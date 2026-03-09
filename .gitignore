@@ -1,0 +1,22 @@
+# Dependency folders
+node_modules/
+dist/
+build/
+
+# Environment variables (Sensitive Data!)
+.env
+.env.local
+
+# Logs
+npm-debug.log*
+yarn-error.log*
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Ignore seedCourts scripts
+src/strategicPlanSeeder.ts
+
+# Ignore seedCourts scripts
+src/seedUsers.ts
