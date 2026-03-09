@@ -4,11 +4,29 @@ import routes from "./routes";
 import { errorHandler } from "./middleware/errorHandler";
 import { applySecurityMiddleware } from "./config/security";
 import cookieParser from "cookie-parser";
+import { env } from "./config/env";
+import cors from "cors"
 
 const app = express();
 
+
 // ---------------- Security Middleware (FIRST) ----------------
 applySecurityMiddleware(app);
+
+app.use(
+  cors({
+    origin: env.FRONTEND_URL,      // your frontend domain
+    credentials: true,             // allow cookies
+    methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"], // allowed HTTP methods
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "Accept",
+    ],
+  }),
+);
+
 
 // ---------------- Body Parser ----------------
 app.use(express.json({ limit: "10kb" }));
