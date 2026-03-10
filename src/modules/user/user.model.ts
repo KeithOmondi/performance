@@ -2,7 +2,7 @@ import mongoose, { Document, Model, Schema } from "mongoose";
 import bcrypt from "bcrypt";
 
 // Updated roles to match your administrative hierarchy
-export type UserRole = "user" | "admin" | "superadmin" | "reviewer" | "registrar";
+export type UserRole = "user" | "admin" | "superadmin" | "examiner";
 
 // ---------------------- Interface ----------------------
 export interface IUser extends Document {
@@ -55,7 +55,7 @@ const userSchema = new Schema<IUser>(
     },
     role: {
       type: String,
-      enum: ["user", "admin", "superadmin", "reviewer", "registrar"],
+      enum: ["user", "admin", "superadmin", "examiner"],
       default: "user",
     },
     isActive: {

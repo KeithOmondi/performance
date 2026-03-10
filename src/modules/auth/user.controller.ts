@@ -42,7 +42,7 @@ export const updateUserRole = asyncHandler(async (req: Request, res: Response) =
   const { role } = req.body;
   
   // Updated to include all roles from your Model: "user", "admin", "superadmin", "reviewer", "registrar"
-  const validRoles = ["user", "admin", "superadmin", "reviewer", "registrar"];
+  const validRoles = ["user", "admin", "superadmin", "examiner",];
   
   if (!role || !validRoles.includes(role)) {
     throw new AppError("Invalid role. Must be one of: " + validRoles.join(", "), 400);
