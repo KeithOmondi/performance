@@ -25,7 +25,7 @@ export const applySecurityMiddleware = (app: Express) => {
     })
   );
 
-  // ---------------- Rate limiting ----------------
+ if (process.env.NODE_ENV === "production") {
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
@@ -35,6 +35,9 @@ export const applySecurityMiddleware = (app: Express) => {
   });
 
   app.use("/api", limiter);
+}
+
+  
 
   // ---------------- Prevent HTTP parameter pollution ----------------
   app.use(hpp());

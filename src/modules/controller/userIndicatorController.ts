@@ -5,10 +5,10 @@ import StrategicPlan from "../SPlanning/strategicPlan.model";
 import mongoose from "mongoose";
 
 /**
- * Enhanced helper to transform Indicator data.
- * Handles Team vs User name resolution for the UI.
+ * Helper to transform Indicator data for UI consumption.
  */
 const transformIndicator = (ind: any) => {
+  if (!ind) return null;
   const plan = ind.strategicPlanId;
   const targetObjId = ind.objectiveId ? String(ind.objectiveId) : null;
   const targetActId = ind.activityId ? String(ind.activityId) : null;
@@ -38,228 +38,162 @@ export const UserIndicatorController = {
    */
   getMyIndicators: async (req: Request, res: Response) => {
     try {
-      const userIdString = String(req.user._id);
+      const userId = new mongoose.Types.ObjectId(req.user._id);
 
-      const indicators = await Indicator.find({
-        $or: [
-          { assignee: userIdString },
-          { assignee: { $in: [userIdString] } }
-        ]
-      })
-        .populate({
-          path: "assignee",
-          select: "name email pjNumber teamName" 
-        })
+      const indicators = await Indicator.find({ assignee: userId })
+        .populate({ path: "assignee", select: "name email pjNumber teamName" })
         .populate("assignedBy", "name")
         .populate({
           path: "strategicPlanId",
           model: StrategicPlan,
           select: "perspective objectives",
         })
-        .sort({ deadline: 1 });
+        .sort({ updatedAt: -1 });
 
       const transformedData = indicators.map(transformIndicator);
       res.status(200).json({ success: true, data: transformedData });
     } catch (error: any) {
-      console.error("Fetch Error:", error);
       res.status(500).json({ success: false, message: error.message });
     }
   },
 
   /**
-   * 2. SUBMIT PROGRESS (Multi-file enabled)
+   * 2. SMART SUBMISSION (Certification Aware)
    */
   submitProgress: async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
-      const { quarter, notes } = req.body;
-      const userIdString = String(req.user._id);
+      const { notes } = req.body;
+      const userId = new mongoose.Types.ObjectId(req.user._id);
 
-      const indicator = await Indicator.findOne({
-        _id: id,
-        $or: [
-          { assignee: userIdString },
-          { assignee: { $in: [userIdString] } }
-        ]
-      });
+      const indicator = await Indicator.findOne({ _id: id, assignee: userId });
 
       if (!indicator) {
-        return res.status(404).json({ success: false, message: "Indicator not found" });
+        return res.status(404).json({ success: false, message: "Registry record not found" });
       }
 
-      if (indicator.reportingCycle === "Quarterly") {
-        const existingPending = indicator.submissions.find(
-          (s) => s.quarter === Number(quarter) && s.reviewStatus === "Pending"
-        );
-        if (existingPending) {
+      const isAnnual = indicator.reportingCycle === "Annual";
+      
+      /**
+       * 🛡️ CERTIFICATION LOGIC: 
+       * Quarterly: Uses activeQuarter (1-4).
+       * Annual: Uses Quarter 0 (The cumulative year bucket).
+       */
+      const targetQuarter = isAnnual ? 0 : indicator.activeQuarter;
+
+      // Find existing submission for the determined target
+      let submission = indicator.submissions.find((s) => s.quarter === targetQuarter);
+
+      if (submission) {
+        // Cannot modify if currently under audit by Admin/Super Admin
+        if (submission.reviewStatus === "Pending") {
           return res.status(400).json({
             success: false,
-            message: `Quarter ${quarter} submission is already pending review.`,
+            message: `The ${isAnnual ? 'Annual' : 'Q' + targetQuarter} dossier is currently in audit.`,
+          });
+        }
+        
+        // If Accepted, user must wait for next cycle opening
+        if (submission.reviewStatus === "Accepted") {
+          return res.status(400).json({
+            success: false,
+            message: `${isAnnual ? 'Annual' : 'Q' + targetQuarter} is already certified. Changes require Admin intervention.`,
           });
         }
       }
 
-      // HANDLE MULTIPLE FILES
-      let documents: IDocument[] = [];
+      // Handle File Uploads
       const files = req.files as Express.Multer.File[];
+      const uploadResults = files?.length > 0 
+        ? await uploadMultipleToCloudinary(files, "submissions") 
+        : [];
 
-      if (files && files.length > 0) {
-        const uploadResults = await uploadMultipleToCloudinary(files, "submissions");
-        
-        documents = uploadResults.map((result, index) => {
-          // Explicitly typing the detected category to satisfy the "raw" | "image" | "video" union
-          let type: "raw" | "image" | "video" = "image";
-          if (result.resource_type === "video") {
-            type = "video";
-          } else if (files[index].mimetype === "application/pdf") {
-            type = "raw";
-          }
+      const newDocuments: IDocument[] = uploadResults.map((result, index) => ({
+        evidenceUrl: result.secure_url,
+        evidencePublicId: result.public_id,
+        fileType: result.resource_type === "video" ? "video" : files[index].mimetype === "application/pdf" ? "raw" : "image",
+        fileName: files[index].originalname,
+      }));
 
-          return {
-            evidenceUrl: result.secure_url,
-            evidencePublicId: result.public_id,
-            fileType: type,
-            fileName: files[index].originalname
-          };
-        });
+      if (submission) {
+        // AMEND EXISTING (Resubmission flow)
+        submission.notes = notes;
+        submission.documents = [...submission.documents, ...newDocuments];
+        submission.reviewStatus = "Pending";
+        submission.isReviewed = false;
+        submission.submittedAt = new Date();
+        submission.resubmissionCount += 1;
+
+        indicator.reviewHistory.push({
+          action: "Resubmitted",
+          reason: `Amended evidence for ${isAnnual ? 'Annual Review' : 'Q' + targetQuarter}`,
+          reviewerRole: "user",
+          reviewedBy: userId,
+          at: new Date(),
+        } as any);
+      } else {
+        // FRESH SUBMISSION
+        indicator.submissions.push({
+          quarter: targetQuarter,
+          notes,
+          achievedValue: 0, // Admin will set this during review
+          documents: newDocuments,
+          submittedAt: new Date(),
+          isReviewed: false,
+          reviewStatus: "Pending",
+          resubmissionCount: 0,
+        } as any);
       }
 
-      const submission = {
-        _id: new mongoose.Types.ObjectId(),
-        quarter: indicator.reportingCycle === "Annual" ? 1 : Number(quarter),
-        notes,
-        achievedValue: 0,
-        // Fallback for legacy fields using the first file
-        ...(documents.length > 0 ? {
-            evidenceUrl: documents[0].evidenceUrl,
-            evidencePublicId: documents[0].evidencePublicId,
-            fileType: documents[0].fileType
-        } : { fileType: "image" as const }),
-        documents, 
-        submittedAt: new Date(),
-        isReviewed: false,
-        reviewStatus: "Pending" as const,
-        resubmissionCount: 0
-      };
+      /**
+       * 🔹 LOCKING THE STATUS
+       * We explicitly set this to "Awaiting Admin Approval". 
+       * This overrides any logic that might accidentally mark it "Completed" 
+       * before the Super Admin sees it.
+       */
+      indicator.status = "Awaiting Admin Approval";
+      
+      await indicator.save();
 
-      indicator.submissions.push(submission as any);
-      await indicator.save(); 
+      // Trigger the Model logic to sync progress (this updates total progress % but keeps status locked)
+      await (Indicator as any).calculateProgress(indicator._id);
 
-      const updated = await Indicator.findById(indicator._id)
+      const finalResult = await Indicator.findById(indicator._id)
         .populate("assignee", "name email")
         .populate({ path: "strategicPlanId", model: StrategicPlan });
 
-      res.status(201).json({ success: true, data: transformIndicator(updated) });
+      res.status(201).json({ 
+        success: true, 
+        message: `${isAnnual ? 'Annual' : 'Q' + targetQuarter} dossier submitted for certification.`,
+        data: transformIndicator(finalResult) 
+      });
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message });
     }
   },
 
   /**
-   * 3. RESUBMIT / EDIT (Multi-file enabled)
+   * 3. GET SINGLE INDICATOR DETAILS
    */
-  resubmitProgress: async (req: Request, res: Response) => {
-    try {
-      const indicatorId = req.params.indicatorId as string;
-      const submissionId = req.params.submissionId as string;
-      const { notes } = req.body;
-      const userIdString = String(req.user._id);
-
-      const indicator = await Indicator.findOne({
-        _id: indicatorId,
-        $or: [
-          { assignee: userIdString },
-          { assignee: { $in: [userIdString] } }
-        ]
-      });
-
-      if (!indicator) return res.status(404).json({ message: "Indicator not found" });
-
-      const submission = indicator.submissions.id(submissionId);
-      if (!submission) return res.status(404).json({ message: "Submission not found" });
-
-      if (submission.reviewStatus === "Accepted") {
-        return res.status(400).json({ message: "Cannot edit an accepted submission" });
-      }
-
-      indicator.reviewHistory.push({
-        action: "RESUBMITTED",
-        reason: `User updated evidence for Q${submission.quarter}.`,
-        reviewedBy: userIdString as any,
-        at: new Date()
-      } as any);
-
-      if (notes) submission.notes = notes;
-      
-      const files = req.files as Express.Multer.File[];
-      if (files && files.length > 0) {
-        const uploadResults = await uploadMultipleToCloudinary(files, "submissions");
-        
-        const newDocuments: IDocument[] = uploadResults.map((result, index) => {
-          let type: "raw" | "image" | "video" = "image";
-          if (result.resource_type === "video") {
-            type = "video";
-          } else if (files[index].mimetype === "application/pdf") {
-            type = "raw";
-          }
-
-          return {
-            evidenceUrl: result.secure_url,
-            evidencePublicId: result.public_id,
-            fileType: type,
-            fileName: files[index].originalname
-          };
-        });
-
-        // Update subdocument collection
-        submission.documents = newDocuments as any;
-        
-        // Sync legacy fields
-        submission.evidenceUrl = newDocuments[0].evidenceUrl;
-        submission.evidencePublicId = newDocuments[0].evidencePublicId;
-        submission.fileType = newDocuments[0].fileType;
-      }
-
-      submission.reviewStatus = "Pending";
-      submission.isReviewed = false;
-      submission.resubmissionCount = (submission.resubmissionCount || 0) + 1;
-      submission.submittedAt = new Date();
-      indicator.status = "Submitted";
-      
-      await indicator.save();
-
-      const updated = await Indicator.findById(indicator._id)
-        .populate("assignee", "name email")
-        .populate({ path: "strategicPlanId", model: StrategicPlan });
-
-      res.status(200).json({ success: true, data: transformIndicator(updated) });
-    } catch (error: any) {
-      res.status(500).json({ message: error.message });
-    }
-  },
-
   getIndicatorDetails: async (req: Request, res: Response) => {
     try {
       const { id } = req.params;
-      const userIdString = String(req.user._id);
+      const userId = new mongoose.Types.ObjectId(req.user._id);
 
-      const indicator = await Indicator.findOne({
-        _id: id,
-        $or: [
-          { assignee: userIdString },
-          { assignee: { $in: [userIdString] } }
-        ]
-      }).populate({
-        path: "strategicPlanId",
-        model: StrategicPlan,
-        select: "perspective objectives",
-      }).populate("assignee", "name email pjNumber teamName");
+      const indicator = await Indicator.findOne({ _id: id, assignee: userId })
+        .populate({
+          path: "strategicPlanId",
+          model: StrategicPlan,
+          select: "perspective objectives",
+        })
+        .populate("assignee", "name email pjNumber teamName")
+        .populate("assignedBy", "name");
 
-      if (!indicator) return res.status(404).json({ message: "Not found" });
+      if (!indicator) return res.status(404).json({ message: "Indicator not found" });
 
       res.status(200).json({ success: true, data: transformIndicator(indicator) });
     } catch (error: any) {
-      res.status(500).json({ message: error.message });
+      res.status(500).json({ success: false, message: error.message });
     }
   },
 };

@@ -5,7 +5,6 @@ import {
   getIndicatorById,
   submitProgress,
   getAllSubmissions,
-  processReview,
   deleteIndicator,
   updateIndicator,
   superAdminDecision,
@@ -13,6 +12,7 @@ import {
   getRejectedByAdmin, // New: Oversight for Super Admin
 } from "./indicator.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
+import { superAdminReviewProcess } from "../admin/adminIndicatorController";
 
 const router = Router();
 
@@ -67,7 +67,7 @@ router.post("/:id/submit", protect, restrictTo("superadmin"), submitProgress);
 /* -------------------------------------------------------------------------- */
 
 // Standard Review (Admin level or initial Super Admin review)
-router.patch("/:id/review", protect, restrictTo("superadmin"), processReview);
+router.patch("/:id/review", protect, restrictTo("superadmin"), superAdminReviewProcess);
 
 // Final Oversight Decision (Super Admin finalizes or overrules)
 // Updated to POST to match your controller logic

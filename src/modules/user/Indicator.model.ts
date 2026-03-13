@@ -1,10 +1,32 @@
 import mongoose, { Schema, Document, Model, Types } from "mongoose";
 
-// --- FORCE MODEL REGISTRATION ---
-import "./user.model"; 
-import StrategicPlan from "../SPlanning/strategicPlan.model";
+// --- REGISTRY CONFIGURATION ---
 
-// ----------------- DOCUMENT INTERFACE -----------------
+export interface IRegistryConfiguration extends Document {
+  quarter: 0 | 1 | 2 | 3 | 4; // 0 for Annual
+  year: number;
+  startDate: Date;
+  endDate: Date;
+  isLocked: boolean;
+}
+
+const RegistryConfigurationSchema = new Schema<IRegistryConfiguration>({
+  quarter: { type: Number, enum: [0, 1, 2, 3, 4], required: true },
+  year: { type: Number, required: true },
+  startDate: { type: Date, required: true },
+  endDate: { type: Date, required: true },
+  isLocked: { type: Boolean, default: false },
+});
+
+export const RegistryConfiguration =
+  mongoose.models.RegistryConfiguration ||
+  mongoose.model<IRegistryConfiguration>(
+    "RegistryConfiguration",
+    RegistryConfigurationSchema,
+  );
+
+// --- INDICATOR INTERFACES ---
+
 export interface IDocument {
   evidenceUrl: string;
   evidencePublicId: string;
@@ -12,16 +34,10 @@ export interface IDocument {
   fileName?: string;
 }
 
-// ----------------- SUBMISSION INTERFACE -----------------
 export interface ISubmission {
   _id: Types.ObjectId;
-  quarter: 1 | 2 | 3 | 4;
-  /** @deprecated Use documents array for multi-file support */
-  evidenceUrl?: string;
-  /** @deprecated Use documents array for multi-file support */
-  evidencePublicId?: string;
-  fileType: "image" | "video" | "raw";
-  documents: IDocument[]; // Added for multiple file support
+  quarter: 0 | 1 | 2 | 3 | 4;
+  documents: IDocument[];
   notes: string;
   adminDescriptionEdit?: string;
   submittedAt: Date;
@@ -32,13 +48,25 @@ export interface ISubmission {
   resubmissionCount: number;
 }
 
-// ----------------- INDICATOR INTERFACE -----------------
+export interface IReviewHistory {
+  action:
+    | "Approved"
+    | "Rejected"
+    | "Verified"
+    | "Resubmitted"
+    | "Correction Requested";
+  reason: string;
+  reviewerRole: "admin" | "superadmin" | "user";
+  reviewedBy: Types.ObjectId;
+  at: Date;
+}
+
 export interface IIndicator extends Document {
   strategicPlanId: Types.ObjectId;
   objectiveId: Types.ObjectId;
   activityId: Types.ObjectId;
-  assignee: any; 
-  assignmentType: "User" | "Team"; 
+  assignee: Types.ObjectId;
+  assignmentType: "User" | "Team";
   reportingCycle: "Quarterly" | "Annual";
   weight: number;
   unit: string;
@@ -49,47 +77,44 @@ export interface IIndicator extends Document {
   progress: number;
   status:
     | "Pending"
-    | "Active"
-    | "Partially Complete"
-    | "Submitted"
+    | "Awaiting Admin Approval"
     | "Rejected by Admin"
     | "Awaiting Super Admin"
-    | "Reviewed";
+    | "Rejected by Super Admin"
+    | "Partially Approved"
+    | "Completed";
   instructions?: string;
   assignedBy: Types.ObjectId;
+  activeQuarter: 0 | 1 | 2 | 3 | 4;
+  reviewHistory: IReviewHistory[];
   adminOverallComments?: string;
-  reviewHistory: Array<{
-    action: string;
-    reason: string;
-    reviewedBy: Types.ObjectId;
-    at: Date;
-  }>;
 }
 
-// ----------------- SUBMISSION SCHEMA -----------------
+interface IIndicatorModel extends Model<IIndicator> {
+  calculateProgress(indicatorId: Types.ObjectId): Promise<IIndicator | null>;
+}
+
+// --- SCHEMAS ---
+
 const SubmissionSchema = new Schema<ISubmission>(
   {
-    quarter: { type: Number, enum: [1, 2, 3, 4], required: true },
-    evidenceUrl: String,
-    evidencePublicId: String,
-    fileType: {
-      type: String,
-      enum: ["image", "video", "raw"],
-      default: "image",
-    },
-    // Added documents array schema to store multiple file objects
+    quarter: { type: Number, enum: [0, 1, 2, 3, 4], required: true },
     documents: [
       {
         evidenceUrl: { type: String, required: true },
         evidencePublicId: { type: String, required: true },
-        fileType: { type: String, enum: ["image", "video", "raw"], required: true },
+        fileType: {
+          type: String,
+          enum: ["image", "video", "raw"],
+          required: true,
+        },
         fileName: String,
       },
     ],
     notes: { type: String, required: true },
     adminDescriptionEdit: { type: String, default: "" },
     submittedAt: { type: Date, default: Date.now },
-    achievedValue: { type: Number, default: 0 },
+    achievedValue: { type: Number, default: 0, min: 0 },
     isReviewed: { type: Boolean, default: false },
     reviewStatus: {
       type: String,
@@ -102,19 +127,21 @@ const SubmissionSchema = new Schema<ISubmission>(
   { _id: true },
 );
 
-// ----------------- INDICATOR SCHEMA -----------------
-const IndicatorSchema = new Schema<IIndicator>(
+const IndicatorSchema = new Schema<IIndicator, IIndicatorModel>(
   {
     strategicPlanId: {
       type: Schema.Types.ObjectId,
       ref: "StrategicPlan",
       required: true,
+      index: true,
     },
-    objectiveId: { type: Schema.Types.ObjectId, required: true },
+    objectiveId: { type: Schema.Types.ObjectId, required: true, index: true },
     activityId: { type: Schema.Types.ObjectId, required: true },
-    assignee: { 
-      type: Schema.Types.Mixed, 
-      required: true 
+    assignee: {
+      type: Schema.Types.ObjectId,
+      required: true,
+      refPath: "assignmentType",
+      index: true,
     },
     assignmentType: {
       type: String,
@@ -134,63 +161,93 @@ const IndicatorSchema = new Schema<IIndicator>(
     submissions: [SubmissionSchema],
     currentTotalAchieved: { type: Number, default: 0 },
     progress: { type: Number, default: 0, min: 0, max: 100 },
+    activeQuarter: { type: Number, enum: [0, 1, 2, 3, 4], default: 1 },
     status: {
       type: String,
       enum: [
         "Pending",
-        "Active",
-        "Partially Complete",
-        "Submitted",
+        "Awaiting Admin Approval",
         "Rejected by Admin",
         "Awaiting Super Admin",
-        "Reviewed",
+        "Rejected by Super Admin",
+        "Partially Approved",
+        "Completed",
       ],
       default: "Pending",
+      index: true,
     },
     instructions: String,
     assignedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
-    adminOverallComments: String,
     reviewHistory: [
       {
         action: String,
         reason: String,
+        reviewerRole: String,
         reviewedBy: { type: Schema.Types.ObjectId, ref: "User" },
         at: { type: Date, default: Date.now },
       },
     ],
+    adminOverallComments: String,
   },
-  {
-    timestamps: true,
-    toJSON: { virtuals: true },
-    toObject: { virtuals: true },
-  },
+  { timestamps: true },
 );
 
-// ----------------- RECALCULATION & STATUS LOGIC -----------------
-IndicatorSchema.pre("save", async function () {
-  if (this.isModified('submissions')) {
-    this.currentTotalAchieved = this.submissions.reduce(
-      (acc, curr) => acc + (curr.achievedValue || 0),
-      0,
-    );
+// --- LOGIC ENGINE ---
 
-    const calculatedProgress =
-      this.target > 0 ? (this.currentTotalAchieved / this.target) * 100 : 0;
+IndicatorSchema.statics.calculateProgress = async function (
+  indicatorId: Types.ObjectId,
+) {
+  const indicator = await this.findById(indicatorId);
+  if (!indicator) return null;
 
-    this.progress = Math.min(Math.max(calculatedProgress, 0), 100);
+  // 1. Only count values that have been formally accepted by the registry
+  const acceptedSubmissions = indicator.submissions.filter(
+    (s) => s.reviewStatus === "Accepted",
+  );
 
-    const protectedStatuses = ["Reviewed", "Awaiting Super Admin", "Rejected by Admin"];
-    
-    if (!protectedStatuses.includes(this.status)) {
-      if (this.submissions.length > 0) {
-        this.status = this.progress >= 100 ? "Submitted" : "Partially Complete";
+  const totalAchieved = acceptedSubmissions.reduce(
+    (acc, curr) => acc + (curr.achievedValue || 0),
+    0,
+  );
+
+  indicator.currentTotalAchieved = totalAchieved;
+  const rawProgress =
+    indicator.target > 0 ? (totalAchieved / indicator.target) * 100 : 0;
+  indicator.progress = Math.min(Math.round(rawProgress * 100) / 100, 100);
+
+  // 2. Certification Chain Logic
+  const latestReview =
+    indicator.reviewHistory[indicator.reviewHistory.length - 1];
+
+  if (latestReview) {
+    if (latestReview.action === "Approved") {
+      // 🔹 Only the Super Admin can move an indicator to "Completed"
+      if (latestReview.reviewerRole === "superadmin") {
+        indicator.status = "Completed";
       } else {
-        this.status = "Active";
+        // Admin approval moves it to the next desk in the hierarchy
+        indicator.status = "Awaiting Super Admin";
       }
+    } else if (latestReview.action === "Rejected") {
+      indicator.status =
+        latestReview.reviewerRole === "superadmin"
+          ? "Rejected by Super Admin"
+          : "Rejected by Admin";
     }
   }
-});
 
-export const Indicator: Model<IIndicator> =
-  mongoose.models.Indicator ||
-  mongoose.model<IIndicator>("Indicator", IndicatorSchema);
+  // 🔹 Guard: If there are pending submissions and no final approval,
+  // ensure the status stays in the review pipeline.
+  const hasPendingSubmissions = indicator.submissions.some(
+    (s) => s.reviewStatus === "Pending",
+  );
+  if (hasPendingSubmissions && indicator.status === "Pending") {
+    indicator.status = "Awaiting Admin Approval";
+  }
+
+  return await indicator.save();
+};
+
+export const Indicator =
+  (mongoose.models.Indicator as IIndicatorModel) ||
+  mongoose.model<IIndicator, IIndicatorModel>("Indicator", IndicatorSchema);
