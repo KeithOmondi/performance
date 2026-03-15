@@ -1,31 +1,6 @@
-import mongoose, { Schema, Document, Model, Types } from "mongoose";
+import mongoose, { Schema, Document, Types } from "mongoose";
 
-// --- REGISTRY CONFIGURATION ---
-
-export interface IRegistryConfiguration extends Document {
-  quarter: 0 | 1 | 2 | 3 | 4; // 0 for Annual
-  year: number;
-  startDate: Date;
-  endDate: Date;
-  isLocked: boolean;
-}
-
-const RegistryConfigurationSchema = new Schema<IRegistryConfiguration>({
-  quarter: { type: Number, enum: [0, 1, 2, 3, 4], required: true },
-  year: { type: Number, required: true },
-  startDate: { type: Date, required: true },
-  endDate: { type: Date, required: true },
-  isLocked: { type: Boolean, default: false },
-});
-
-export const RegistryConfiguration =
-  mongoose.models.RegistryConfiguration ||
-  mongoose.model<IRegistryConfiguration>(
-    "RegistryConfiguration",
-    RegistryConfigurationSchema,
-  );
-
-// --- INDICATOR INTERFACES ---
+/* --- SUB-INTERFACES --- */
 
 export interface IDocument {
   evidenceUrl: string;
@@ -43,16 +18,16 @@ export interface ISubmission {
   submittedAt: Date;
   achievedValue: number;
   isReviewed: boolean;
-  reviewStatus: "Pending" | "Accepted" | "Rejected";
+  reviewStatus: "Pending" | "Verified" | "Accepted" | "Rejected";
   adminComment?: string;
   resubmissionCount: number;
 }
 
 export interface IReviewHistory {
   action:
+    | "Verified"
     | "Approved"
     | "Rejected"
-    | "Verified"
     | "Resubmitted"
     | "Correction Requested";
   reason: string;
@@ -72,7 +47,7 @@ export interface IIndicator extends Document {
   unit: string;
   target: number;
   deadline: Date;
-  submissions: mongoose.Types.DocumentArray<ISubmission & mongoose.Document>;
+  submissions: mongoose.Types.DocumentArray<ISubmission>;
   currentTotalAchieved: number;
   progress: number;
   status:
@@ -81,20 +56,15 @@ export interface IIndicator extends Document {
     | "Rejected by Admin"
     | "Awaiting Super Admin"
     | "Rejected by Super Admin"
-    | "Partially Approved"
     | "Completed";
   instructions?: string;
-  assignedBy: Types.ObjectId;
+  assignedBy: Types.ObjectId; // Now defined in Schema
   activeQuarter: 0 | 1 | 2 | 3 | 4;
   reviewHistory: IReviewHistory[];
   adminOverallComments?: string;
 }
 
-interface IIndicatorModel extends Model<IIndicator> {
-  calculateProgress(indicatorId: Types.ObjectId): Promise<IIndicator | null>;
-}
-
-// --- SCHEMAS ---
+/* --- SCHEMAS --- */
 
 const SubmissionSchema = new Schema<ISubmission>(
   {
@@ -114,11 +84,11 @@ const SubmissionSchema = new Schema<ISubmission>(
     notes: { type: String, required: true },
     adminDescriptionEdit: { type: String, default: "" },
     submittedAt: { type: Date, default: Date.now },
-    achievedValue: { type: Number, default: 0, min: 0 },
+    achievedValue: { type: Number, default: 0 },
     isReviewed: { type: Boolean, default: false },
     reviewStatus: {
       type: String,
-      enum: ["Pending", "Accepted", "Rejected"],
+      enum: ["Pending", "Verified", "Accepted", "Rejected"],
       default: "Pending",
     },
     adminComment: String,
@@ -127,41 +97,40 @@ const SubmissionSchema = new Schema<ISubmission>(
   { _id: true },
 );
 
-const IndicatorSchema = new Schema<IIndicator, IIndicatorModel>(
+const IndicatorSchema = new Schema<IIndicator>(
   {
     strategicPlanId: {
       type: Schema.Types.ObjectId,
       ref: "StrategicPlan",
       required: true,
-      index: true,
     },
-    objectiveId: { type: Schema.Types.ObjectId, required: true, index: true },
+    objectiveId: { type: Schema.Types.ObjectId, required: true },
     activityId: { type: Schema.Types.ObjectId, required: true },
     assignee: {
       type: Schema.Types.ObjectId,
       required: true,
       refPath: "assignmentType",
-      index: true,
     },
-    assignmentType: {
-      type: String,
-      required: true,
-      enum: ["User", "Team"],
-      default: "User",
-    },
+    assignmentType: { type: String, enum: ["User", "Team"], default: "User" },
     reportingCycle: {
       type: String,
       enum: ["Quarterly", "Annual"],
       default: "Quarterly",
     },
+    target: { type: Number, default: 100 },
     weight: { type: Number, default: 5 },
     unit: { type: String, default: "%" },
-    target: { type: Number, default: 100 },
     deadline: { type: Date, required: true },
     submissions: [SubmissionSchema],
     currentTotalAchieved: { type: Number, default: 0 },
-    progress: { type: Number, default: 0, min: 0, max: 100 },
-    activeQuarter: { type: Number, enum: [0, 1, 2, 3, 4], default: 1 },
+    progress: { type: Number, default: 0 },
+    activeQuarter: { type: Number, default: 1 },
+    instructions: { type: String, default: "" }, // Added missing field
+    assignedBy: { 
+      type: Schema.Types.ObjectId, 
+      ref: "User", 
+      required: true 
+    }, // Added missing field to fix StrictPopulateError
     status: {
       type: String,
       enum: [
@@ -170,19 +139,18 @@ const IndicatorSchema = new Schema<IIndicator, IIndicatorModel>(
         "Rejected by Admin",
         "Awaiting Super Admin",
         "Rejected by Super Admin",
-        "Partially Approved",
         "Completed",
       ],
       default: "Pending",
-      index: true,
     },
-    instructions: String,
-    assignedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     reviewHistory: [
       {
-        action: String,
+        action: { 
+          type: String, 
+          enum: ["Verified", "Approved", "Rejected", "Resubmitted", "Correction Requested"] 
+        },
         reason: String,
-        reviewerRole: String,
+        reviewerRole: { type: String, enum: ["admin", "superadmin", "user"] },
         reviewedBy: { type: Schema.Types.ObjectId, ref: "User" },
         at: { type: Date, default: Date.now },
       },
@@ -192,62 +160,74 @@ const IndicatorSchema = new Schema<IIndicator, IIndicatorModel>(
   { timestamps: true },
 );
 
-// --- LOGIC ENGINE ---
+/* --- THE LOGIC ENGINE --- */
 
-IndicatorSchema.statics.calculateProgress = async function (
-  indicatorId: Types.ObjectId,
-) {
-  const indicator = await this.findById(indicatorId);
-  if (!indicator) return null;
+/**
+ * Sync hook handles progress math and global status transitions.
+ * Since we are using Mongoose 5.x+, async/await replaces the need for next().
+ */
+IndicatorSchema.pre("save", async function () {
+  const indicator = this as IIndicator;
 
-  // 1. Only count values that have been formally accepted by the registry
-  const acceptedSubmissions = indicator.submissions.filter(
+  // 1. PROGRESS CALCULATION
+  const certifiedSubmissions = indicator.submissions.filter(
     (s) => s.reviewStatus === "Accepted",
   );
-
-  const totalAchieved = acceptedSubmissions.reduce(
+  
+  const totalAchieved = certifiedSubmissions.reduce(
     (acc, curr) => acc + (curr.achievedValue || 0),
     0,
   );
 
   indicator.currentTotalAchieved = totalAchieved;
-  const rawProgress =
-    indicator.target > 0 ? (totalAchieved / indicator.target) * 100 : 0;
-  indicator.progress = Math.min(Math.round(rawProgress * 100) / 100, 100);
+  if (indicator.target > 0) {
+    indicator.progress = Math.min(
+      (totalAchieved / indicator.target) * 100,
+      100,
+    );
+  }
 
-  // 2. Certification Chain Logic
-  const latestReview =
-    indicator.reviewHistory[indicator.reviewHistory.length - 1];
+  // 2. STATE TRANSITION MACHINE
+  const latestReview = indicator.reviewHistory[indicator.reviewHistory.length - 1];
 
   if (latestReview) {
-    if (latestReview.action === "Approved") {
-      // 🔹 Only the Super Admin can move an indicator to "Completed"
-      if (latestReview.reviewerRole === "superadmin") {
-        indicator.status = "Completed";
-      } else {
-        // Admin approval moves it to the next desk in the hierarchy
-        indicator.status = "Awaiting Super Admin";
-      }
-    } else if (latestReview.action === "Rejected") {
-      indicator.status =
-        latestReview.reviewerRole === "superadmin"
-          ? "Rejected by Super Admin"
-          : "Rejected by Admin";
+    switch (latestReview.action) {
+      case "Verified":
+        if (latestReview.reviewerRole === "admin") {
+          indicator.status = "Awaiting Super Admin";
+        }
+        break;
+
+      case "Approved":
+        if (latestReview.reviewerRole === "superadmin") {
+          indicator.status = "Completed";
+        }
+        break;
+
+      case "Correction Requested":
+      case "Rejected":
+        indicator.status =
+          latestReview.reviewerRole === "superadmin"
+            ? "Rejected by Super Admin"
+            : "Rejected by Admin";
+        break;
+
+      case "Resubmitted":
+        indicator.status = "Awaiting Admin Approval";
+        break;
     }
   }
 
-  // 🔹 Guard: If there are pending submissions and no final approval,
-  // ensure the status stays in the review pipeline.
-  const hasPendingSubmissions = indicator.submissions.some(
-    (s) => s.reviewStatus === "Pending",
-  );
-  if (hasPendingSubmissions && indicator.status === "Pending") {
+  // 3. FRESH SUBMISSION OVERRIDE
+  // If user adds a new submission but hasn't had a "Resubmitted" action logged yet
+  const hasFreshUpload = indicator.submissions.some((s) => s.reviewStatus === "Pending");
+  const isTerminal = ["Awaiting Super Admin", "Completed", "Rejected by Super Admin", "Rejected by Admin"].includes(indicator.status);
+
+  if (hasFreshUpload && !isTerminal) {
     indicator.status = "Awaiting Admin Approval";
   }
-
-  return await indicator.save();
-};
+});
 
 export const Indicator =
-  (mongoose.models.Indicator as IIndicatorModel) ||
-  mongoose.model<IIndicator, IIndicatorModel>("Indicator", IndicatorSchema);
+  mongoose.models.Indicator ||
+  mongoose.model<IIndicator>("Indicator", IndicatorSchema);

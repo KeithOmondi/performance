@@ -1,60 +1,50 @@
 import { Request, Response } from "express";
-import { Indicator } from "../user/Indicator.model";
+import { Indicator, ISubmission } from "../user/Indicator.model";
 import { Types } from "mongoose";
 import { RegistryConfiguration } from "../user/RegistryConfiguration";
-import { User } from "../user/user.model";
-import StrategicPlan from "../SPlanning/strategicPlan.model";
+import mongoose from "mongoose";
 
 /**
  * HELPER: transformIndicator
- * Flattens nested strategic data and adds UI-specific flags.
  */
 const transformIndicator = (ind: any) => {
   const indObj = typeof ind.toObject === "function" ? ind.toObject() : ind;
   const plan = indObj.strategicPlanId;
 
   const objective = plan?.objectives?.find(
-    (obj: any) => obj._id.toString() === indObj.objectiveId?.toString(),
+    (obj: any) => obj._id?.toString() === indObj.objectiveId?.toString()
   );
   const activity = objective?.activities?.find(
-    (act: any) => act._id.toString() === indObj.activityId?.toString(),
+    (act: any) => act._id?.toString() === indObj.activityId?.toString()
   );
 
-  const displayName =
-    indObj.assignee?.name || indObj.assignee?.groupName || "Unassigned";
+  const displayName = indObj.assignee?.name || indObj.assignee?.groupName || "Unassigned";
 
   return {
     ...indObj,
     perspective: plan?.perspective || "N/A",
     objectiveTitle: objective?.title || "Unknown Objective",
-    activityDescription:
-      activity?.description || indObj.instructions || "No activity text",
+    activityDescription: activity?.description || indObj.instructions || "No activity text",
     assigneeDisplayName: displayName,
-    needsAction: ["Rejected by Admin", "Rejected by Super Admin"].includes(
-      indObj.status,
-    ),
+    // UI Logic: Needs action if rejected at any level
+    needsAction: ["Rejected by Admin", "Rejected by Super Admin"].includes(indObj.status),
   };
 };
 
 
 /**
- * @desc 1. CREATE INDICATOR (Admin Assignment)
+ * @desc 1. CREATE INDICATOR (Super Admin / Management)
  */
 export const createIndicator = async (req: Request, res: Response) => {
   try {
     const {
-      strategicPlanId,
-      objectiveId,
-      activityId,
-      assignee,
-      assignmentType,
-      reportingCycle,
-      weight,
-      unit,
-      target,
-      deadline,
-      instructions,
+      strategicPlanId, objectiveId, activityId, assignee,
+      assignmentType, reportingCycle, weight, unit, target,
+      deadline, instructions
     } = req.body;
+
+    // Default activeQuarter to 0 if Annual, else 1
+    const initialQuarter = reportingCycle === "Annual" ? 0 : 1;
 
     const indicator = await Indicator.create({
       strategicPlanId,
@@ -68,6 +58,7 @@ export const createIndicator = async (req: Request, res: Response) => {
       target: target || 100,
       deadline,
       instructions,
+      activeQuarter: initialQuarter,
       assignedBy: (req as any).user?._id,
       status: "Pending",
     });
@@ -79,45 +70,38 @@ export const createIndicator = async (req: Request, res: Response) => {
 };
 
 /**
- * @desc 2. UPDATE INDICATOR (Meta data & Phase Management)
- * This is now the "Gatekeeper" that opens new quarters.
+ * @desc 2. UPDATE INDICATOR
+ * Refined to let the Model Hook handle status transitions.
  */
 export const updateIndicator = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const updateData = { ...req.body };
+    const indicator = await Indicator.findById(id);
+    
+    if (!indicator) return res.status(404).json({ success: false, message: "Not found" });
 
-    // 1. PHASE GATE LOGIC
-    // If the Admin is providing a NEW deadline or explicitly advancing the quarter,
-    // we move the indicator back to "Pending" status to unlock it for the User.
-    if (updateData.deadline || updateData.activeQuarter) {
-      updateData.status = "Pending";
+    // Apply updates via Object.assign to trigger 'save' middleware correctly
+    Object.assign(indicator, req.body);
+
+    // If core tracking parameters change, we manually reset status to Pending
+    // to force a fresh review cycle, then save triggers the logic engine.
+    if (req.body.deadline || req.body.activeQuarter !== undefined || req.body.target) {
+      indicator.status = "Pending";
     }
 
-    const updated = await Indicator.findByIdAndUpdate(
-      id,
-      { $set: updateData },
-      { new: true, runValidators: true }
-    ).populate("assignee", "name email groupName")
-     .populate({ path: "strategicPlanId", select: "perspective objectives" });
+    await indicator.save();
+    
+    const populated = await indicator.populate([
+      { path: "assignee", select: "name email groupName" },
+      { path: "strategicPlanId", select: "perspective objectives" }
+    ]);
 
-    if (!updated) {
-      return res.status(404).json({ success: false, message: "Indicator not found" });
-    }
-
-    // 2. RECALCULATE
-    // Ensure the total progress and aggregates are synced with the manual update
-    const finalState = await Indicator.calculateProgress(updated._id as Types.ObjectId);
-
-    res.status(200).json({ 
-      success: true, 
-      message: updateData.activeQuarter ? "Next reporting phase opened." : "Governance records updated.",
-      data: transformIndicator(finalState || updated) 
-    });
+    res.status(200).json({ success: true, data: transformIndicator(populated) });
   } catch (error: any) {
     res.status(500).json({ success: false, message: error.message });
   }
 };
+
 
 /**
  * @desc 3. DELETE INDICATOR
@@ -132,7 +116,7 @@ export const deleteIndicator = async (req: Request, res: Response) => {
 };
 
 /**
- * @desc 4. GET ALL SUBMISSIONS (Flattened Queue for Admin)
+ * @desc 4. GET ALL SUBMISSIONS (Work Queue for Super Admin)
  */
 export const getAllSubmissions = async (_req: Request, res: Response) => {
   try {
@@ -144,7 +128,7 @@ export const getAllSubmissions = async (_req: Request, res: Response) => {
     const flatQueue = indicators.map((ind: any) => {
       const latestSub = ind.submissions[ind.submissions.length - 1];
       const transformed = transformIndicator(ind);
-
+      
       return {
         _id: ind._id,
         indicatorTitle: transformed.activityDescription,
@@ -152,7 +136,9 @@ export const getAllSubmissions = async (_req: Request, res: Response) => {
         submittedOn: latestSub?.submittedAt,
         status: ind.status,
         progress: ind.progress,
-        quarter: latestSub?.quarter
+        quarter: latestSub?.quarter === 0 ? "Annual" : `Q${latestSub?.quarter}`,
+        // 🔹 New field: Count of attached evidence files
+        documentsCount: latestSub?.documents?.length || 0 
       };
     });
 
@@ -183,7 +169,7 @@ export const getRejectedByAdmin = async (_req: Request, res: Response) => {
 };
 
 /**
- * @desc 6. SUPER ADMIN STATS (Aggregates)
+ * @desc 5. SUPER ADMIN STATS (Aggregates)
  */
 export const getSuperAdminStats = async (req: Request, res: Response) => {
   try {
@@ -214,7 +200,7 @@ export const getSuperAdminStats = async (req: Request, res: Response) => {
       }
     });
   } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: "Internal server error" });
   }
 };
 
@@ -255,99 +241,72 @@ export const getAllIndicators = async (_req: Request, res: Response) => {
   }
 };
 
-// --- USER OPERATIONS ---
-
 /**
- * @desc User submits or resubmits progress
+ * @desc 3. SUBMIT PROGRESS (User)
+ * Aligned with IDocument[] array and Registry validation
  */
 export const submitProgress = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const {
-      quarter,
-      notes,
-      evidenceUrl,
-      evidencePublicId,
-      achievedValue,
-      fileType,
-    } = req.body;
-
-    const quarterNum = Number(quarter) as 1 | 2 | 3 | 4;
-    const currentYear = new Date().getFullYear();
-
-    // 1. Registry Gatekeeper
-    const registryConfig = await RegistryConfiguration.findOne({
-      quarter: quarterNum,
-      year: currentYear,
-    });
-    if (!registryConfig)
-      return res
-        .status(403)
-        .json({ success: false, message: "Registry not configured." });
-
-    const now = new Date();
-    if (
-      now < registryConfig.startDate ||
-      now > registryConfig.endDate ||
-      registryConfig.isLocked
-    ) {
-      return res
-        .status(403)
-        .json({
-          success: false,
-          message: "The Registry window is currently closed.",
-        });
-    }
+    const { notes, evidenceUrl, evidencePublicId, achievedValue, fileType, fileName } = req.body;
 
     const indicator = await Indicator.findById(id);
-    if (!indicator)
-      return res
-        .status(404)
-        .json({ success: false, message: "Indicator not found" });
+    if (!indicator) return res.status(404).json({ message: "Indicator not found" });
 
-    // 2. Submission Logic
-    let sub = indicator.submissions.find((s) => s.quarter === quarterNum);
+    const targetQuarter = indicator.reportingCycle === "Annual" ? 0 : indicator.activeQuarter;
+    const currentYear = new Date().getFullYear();
+
+    // 1. Registry Validation
+    const registryConfig = await RegistryConfiguration.findOne({ 
+      quarter: targetQuarter, 
+      year: currentYear 
+    });
+
+    if (!registryConfig || registryConfig.isLocked) {
+      return res.status(403).json({ message: "Reporting window is currently closed or locked for this period." });
+    }
+
+    // 2. Document Construction (Matches IDocument interface)
+    const newDocument = {
+      evidenceUrl,
+      evidencePublicId,
+      fileType: fileType || "raw",
+      fileName: fileName || "Attachment"
+    };
+
+   // 3. Update or Push Submission
+let sub = indicator.submissions.find((s: ISubmission) => s.quarter === targetQuarter);
 
     if (sub) {
-      if (sub.reviewStatus === "Accepted")
-        return res
-          .status(400)
-          .json({ success: false, message: "Approved quarters are locked." });
-
+      if (sub.reviewStatus === "Accepted") {
+        return res.status(400).json({ message: "Approved cycles are locked for editing." });
+      }
       sub.notes = notes;
-      sub.documents = [
-        { evidenceUrl, evidencePublicId, fileType: fileType || "raw" },
-      ];
       sub.achievedValue = Number(achievedValue);
+      sub.documents = [newDocument]; // Replaces current docs with new upload
       sub.reviewStatus = "Pending";
-      sub.isReviewed = false;
-      sub.resubmissionCount += 1;
       sub.submittedAt = new Date();
+      sub.resubmissionCount += 1;
     } else {
       indicator.submissions.push({
-        quarter: quarterNum,
+        quarter: targetQuarter,
         notes,
-        documents: [
-          { evidenceUrl, evidencePublicId, fileType: fileType || "raw" },
-        ],
         achievedValue: Number(achievedValue),
+        documents: [newDocument],
         reviewStatus: "Pending",
         submittedAt: new Date(),
+        isReviewed: false,
+        resubmissionCount: 0
       } as any);
     }
 
-    // 3. Status Transition
-    indicator.status = "Awaiting Admin Approval";
-    indicator.reviewHistory.push({
-      action: "Resubmitted",
-      reason: `Quarter ${quarterNum} update submitted.`,
-      reviewerRole: "user",
-      reviewedBy: (req as any).user?._id,
-      at: new Date(),
-    });
-
+    // 4. Trigger Model Middleware
+    // This will automatically:
+    // - Recalculate progress based on 'Accepted' subs
+    // - Set status to 'Awaiting Admin Approval'
     await indicator.save();
-    res.status(200).json({ success: true, message: "Submission successful." });
+
+    res.status(200).json({ success: true, message: "Progress submitted successfully." });
   } catch (error: any) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -355,59 +314,58 @@ export const submitProgress = async (req: Request, res: Response) => {
 
 
 /**
- * 🛡️ SUPER ADMIN CERTIFICATION PROCESS (Audit remains on current quarter)
+ * @desc 4. SUPER ADMIN REVIEW (Atomic Transaction)
+ * Ensures history and status updates are atomic.
  */
 export const superAdminReviewProcess = async (req: Request, res: Response) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
     const { id } = req.params;
     const { decision, reason, progressOverride } = req.body;
 
-    const indicator = await Indicator.findById(id);
-    if (!indicator) return res.status(404).json({ success: false, message: "Indicator not found" });
+    const indicator = await Indicator.findById(id).session(session);
+    if (!indicator) throw new Error("Indicator not found");
 
     const isApprove = decision === "Approved";
+    const targetQ = indicator.reportingCycle === "Annual" ? 0 : indicator.activeQuarter;
+    const currentSub = indicator.submissions.find((s: ISubmission) => s.quarter === targetQ);
 
-    // 1. Identify current submission
-    const currentSub = indicator.submissions.find(s => s.quarter === indicator.activeQuarter);
-
+    // Update specific submission status
     if (currentSub) {
       currentSub.reviewStatus = isApprove ? "Accepted" : "Rejected";
       currentSub.isReviewed = true;
-      
       if (isApprove && progressOverride !== undefined) {
-        currentSub.achievedValue = Number(progressOverride);
-      } else if (!isApprove) {
-        currentSub.adminComment = reason;
+          currentSub.achievedValue = Number(progressOverride);
       }
+      if (!isApprove) currentSub.adminComment = reason;
     }
 
-    // 2. Log History
+    // Append to History
     indicator.reviewHistory.push({
       action: isApprove ? "Approved" : "Rejected",
-      reason: reason || (isApprove ? "Certified by Super Admin" : "Rejected by Super Admin"),
+      reason: reason || (isApprove ? "Performance Certified" : "Criteria not met"),
       reviewerRole: "superadmin",
       reviewedBy: (req as any).user?._id,
       at: new Date(),
     } as any);
 
-    // 3. Save & Recalculate 
-    // (Model now stays on the current quarter and sets status to "Completed")
-    await indicator.save();
-    const updated = await Indicator.calculateProgress(indicator._id as Types.ObjectId);
+    // Save triggers the logic engine hook to set indicator.status to "Completed" or "Rejected..."
+    await indicator.save({ session });
+    
+    await session.commitTransaction();
+    
+    const final = await indicator.populate([
+        { path: "assignee", select: "name email groupName" },
+        { path: "strategicPlanId", select: "perspective objectives" }
+    ]);
 
-    const finalData = await Indicator.findById(id)
-      .populate("assignee", "name email groupName")
-      .populate({ path: "strategicPlanId", select: "perspective objectives" });
-
-    res.status(200).json({
-      success: true,
-      message: isApprove 
-        ? "Performance certified. Awaiting manual opening of next phase." 
-        : "Submission rejected.",
-      data: transformIndicator(finalData)
-    });
+    res.status(200).json({ success: true, data: transformIndicator(final) });
   } catch (error: any) {
+    await session.abortTransaction();
     res.status(500).json({ success: false, message: error.message });
+  } finally {
+    session.endSession();
   }
 };
 
