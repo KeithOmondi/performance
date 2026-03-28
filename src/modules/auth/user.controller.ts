@@ -137,3 +137,53 @@ export const createUser = asyncHandler(async (req: Request, res: Response) => {
     user: userResponse,
   });
 });
+
+// ─── Update User Details (SuperAdmin only) ────────────────────────────────────
+export const updateUser = asyncHandler(async (req: Request, res: Response) => {
+  const { name, email, pjNumber, title, role } = req.body;
+
+  // 1. Check if user exists
+  const user = await User.findById(req.params.id);
+  if (!user) throw new AppError("User not found.", 404);
+
+  // 2. Prevent SuperAdmin from demoting themselves via general update
+  if (req.user?._id.toString() === req.params.id && role && role !== "superadmin") {
+    throw new AppError("You cannot change your own role to a lower level.", 403);
+  }
+
+  // 3. Update the fields
+  const updatedUser = await User.findByIdAndUpdate(
+    req.params.id,
+    { name, email, pjNumber, title, role },
+    { new: true, runValidators: true }
+  ).select(USER_FIELDS);
+
+  res.status(200).json({
+    success: true,
+    message: "User details updated successfully.",
+    user: updatedUser,
+  });
+});
+
+// ─── Delete User (SuperAdmin only) ───────────────────────────────────────────
+export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
+  const user = await User.findById(req.params.id);
+
+  if (!user) throw new AppError("User not found.", 404);
+
+  // Prevent SuperAdmin from deleting themselves
+  if (req.user?._id.toString() === req.params.id) {
+    throw new AppError("You cannot delete your own account.", 403);
+  }
+
+  // Optional: Check if user has assigned indicators/tasks before allowing deletion
+  // If your system requires history, you might prefer toggleUserActive (Soft Delete)
+  
+  await User.findByIdAndDelete(req.params.id);
+
+  res.status(200).json({
+    success: true,
+    message: "User has been removed from the system.",
+    id: req.params.id
+  });
+});

@@ -4,7 +4,9 @@ import {
   getUser,
   updateUserRole,
   toggleUserActive,
-  createUser, // 👈 Add the new controller here
+  createUser,
+  updateUser,
+  deleteUser, // 👈 Add the new controller here
 } from "./user.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
@@ -31,5 +33,11 @@ router.patch("/:id/toggle", restrictTo("superadmin"), toggleUserActive);
 
 // Update user role
 router.patch("/:id/role", restrictTo("superadmin"), updateUserRole);
+
+// Update full user details
+router.put("/:id", restrictTo("superadmin"), updateUser);
+
+// Delete user
+router.delete("/:id", restrictTo("superadmin"), deleteUser);
 
 export default router;
