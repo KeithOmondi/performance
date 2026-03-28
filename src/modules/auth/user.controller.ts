@@ -107,3 +107,33 @@ export const toggleUserActive = asyncHandler(async (req: Request, res: Response)
     user,
   });
 });
+
+// ─── Create New User (SuperAdmin only) ────────────────────────────────────────
+export const createUser = asyncHandler(async (req: Request, res: Response) => {
+  const { name, email, password, role, pjNumber, title } = req.body;
+
+  // Check if user already exists
+  const existingUser = await User.findOne({ email });
+  if (existingUser) {
+    throw new AppError("A user with this email already exists.", 400);
+  }
+
+  const user = await User.create({
+    name,
+    email,
+    password, // Ensure your model hashes this!
+    role: role || "user",
+    pjNumber,
+    title,
+    isActive: true
+  });
+
+  // Remove password from response
+  const userResponse = await User.findById(user._id).select(USER_FIELDS);
+
+  res.status(201).json({
+    success: true,
+    message: "User created successfully.",
+    user: userResponse,
+  });
+});
