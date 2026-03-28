@@ -1,32 +1,58 @@
 // models/RegistryConfiguration.ts
 import mongoose, { Schema, Document } from "mongoose";
 
+export type RegistryQuarter = 0 | 1 | 2 | 3 | 4;
+
 export interface IRegistryConfiguration extends Document {
-  /** * 0 = Annual cycle registry
-   * 1-4 = Quarterly cycle registries 
+  _id: mongoose.Types.ObjectId;
+  /**
+   * 0 = Annual cycle registry
+   * 1–4 = Quarterly cycle registries
    */
-  quarter: 0 | 1 | 2 | 3 | 4; 
+  quarter: RegistryQuarter;
   year: number;
   startDate: Date;
   endDate: Date;
-  isLocked: boolean; // Manual emergency lock
+  isLocked: boolean;
+  lockedReason?: string;
+  createdBy: mongoose.Types.ObjectId;
 }
 
-const RegistryConfigSchema = new Schema<IRegistryConfiguration>({
-  // 🔹 Added 0 to the enum to support Annual logic
-  quarter: { type: Number, enum: [0, 1, 2, 3, 4], required: true },
-  year: { type: Number, required: true },
-  startDate: { type: Date, required: true },
-  endDate: { type: Date, required: true },
-  isLocked: { type: Boolean, default: false },
-});
+const RegistryConfigSchema = new Schema<IRegistryConfiguration>(
+  {
+    quarter: { type: Number, enum: [0, 1, 2, 3, 4], required: true },
+    year: {
+      type: Number,
+      required: true,
+      min: [2020, "Year must be 2020 or later"],
+      max: [2100, "Year must be 2100 or earlier"],
+    },
+    startDate: { type: Date, required: true },
+    endDate: { type: Date, required: true },
+    isLocked: { type: Boolean, default: false },
+    lockedReason: { type: String, default: "" },
+    createdBy: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+  },
+  { timestamps: true }
+);
 
-// Ensure only one config exists per quarter/year (e.g., only one "2026 Q0")
+// One config per quarter/year combination
 RegistryConfigSchema.index({ quarter: 1, year: 1 }, { unique: true });
 
-export const RegistryConfiguration = 
-  mongoose.models.RegistryConfiguration || 
+// Validate that endDate is always after startDate
+RegistryConfigSchema.pre("save", function () {
+  if (this.endDate <= this.startDate) {
+    throw new Error("End date must be after start date.");
+  }
+});
+
+export const RegistryConfiguration =
+  mongoose.models.RegistryConfiguration ||
   mongoose.model<IRegistryConfiguration>(
-    "RegistryConfiguration", 
+    "RegistryConfiguration",
     RegistryConfigSchema
   );

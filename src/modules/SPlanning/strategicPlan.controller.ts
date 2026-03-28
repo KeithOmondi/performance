@@ -1,79 +1,62 @@
-import { Request, Response, NextFunction } from "express";
+import { Request, Response } from "express";
+import { asyncHandler } from "../../utils/asyncHandler";
 import { StrategicPlanService } from "./strategicPlan.service";
 
-const createStrategicPlan = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const result = await StrategicPlanService.createStrategicPlan(req.body);
+const createStrategicPlan = asyncHandler(async (req: Request, res: Response) => {
+  const result = await StrategicPlanService.createStrategicPlan(
+    req.body,
+    req.user!._id.toString()
+  );
 
-    res.status(201).json({
-      success: true,
-      message: "Strategic Plan created",
-      data: result,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
+  res.status(201).json({
+    success: true,
+    message: "Strategic Plan created successfully.",
+    data: result,
+  });
+});
 
-const fetchAllStrategicPlans = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const result = await StrategicPlanService.fetchAllStrategicPlans();
+const fetchAllStrategicPlans = asyncHandler(async (_req: Request, res: Response) => {
+  const result = await StrategicPlanService.fetchAllStrategicPlans();
 
-    res.status(200).json({
-      success: true,
-      count: result.length,
-      data: result,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
+  res.status(200).json({
+    success: true,
+    count: result.length,
+    data: result,
+  });
+});
 
-const fetchStrategicPlanById = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const id = req.params.id as string;
+const fetchStrategicPlanById = asyncHandler(async (req: Request, res: Response) => {
+  const result = await StrategicPlanService.fetchStrategicPlanById(
+    req.params.id as string
+  );
 
-    const result = await StrategicPlanService.fetchStrategicPlanById(id);
+  res.status(200).json({
+    success: true,
+    data: result,
+  });
+});
 
-    res.status(200).json({
-      success: true,
-      data: result,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
+const updateStrategicPlan = asyncHandler(async (req: Request, res: Response) => {
+  const result = await StrategicPlanService.updateStrategicPlan(
+    req.params.id as string,
+    req.body
+  );
 
-const updateStrategicPlan = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const id = req.params.id as string;
+  res.status(200).json({
+    success: true,
+    message: "Strategic Plan updated successfully.",
+    data: result,
+  });
+});
 
-    const result = await StrategicPlanService.updateStrategicPlan(id, req.body);
+const deleteStrategicPlan = asyncHandler(async (req: Request, res: Response) => {
+  await StrategicPlanService.deleteStrategicPlan(req.params.id as string);
 
-    res.status(200).json({
-      success: true,
-      message: "Strategic Plan updated",
-      data: result,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-const deleteStrategicPlan = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const id = req.params.id as string;
-
-    await StrategicPlanService.deleteStrategicPlan(id);
-
-    res.status(200).json({
-      success: true,
-      message: "Strategic Plan deleted successfully",
-    });
-  } catch (error) {
-    next(error);
-  }
-};
+  res.status(200).json({
+    success: true,
+    message: "Strategic Plan deleted successfully.",
+  });
+});
 
 export const StrategicPlanController = {
   createStrategicPlan,

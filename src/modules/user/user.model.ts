@@ -1,18 +1,23 @@
 import mongoose, { Document, Model, Schema } from "mongoose";
 import bcrypt from "bcrypt";
 
-// Updated roles to match your administrative hierarchy
+// ---------------------- Types ----------------------
 export type UserRole = "user" | "admin" | "superadmin" | "examiner";
 
-// ---------------------- Interface ----------------------
 export interface IUser extends Document {
+  _id: mongoose.Types.ObjectId;
   name: string;
   email: string;
-  password: string;
+  password?: string;
   role: UserRole;
-  pjNumber: string; // 👈 Added
-  title: string;    // 👈 Added
+  pjNumber: string;
+  title: string;
   isActive: boolean;
+
+  // OTP Fields for Login
+  loginOtp?: string;
+  loginOtpExpires?: Date;
+
   passwordChangedAt?: Date;
 
   comparePassword(candidatePassword: string): Promise<boolean>;
@@ -32,21 +37,20 @@ const userSchema = new Schema<IUser>(
       unique: true,
       lowercase: true,
       trim: true,
+      match: [/^\S+@\S+\.\S+$/, "Please provide a valid email address"],
     },
     password: {
       type: String,
-      required: [true, "Password is required"],
-      minlength: 6,
-      select: false, 
+      minlength: [8, "Password must be at least 8 characters"],
+      select: false,
     },
-    // New Professional Identification
     pjNumber: {
       type: String,
       required: [true, "PJ Number is required"],
       unique: true,
       trim: true,
+      index: true,
     },
-    // New Professional Designation
     title: {
       type: String,
       required: [true, "Professional title is required"],
@@ -61,24 +65,46 @@ const userSchema = new Schema<IUser>(
     isActive: {
       type: Boolean,
       default: true,
+      index: true, // frequently queried in auth middleware
     },
-    passwordChangedAt: Date,
+    loginOtp: {
+      type: String,
+      select: false,
+    },
+    loginOtpExpires: {
+      type: Date,
+      select: false,
+    },
+    passwordChangedAt: {
+      type: Date,
+      select: false,
+    },
   },
   {
     timestamps: true,
+    toJSON: {
+  transform(_doc, ret: Record<string, any>) {
+    ret.password = undefined;
+    ret.loginOtp = undefined;
+    ret.loginOtpExpires = undefined;
+    ret.passwordChangedAt = undefined;
+    ret.__v = undefined;
+    return ret;
   },
+},
+  }
 );
 
 // ---------------------- Pre-save Hooks ----------------------
 
-// 🔐 Hash password before saving
+// Hash password if modified
 userSchema.pre("save", async function () {
-  if (!this.isModified("password")) return;
+  if (!this.isModified("password") || !this.password) return;
   const salt = await bcrypt.genSalt(12);
   this.password = await bcrypt.hash(this.password, salt);
 });
 
-// 🔐 Track password changes
+// Track password changes for JWT invalidation
 userSchema.pre("save", function () {
   if (!this.isModified("password") || this.isNew) return;
   this.passwordChangedAt = new Date(Date.now() - 1000);
@@ -87,9 +113,9 @@ userSchema.pre("save", function () {
 // ---------------------- Instance Methods ----------------------
 
 userSchema.methods.comparePassword = async function (
-  candidatePassword: string,
+  candidatePassword: string
 ): Promise<boolean> {
-  // Accessing 'this.password' requires it to be selected in the query
+  if (!this.password) return false;
   return bcrypt.compare(candidatePassword, this.password);
 };
 

@@ -7,11 +7,12 @@ export interface IDocument {
   evidencePublicId: string;
   fileType: "image" | "video" | "raw";
   fileName?: string;
+  uploadedAt: Date;
 }
 
 export interface ISubmission {
   _id: Types.ObjectId;
-  quarter: 0 | 1 | 2 | 3 | 4;
+  quarter: 1 | 2 | 3 | 4;
   documents: IDocument[];
   notes: string;
   adminDescriptionEdit?: string;
@@ -25,18 +26,22 @@ export interface ISubmission {
 
 export interface IReviewHistory {
   action:
+    | "Submitted"
     | "Verified"
     | "Approved"
     | "Rejected"
     | "Resubmitted"
     | "Correction Requested";
-  reason: string;
-  reviewerRole: "admin" | "superadmin" | "user";
+  reason?: string;
+  reviewerRole: "user" | "admin" | "superadmin" | "examiner";
   reviewedBy: Types.ObjectId;
   at: Date;
+  // NEW: Allow admin to propose a new deadline for the subsequent period
+  nextDeadline?: Date;
 }
 
 export interface IIndicator extends Document {
+  _id: Types.ObjectId;
   strategicPlanId: Types.ObjectId;
   objectiveId: Types.ObjectId;
   activityId: Types.ObjectId;
@@ -58,41 +63,68 @@ export interface IIndicator extends Document {
     | "Rejected by Super Admin"
     | "Completed";
   instructions?: string;
-  assignedBy: Types.ObjectId; // Now defined in Schema
-  activeQuarter: 0 | 1 | 2 | 3 | 4;
+  assignedBy: Types.ObjectId;
+  activeQuarter: 1 | 2 | 3 | 4;
   reviewHistory: IReviewHistory[];
   adminOverallComments?: string;
 }
 
 /* --- SCHEMAS --- */
 
+const DocumentSchema = new Schema<IDocument>(
+  {
+    evidenceUrl: { type: String, required: true },
+    evidencePublicId: { type: String, required: true },
+    fileType: { type: String, enum: ["image", "video", "raw"], required: true },
+    fileName: { type: String, default: "" },
+    uploadedAt: { type: Date, default: Date.now },
+  },
+  { _id: true },
+);
+
 const SubmissionSchema = new Schema<ISubmission>(
   {
-    quarter: { type: Number, enum: [0, 1, 2, 3, 4], required: true },
-    documents: [
-      {
-        evidenceUrl: { type: String, required: true },
-        evidencePublicId: { type: String, required: true },
-        fileType: {
-          type: String,
-          enum: ["image", "video", "raw"],
-          required: true,
-        },
-        fileName: String,
-      },
-    ],
-    notes: { type: String, required: true },
+    quarter: { type: Number, enum: [1, 2, 3, 4], required: true },
+    documents: { type: [DocumentSchema], default: [] },
+    notes: { type: String, required: true, trim: true },
     adminDescriptionEdit: { type: String, default: "" },
     submittedAt: { type: Date, default: Date.now },
-    achievedValue: { type: Number, default: 0 },
+    achievedValue: { type: Number, default: 0, min: 0 },
     isReviewed: { type: Boolean, default: false },
     reviewStatus: {
       type: String,
       enum: ["Pending", "Verified", "Accepted", "Rejected"],
       default: "Pending",
     },
-    adminComment: String,
-    resubmissionCount: { type: Number, default: 0 },
+    adminComment: { type: String, default: "" },
+    resubmissionCount: { type: Number, default: 0, min: 0 },
+  },
+  { _id: true },
+);
+
+const ReviewHistorySchema = new Schema<IReviewHistory>(
+  {
+    action: {
+      type: String,
+      enum: [
+        "Submitted",
+        "Verified",
+        "Approved",
+        "Rejected",
+        "Resubmitted",
+        "Correction Requested",
+      ],
+      required: true,
+    },
+    reason: { type: String, default: "" },
+    reviewerRole: {
+      type: String,
+      enum: ["user", "admin", "superadmin", "examiner"],
+      required: true,
+    },
+    reviewedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    at: { type: Date, default: Date.now },
+    nextDeadline: { type: Date }, // Stores the date chosen by Super Admin for the next phase
   },
   { _id: true },
 );
@@ -103,13 +135,15 @@ const IndicatorSchema = new Schema<IIndicator>(
       type: Schema.Types.ObjectId,
       ref: "StrategicPlan",
       required: true,
+      index: true,
     },
-    objectiveId: { type: Schema.Types.ObjectId, required: true },
+    objectiveId: { type: Schema.Types.ObjectId, required: true, index: true },
     activityId: { type: Schema.Types.ObjectId, required: true },
     assignee: {
       type: Schema.Types.ObjectId,
+      ref: "User",
       required: true,
-      refPath: "assignmentType",
+      index: true,
     },
     assignmentType: { type: String, enum: ["User", "Team"], default: "User" },
     reportingCycle: {
@@ -117,20 +151,16 @@ const IndicatorSchema = new Schema<IIndicator>(
       enum: ["Quarterly", "Annual"],
       default: "Quarterly",
     },
-    target: { type: Number, default: 100 },
-    weight: { type: Number, default: 5 },
+    target: { type: Number, default: 100, min: 0 },
+    weight: { type: Number, default: 5, min: 0, max: 100 },
     unit: { type: String, default: "%" },
     deadline: { type: Date, required: true },
-    submissions: [SubmissionSchema],
-    currentTotalAchieved: { type: Number, default: 0 },
-    progress: { type: Number, default: 0 },
-    activeQuarter: { type: Number, default: 1 },
-    instructions: { type: String, default: "" }, // Added missing field
-    assignedBy: { 
-      type: Schema.Types.ObjectId, 
-      ref: "User", 
-      required: true 
-    }, // Added missing field to fix StrictPopulateError
+    submissions: { type: [SubmissionSchema], default: [] },
+    currentTotalAchieved: { type: Number, default: 0, min: 0 },
+    progress: { type: Number, default: 0, min: 0, max: 100 },
+    activeQuarter: { type: Number, enum: [1, 2, 3, 4], default: 1 },
+    instructions: { type: String, default: "" },
+    assignedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     status: {
       type: String,
       enum: [
@@ -142,56 +172,45 @@ const IndicatorSchema = new Schema<IIndicator>(
         "Completed",
       ],
       default: "Pending",
+      index: true,
     },
-    reviewHistory: [
-      {
-        action: { 
-          type: String, 
-          enum: ["Verified", "Approved", "Rejected", "Resubmitted", "Correction Requested"] 
-        },
-        reason: String,
-        reviewerRole: { type: String, enum: ["admin", "superadmin", "user"] },
-        reviewedBy: { type: Schema.Types.ObjectId, ref: "User" },
-        at: { type: Date, default: Date.now },
-      },
-    ],
-    adminOverallComments: String,
+    reviewHistory: { type: [ReviewHistorySchema], default: [] },
+    adminOverallComments: { type: String, default: "" },
   },
   { timestamps: true },
 );
 
-/* --- THE LOGIC ENGINE --- */
+/* --- LOGIC ENGINE --- */
 
-/**
- * Sync hook handles progress math and global status transitions.
- * Since we are using Mongoose 5.x+, async/await replaces the need for next().
- */
-IndicatorSchema.pre("save", async function () {
-  const indicator = this as IIndicator;
+IndicatorSchema.pre("save", function () {
+  const indicator = this as unknown as IIndicator;
 
-  // 1. PROGRESS CALCULATION
-  const certifiedSubmissions = indicator.submissions.filter(
+  // 1. CALCULATE PROGRESS
+  const acceptedSubmissions = indicator.submissions.filter(
     (s) => s.reviewStatus === "Accepted",
   );
-  
-  const totalAchieved = certifiedSubmissions.reduce(
+  const totalAchieved = acceptedSubmissions.reduce(
     (acc, curr) => acc + (curr.achievedValue || 0),
     0,
   );
 
   indicator.currentTotalAchieved = totalAchieved;
-  if (indicator.target > 0) {
-    indicator.progress = Math.min(
-      (totalAchieved / indicator.target) * 100,
-      100,
-    );
-  }
+  indicator.progress =
+    indicator.target > 0
+      ? Math.min(Math.round((totalAchieved / indicator.target) * 100), 100)
+      : 0;
 
-  // 2. STATE TRANSITION MACHINE
-  const latestReview = indicator.reviewHistory[indicator.reviewHistory.length - 1];
+  // 2. STATE MACHINE
+  const latestReview =
+    indicator.reviewHistory[indicator.reviewHistory.length - 1];
 
   if (latestReview) {
     switch (latestReview.action) {
+      case "Submitted":
+      case "Resubmitted":
+        indicator.status = "Awaiting Admin Approval";
+        break;
+
       case "Verified":
         if (latestReview.reviewerRole === "admin") {
           indicator.status = "Awaiting Super Admin";
@@ -200,7 +219,29 @@ IndicatorSchema.pre("save", async function () {
 
       case "Approved":
         if (latestReview.reviewerRole === "superadmin") {
-          indicator.status = "Completed";
+          // LOGIC: Check Cycle & Quarter
+          if (indicator.reportingCycle === "Quarterly") {
+            if (indicator.activeQuarter < 4) {
+              // Reset for next quarter
+              indicator.activeQuarter = (indicator.activeQuarter + 1) as
+                | 1
+                | 2
+                | 3
+                | 4;
+              indicator.status = "Pending"; // Revert to Pending for the new quarter
+
+              // Apply new deadline if provided by Super Admin
+              if (latestReview.nextDeadline) {
+                indicator.deadline = latestReview.nextDeadline;
+              }
+            } else {
+              // If Q4 is approved, it is finally complete
+              indicator.status = "Completed";
+            }
+          } else {
+            // Annual indicators complete immediately
+            indicator.status = "Completed";
+          }
         }
         break;
 
@@ -211,20 +252,7 @@ IndicatorSchema.pre("save", async function () {
             ? "Rejected by Super Admin"
             : "Rejected by Admin";
         break;
-
-      case "Resubmitted":
-        indicator.status = "Awaiting Admin Approval";
-        break;
     }
-  }
-
-  // 3. FRESH SUBMISSION OVERRIDE
-  // If user adds a new submission but hasn't had a "Resubmitted" action logged yet
-  const hasFreshUpload = indicator.submissions.some((s) => s.reviewStatus === "Pending");
-  const isTerminal = ["Awaiting Super Admin", "Completed", "Rejected by Super Admin", "Rejected by Admin"].includes(indicator.status);
-
-  if (hasFreshUpload && !isTerminal) {
-    indicator.status = "Awaiting Admin Approval";
   }
 });
 

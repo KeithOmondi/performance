@@ -9,23 +9,23 @@ import { protect, restrictTo } from "../../middleware/auth.middleware";
 
 const router = Router();
 
-// --- All routes below require being logged in ---
+// All routes require authentication
 router.use(protect);
 
-// -------------------------
-// Routes
-// -------------------------
+// ─── Admin + SuperAdmin ───────────────────────────────────────────────────────
 
-// List all users: Accessible by Admin and Superadmin
+// List all users
 router.get("/", restrictTo("admin", "superadmin"), listUsers);
 
-// Get single user by ID: Accessible by Admin and Superadmin
+// Get single user
 router.get("/:id", restrictTo("admin", "superadmin"), getUser);
 
-// Update user role: STRICKLY Superadmin only
-router.patch("/:id/role", restrictTo("superadmin"), updateUserRole);
+// Toggle active/inactive
+router.patch("/:id/toggle", restrictTo("superadmin"), toggleUserActive);
 
-// Activate / Deactivate user: Accessible by Admin and Superadmin
-router.patch("/:id/toggle", restrictTo("admin", "superadmin"), toggleUserActive);
+// ─── SuperAdmin Only ──────────────────────────────────────────────────────────
+
+// Update user role
+router.patch("/:id/role", restrictTo("superadmin"), updateUserRole);
 
 export default router;

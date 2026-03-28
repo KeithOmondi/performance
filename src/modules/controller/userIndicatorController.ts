@@ -1,235 +1,235 @@
 import { Request, Response } from "express";
+import { asyncHandler } from "../../utils/asyncHandler";
+import { AppError } from "../../utils/AppError";
 import { Indicator, IDocument, ISubmission } from "../user/Indicator.model";
 import { uploadMultipleToCloudinary } from "../../config/cloudinary";
-import StrategicPlan from "../SPlanning/strategicPlan.model";
 import mongoose from "mongoose";
+import { sendMail } from "../../utils/sendMail";
+import { User } from "../user/user.model";
+import {
+  submissionReceivedTemplate,
+  adminReviewNeededTemplate,
+} from "../../utils/mailTemplates";
 
-/**
- * 🛠 DATA TRANSFORMER
- * Refined to handle .lean() POJOs and Mongoose Documents interchangeably.
- * Uses optional chaining to prevent 500 crashes on null/undefined relations.
- */
+// ─── DATA TRANSFORMER ────────────────────────────────────────────────────────
 const transformIndicator = (ind: any) => {
   if (!ind) return null;
-  
-  // 🛡️ Guard: Handle both Mongoose Doc and Plain Object from .lean()
   const rawData = typeof ind.toObject === "function" ? ind.toObject() : ind;
-  
   const plan = rawData.strategicPlanId;
   const targetObjId = rawData.objectiveId ? String(rawData.objectiveId) : null;
   const targetActId = rawData.activityId ? String(rawData.activityId) : null;
 
-  // 🛡️ Guard: Find the specific objective within the plan safely
   const objective = plan?.objectives?.find(
-    (obj: any) => obj?._id && String(obj._id) === targetObjId
+    (obj: any) => obj?._id && String(obj._id) === targetObjId,
   );
 
-  // 🛡️ Guard: Find the specific activity within that objective safely
   const activity = objective?.activities?.find(
-    (act: any) => act?._id && String(act._id) === targetActId
+    (act: any) => act?._id && String(act._id) === targetActId,
   );
 
   return {
     ...rawData,
-    // Provide fallbacks for UI fields to prevent "undefined" in frontend
     perspective: plan?.perspective || "N/A",
     objectiveTitle: objective?.title || "Strategic Objective",
     activityDescription: activity?.description || rawData.instructions || "No description provided",
-    // Preserve the ID for the frontend even if populated
     strategicPlanId: plan?._id || rawData.strategicPlanId,
-    // Ensure arrays exist even if DB record is sparse
-    submissions: rawData.submissions || [],
-    reviewHistory: rawData.reviewHistory || [],
+    submissions: (rawData.submissions || []).map((sub: any) => ({
+      ...sub,
+      documents: sub.documents || [],
+    })),
   };
 };
 
+// ─── CONTROLLER ──────────────────────────────────────────────────────────────
 export const UserIndicatorController = {
-  /**
-   * 1. GET MY ASSIGNMENTS
-   */
-  getMyIndicators: async (req: Request, res: Response) => {
+  // 1. Get My Assignments
+  getMyIndicators: asyncHandler(async (req: Request, res: Response) => {
+    const userId = new mongoose.Types.ObjectId(req.user!._id);
+
+    const indicators = await Indicator.find({ assignee: userId })
+      .populate({ path: "assignee", select: "name email pjNumber" })
+      .populate("assignedBy", "name")
+      .populate({
+        path: "strategicPlanId",
+        model: "StrategicPlan",
+        select: "perspective objectives",
+      })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    res.status(200).json({
+      success: true,
+      results: indicators.length,
+      data: indicators.map((ind) => transformIndicator(ind)),
+    });
+  }),
+
+  // 2. Get Single Indicator Details (RESTORED)
+  getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
+    const id = req.params.id as string;
+    const userId = req.user!._id;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new AppError("Invalid indicator ID.", 400);
+    }
+
+    const indicator = await Indicator.findOne({ _id: id, assignee: userId })
+      .populate({
+        path: "strategicPlanId",
+        model: "StrategicPlan",
+        select: "perspective objectives",
+      })
+      .populate("assignee", "name email pjNumber")
+      .populate("assignedBy", "name")
+      .populate("reviewHistory.reviewedBy", "name")
+      .lean();
+
+    if (!indicator) throw new AppError("Indicator not found.", 404);
+
+    res.status(200).json({
+      success: true,
+      data: transformIndicator(indicator),
+    });
+  }),
+
+  // 3. Submit / Resubmit Progress
+  submitProgress: asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { notes, achievedValue } = req.body;
+    const userId = req.user!._id;
+
+    if (!notes?.trim()) throw new AppError("Notes are required.", 400);
+    if (achievedValue === undefined) throw new AppError("Value is required.", 400);
+
+    const indicator = await Indicator.findOne({ _id: id, assignee: userId });
+    if (!indicator) throw new AppError("Indicator not found.", 404);
+
+    if (indicator.status === "Completed") throw new AppError("Filing period is closed.", 400);
+    if (indicator.status === "Awaiting Super Admin") throw new AppError("Locked for certification.", 400);
+
+    const targetQuarter = indicator.reportingCycle === "Annual" ? 1 : indicator.activeQuarter;
+    
+    // Explicit type for 's' to fix ts(7006)
+    const existingSubmission = indicator.submissions.find((s: ISubmission) => s.quarter === targetQuarter);
+
+    if (existingSubmission && !["Rejected", "Pending"].includes(existingSubmission.reviewStatus)) {
+      throw new AppError(`Q${targetQuarter} submission is already under review.`, 400);
+    }
+
+    const files = req.files as Express.Multer.File[];
+    let newDocs: IDocument[] = [];
+    if (files?.length) {
+      const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
+      newDocs = uploads.map((res, i) => ({
+        evidenceUrl: res.secure_url,
+        evidencePublicId: res.public_id,
+        fileType: res.resource_type === "video" ? "video" : files[i].mimetype === "application/pdf" ? "raw" : "image",
+        fileName: files[i].originalname,
+        uploadedAt: new Date(),
+      }));
+    }
+
+    if (existingSubmission) {
+      existingSubmission.notes = notes.trim();
+      existingSubmission.achievedValue = Number(achievedValue);
+      existingSubmission.documents.push(...newDocs);
+      existingSubmission.reviewStatus = "Pending";
+      existingSubmission.isReviewed = false;
+      existingSubmission.submittedAt = new Date();
+      existingSubmission.resubmissionCount += 1;
+
+      indicator.reviewHistory.push({
+        action: "Resubmitted",
+        reason: `Officer updated filing for Q${targetQuarter}`,
+        reviewerRole: "user",
+        reviewedBy: userId,
+        at: new Date(),
+      } as any);
+    } else {
+      indicator.submissions.push({
+        quarter: targetQuarter,
+        notes: notes.trim(),
+        achievedValue: Number(achievedValue),
+        documents: newDocs,
+        submittedAt: new Date(),
+        isReviewed: false,
+        reviewStatus: "Pending",
+        resubmissionCount: 0,
+      } as any);
+
+      indicator.reviewHistory.push({
+        action: "Submitted",
+        reason: `Initial filing for Q${targetQuarter}`,
+        reviewerRole: "user",
+        reviewedBy: userId,
+        at: new Date(),
+      } as any);
+    }
+
+    indicator.markModified("submissions");
+    await indicator.save();
+
+    // Existence check for req.user to fix ts(2532)
+    if (req.user) {
+      UserIndicatorController._sendAlerts(req.user, indicator, targetQuarter);
+    }
+
+    res.status(201).json({ success: true, message: "Filing processed." });
+  }),
+
+  // 4. Add Documents
+  addDocuments: asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { quarter } = req.body;
+    const userId = req.user!._id;
+
+    const files = req.files as Express.Multer.File[];
+    if (!files?.length) throw new AppError("Files required.", 400);
+
+    const indicator = await Indicator.findOne({ _id: id, assignee: userId });
+    if (!indicator) throw new AppError("Not found.", 404);
+
+    const targetQ = Number(quarter) || indicator.activeQuarter;
+    
+    // Explicit type for 's' to fix ts(7006)
+    const submission = indicator.submissions.find((s: ISubmission) => s.quarter === targetQ);
+
+    if (!submission) throw new AppError("No submission found.", 404);
+    if (submission.reviewStatus === "Accepted") throw new AppError("Record is certified.", 400);
+
+    const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
+    const docs: IDocument[] = uploads.map((res, i) => ({
+      evidenceUrl: res.secure_url,
+      evidencePublicId: res.public_id,
+      fileType: res.resource_type === "video" ? "video" : files[i].mimetype === "application/pdf" ? "raw" : "image",
+      fileName: files[i].originalname,
+      uploadedAt: new Date(),
+    }));
+
+    submission.documents.push(...docs);
+    indicator.markModified("submissions");
+    await indicator.save();
+
+    res.status(200).json({ success: true, documents: docs });
+  }),
+
+  // Internal Helper
+  _sendAlerts: async (user: any, indicator: any, q: number) => {
     try {
-      console.log("🔍 Fetching assignments for user:", req.user?._id);
+      sendMail({
+        to: user.email,
+        subject: `Registry Filing: Q${q}`,
+        html: submissionReceivedTemplate(user.name, indicator.instructions || "Indicator", q, new Date().getFullYear()),
+      });
 
-      if (!req.user?._id) {
-        return res.status(401).json({ success: false, message: "Authentication required" });
-      }
-
-      const userId = new mongoose.Types.ObjectId(req.user._id);
-
-      const indicators = await Indicator.find({ assignee: userId })
-        .populate({ path: "assignee", select: "name email pjNumber teamName" })
-        .populate("assignedBy", "name")
-        .populate({
-          path: "strategicPlanId",
-          model: "StrategicPlan",
-          select: "perspective objectives", 
-        })
-        .sort({ updatedAt: -1 })
-        .lean();
-
-      console.log(`📦 DB Found ${indicators.length} indicators for user ${userId}`);
-
-      // Log the first raw indicator to see if strategicPlanId populated correctly
-      if (indicators.length > 0) {
-        console.log("🛠 Sample Raw Data (First Item):", {
-          id: indicators[0]._id,
-          hasPlan: !!indicators[0].strategicPlanId,
-          planDetails: indicators[0].strategicPlanId?.perspective || "MISSING_PERSPECTIVE"
+      const admins = await User.find({ role: "admin", isActive: true }).select("email name");
+      admins.forEach(admin => {
+        sendMail({
+          to: admin.email,
+          subject: "Verification Required",
+          html: adminReviewNeededTemplate(admin.name, user.name, indicator.instructions || "Indicator", q, new Date().getFullYear()),
         });
-      }
-
-      const transformedData = indicators.map((ind, index) => {
-        try {
-          return transformIndicator(ind);
-        } catch (err: any) {
-          console.error(`❌ Transformation failed at index ${index} (ID: ${ind._id}):`, err.message);
-          throw err; // Re-throw to trigger catch block
-        }
       });
-
-      console.log("✅ Transformation complete. Sending response...");
-
-      res.status(200).json({ 
-        success: true, 
-        results: indicators.length,
-        data: transformedData 
-      });
-    } catch (error: any) {
-      console.error("🔥 GET_MY_INDICATORS_CRASH:", error); // Log full error object, not just message
-      res.status(500).json({ 
-        success: false, 
-        message: "Error processing assignments registry data.",
-        error: error.message // Temporarily sending error to frontend for debugging
-      });
-    }
-  },
-
-  /**
-   * 2. SUBMIT PROGRESS / DOSSIER
-   */
-  submitProgress: async (req: Request, res: Response) => {
-    try {
-      const { id } = req.params;
-      const { notes, achievedValue } = req.body; 
-      const userId = req.user._id;
-
-      // Do NOT use .lean() here, we need the .save() method
-      const indicator = await Indicator.findOne({ _id: id, assignee: userId });
-      
-      if (!indicator) {
-        return res.status(404).json({ success: false, message: "Indicator dossier not found" });
-      }
-
-      const isAnnual = indicator.reportingCycle === "Annual";
-      const targetQuarter = isAnnual ? 0 : indicator.activeQuarter;
-
-      let submission = indicator.submissions.find(
-        (s: ISubmission) => s.quarter === targetQuarter
-      );
-
-      // BLOCKER: State Firewall
-      if (submission) {
-        if (submission.reviewStatus === "Pending" || indicator.status === "Awaiting Super Admin") {
-          return res.status(400).json({
-            success: false,
-            message: "Submission locked. Currently undergoing Registry Audit.",
-          });
-        }
-        if (submission.reviewStatus === "Accepted") {
-          return { success: false, message: "Cycle certified. No further filings allowed." };
-        }
-      }
-
-      // Handle Files
-      const files = req.files as Express.Multer.File[];
-      let newDocuments: IDocument[] = [];
-      
-      if (files && files.length > 0) {
-        const uploadResults = await uploadMultipleToCloudinary(files, "registry_evidence");
-        newDocuments = uploadResults.map((result, index) => ({
-          evidenceUrl: result.secure_url,
-          evidencePublicId: result.public_id,
-          fileType: result.resource_type === "video" ? "video" : 
-                    files[index].mimetype === "application/pdf" ? "raw" : "image",
-          fileName: files[index].originalname,
-        }));
-      }
-
-      if (submission) {
-        // Update existing logic
-        submission.notes = notes || submission.notes;
-        submission.achievedValue = Number(achievedValue) || submission.achievedValue;
-        submission.documents.push(...newDocuments);
-        submission.reviewStatus = "Pending";
-        submission.isReviewed = false;
-        submission.submittedAt = new Date();
-        submission.resubmissionCount += 1;
-
-        indicator.reviewHistory.push({
-          action: "Resubmitted",
-          reason: `Evidence amended for review cycle.`,
-          reviewerRole: "user",
-          reviewedBy: userId,
-          at: new Date(),
-        } as any);
-      } else {
-        // Fresh submission logic
-        indicator.submissions.push({
-          quarter: targetQuarter,
-          notes,
-          achievedValue: Number(achievedValue) || 0,
-          documents: newDocuments,
-          submittedAt: new Date(),
-          isReviewed: false,
-          reviewStatus: "Pending",
-          resubmissionCount: 0,
-        } as any);
-      }
-
-      // Trigger re-audit
-      indicator.status = "Awaiting Admin Approval";
-      await indicator.save(); 
-
-      res.status(201).json({
-        success: true,
-        message: "Submission successful.",
-      });
-    } catch (error: any) {
-      console.error("🔥 SUBMISSION_CRASH:", error);
-      res.status(500).json({ success: false, message: error.message });
-    }
-  },
-
-  /**
-   * 3. GET SINGLE DOSSIER DETAILS
-   */
-  getIndicatorDetails: async (req: Request, res: Response) => {
-    try {
-      const { id } = req.params;
-      const userId = req.user._id;
-
-      const indicator = await Indicator.findOne({ _id: id, assignee: userId })
-        .populate({
-          path: "strategicPlanId",
-          model: "StrategicPlan",
-          select: "perspective objectives",
-        })
-        .populate("assignee", "name email pjNumber teamName")
-        .populate("assignedBy", "name")
-        .populate("reviewHistory.reviewedBy", "name")
-        .lean(); // Faster lookup for details
-
-      if (!indicator) {
-        return res.status(404).json({ success: false, message: "Indicator not found" });
-      }
-
-      res.status(200).json({ 
-        success: true, 
-        data: transformIndicator(indicator) 
-      });
-    } catch (error: any) {
-      res.status(500).json({ success: false, message: error.message });
-    }
-  },
+    } catch (e) { console.error("Mail Failure:", e); }
+  }
 };

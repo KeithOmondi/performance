@@ -6,11 +6,12 @@ declare module 'xss-clean' {
   export default xss;
 }
 
-
 declare global {
   namespace Express {
     interface Request {
-      user: IUser; 
+      user?: IUser;
+      file?: Express.Multer.File;
+      files?: Express.Multer.File[];
     }
   }
 }

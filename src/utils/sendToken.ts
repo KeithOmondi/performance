@@ -2,14 +2,15 @@ import { Response } from "express";
 import jwt, { SignOptions } from "jsonwebtoken";
 import { env } from "../config/env";
 import ms from "ms";
+import { IUser } from "../modules/user/user.model";
 
 export interface IUserPayload {
   id: string;
-  role: string;
+  role: "user" | "admin" | "superadmin" | "examiner";
 }
 
-const parseExpires = (value: string): SignOptions['expiresIn'] => {
-  return value as unknown as SignOptions['expiresIn'];
+const parseExpires = (value: string): SignOptions["expiresIn"] => {
+  return value as unknown as SignOptions["expiresIn"];
 };
 
 export const generateAccessToken = (payload: IUserPayload) => {
@@ -22,14 +23,10 @@ export const generateRefreshToken = (payload: IUserPayload) => {
   return jwt.sign(payload, env.JWT_REFRESH_SECRET, options);
 };
 
-export const sendToken = (
-  res: Response,
-  // Changed to 'any' or a Document type to handle Mongoose ObjectIds
-  user: any 
-) => {
-  const payload: IUserPayload = { 
-    id: user._id.toString(), 
-    role: user.role 
+export const sendToken = (res: Response, user: IUser, statusCode: number = 200) => {
+  const payload: IUserPayload = {
+    id: user._id.toString(),
+    role: user.role,
   };
 
   const accessToken = generateAccessToken(payload);
@@ -41,18 +38,17 @@ export const sendToken = (
     httpOnly: true,
     secure: isProduction,
     sameSite: isProduction ? "none" : "lax",
-    maxAge: ms('15m'),
+    maxAge: ms("15m"),
   });
 
   res.cookie("refreshToken", refreshToken, {
     httpOnly: true,
     secure: isProduction,
     sameSite: isProduction ? "none" : "lax",
-    maxAge: ms('7d'),
+    maxAge: ms("7d"),
   });
 
-  // ✅ CRITICAL FIX: Include user object so frontend state.user is not null
-  return res.status(200).json({
+  return res.status(statusCode).json({
     success: true,
     message: "Authentication successful",
     user: {

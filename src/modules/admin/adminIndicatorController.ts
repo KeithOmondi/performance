@@ -1,21 +1,27 @@
 import { Request, Response } from "express";
-import { Indicator, ISubmission } from "../user/Indicator.model";
-import StrategicPlan from "../SPlanning/strategicPlan.model";
+import { asyncHandler } from "../../utils/asyncHandler";
+import { AppError } from "../../utils/AppError";
+import { Indicator } from "../user/Indicator.model";
 import { User } from "../user/user.model";
+import { sendMail } from "../../utils/sendMail";
+import {
+  submissionRejectedTemplate,
+  superAdminReviewNeededTemplate,
+} from "../../utils/mailTemplates";
+import mongoose from "mongoose";
 
-/**
- * 🛠 DATA TRANSFORMER
- */
+// ─── Data Transformer (Enhanced for Lean Objects & Nested Documents) ──────────
 const transformIndicator = (ind: any) => {
+  if (!ind) return null;
   const indObj = typeof ind.toObject === "function" ? ind.toObject() : ind;
   const plan = indObj.strategicPlanId;
 
   const objective = plan?.objectives?.find(
-    (obj: any) => obj._id?.toString() === indObj.objectiveId?.toString(),
+    (obj: any) => obj._id?.toString() === indObj.objectiveId?.toString()
   );
 
   const activity = objective?.activities?.find(
-    (act: any) => act._id?.toString() === indObj.activityId?.toString(),
+    (act: any) => act._id?.toString() === indObj.activityId?.toString()
   );
 
   return {
@@ -25,194 +31,83 @@ const transformIndicator = (ind: any) => {
     objectiveTitle: objective?.title || "Unknown Objective",
     activityDescription:
       activity?.description || indObj.instructions || "No activity text",
-    assigneeDisplayName:
-      indObj.assignee?.name || indObj.assignee?.groupName || "Unassigned",
+    assigneeDisplayName: indObj.assignee?.name || "Unassigned",
+    // FIX: Deep map submissions to ensure documents array is always present
+    submissions: (indObj.submissions || []).map((sub: any) => ({
+      ...sub,
+      _id: sub._id?.toString(),
+      documents: sub.documents || [],
+    })),
     isOverdue:
       new Date() > new Date(indObj.deadline) && indObj.status !== "Completed",
   };
 };
 
-/**
- * ⚖️ ADMIN VERIFICATION PROCESS (The Audit Gate)
- * ACTION: "Verified" -> Status: "Awaiting Super Admin"
- * PROGRESS: Remains unchanged (Accepted logic not yet triggered)
- */
-export const adminReviewProcess = async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const {
-      decision, // "Verified" | "Rejected"
-      adminOverallComments,
-      submissionUpdates,
-    } = req.body;
+// ─── 1. Get All Indicators (Admin Dashboard) ──────────────────────────────────
+export const fetchIndicatorsForAdmin = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { status, search } = req.query;
+    const filter: Record<string, any> = {};
 
-    const indicator = await Indicator.findById(id);
-    if (!indicator)
-      return res
-        .status(404)
-        .json({ success: false, message: "Indicator not found" });
-
-    const isVerified = decision === "Verified";
-
-    // 1. Audit individual submissions
-    if (Array.isArray(submissionUpdates)) {
-      submissionUpdates.forEach((update: any) => {
-        const sub = (indicator.submissions as any).id(update.submissionId);
-        if (sub) {
-          // IMPORTANT: Admin marks as 'Verified', NOT 'Accepted'
-          sub.reviewStatus = isVerified ? "Verified" : "Rejected";
-          sub.adminComment = update.adminComment;
-          if (update.adminDescriptionEdit !== undefined) {
-            sub.adminDescriptionEdit = update.adminDescriptionEdit;
-          }
-          sub.isReviewed = true;
-        }
-      });
+    if (status && typeof status === "string" && status !== "all") {
+      filter.status = status;
     }
 
-    indicator.adminOverallComments = adminOverallComments;
+    if (search && typeof search === "string") {
+      const matchingUsers = await User.find({
+        $or: [
+          { name: { $regex: search, $options: "i" } },
+          { pjNumber: { $regex: search, $options: "i" } },
+        ],
+      }).select("_id");
+      filter.assignee = { $in: matchingUsers.map((u) => u._id) };
+    }
 
-    // 2. Log History (Triggers Middleware Step 2)
-    indicator.reviewHistory.push({
-      action: isVerified ? "Verified" : "Correction Requested",
-      reason:
-        adminOverallComments ||
-        (isVerified
-          ? "Audit passed. Documentation verified."
-          : "Insufficient evidence."),
-      reviewerRole: "admin",
-      reviewedBy: (req as any).user?._id,
-      at: new Date(),
-    });
-
-    await indicator.save();
+    const indicators = await Indicator.find(filter)
+      .populate({ path: "assignee", select: "name email pjNumber" })
+      .populate({ path: "strategicPlanId", select: "perspective objectives" })
+      .populate({ path: "assignedBy", select: "name" })
+      .sort({ updatedAt: -1 })
+      .lean();
 
     res.status(200).json({
       success: true,
-      message: isVerified
-        ? "Verified and sent to Super Admin."
-        : "Returned for correction.",
+      count: indicators.length,
+      data: indicators.map(transformIndicator),
+    });
+  }
+);
+
+// ─── 2. Get Single Indicator (Admin View) ─────────────────────────────────────
+export const getIndicatorByIdAdmin = asyncHandler(
+  async (req: Request, res: Response) => {
+    const id = req.params.id as string;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new AppError("Invalid indicator ID.", 400);
+    }
+
+    const indicator = await Indicator.findById(id)
+      .populate({ path: "assignee", select: "name email pjNumber" })
+      .populate({ path: "assignedBy", select: "name" })
+      .populate({ path: "strategicPlanId", select: "perspective objectives" })
+      .populate({ path: "reviewHistory.reviewedBy", select: "name role" })
+      .lean();
+
+    if (!indicator) throw new AppError("Indicator not found.", 404);
+
+    res.status(200).json({
+      success: true,
       data: transformIndicator(indicator),
     });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
   }
-};
+);
 
-/**
- * 🛡️ SUPER ADMIN CERTIFICATION (The Value Gate)
- * ACTION: "Approved" -> Status: "Completed"
- * PROGRESS: Recalculates based on "Accepted" submissions
- */
-export const superAdminReviewProcess = async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const { decision, reason, progressOverride } = req.body;
-
-    const indicator = await Indicator.findById(id);
-    if (!indicator)
-      return res
-        .status(404)
-        .json({ success: false, message: "Indicator not found" });
-
-    const isApprove = decision === "Approved";
-
-    if (isApprove) {
-      // Find the specific cycle's submission that the Admin just verified
-      const targetQ =
-        indicator.reportingCycle === "Annual" ? 0 : indicator.activeQuarter;
-      const currentSub = indicator.submissions.find(
-        (s: ISubmission) =>
-          s.quarter === targetQ && s.reviewStatus === "Verified",
-      );
-
-      if (currentSub) {
-        // FINAL ACT: Change status to 'Accepted' to trigger progress calculation
-        currentSub.reviewStatus = "Accepted";
-        if (progressOverride !== undefined) {
-          currentSub.achievedValue = Number(progressOverride);
-        }
-      }
-    }
-
-    // 2. Log Certification (Triggers Middleware Step 2 to set status "Completed")
-    indicator.reviewHistory.push({
-      action: isApprove ? "Approved" : "Rejected",
-      reason: reason || "Performance certified and finalized.",
-      reviewerRole: "superadmin",
-      reviewedBy: (req as any).user?._id,
-      at: new Date(),
-    });
-
-    await indicator.save();
-
-    // Re-fetch with populations for a clean UI update
-    const updated = await Indicator.findById(id)
-      .populate({ path: "assignee", model: User })
-      .populate({ path: "strategicPlanId", model: StrategicPlan });
-
-    res.status(200).json({
-      success: true,
-      message: isApprove
-        ? "Performance certified at 100%"
-        : "Rejection recorded",
-      data: transformIndicator(updated),
-    });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-/**
- * 🔍 DASHBOARD UTILITIES
- */
-
-export const fetchIndicatorsForAdmin = async (req: Request, res: Response) => {
-  try {
-    const indicators = await Indicator.find()
-      .populate({
-        path: "assignee",
-        model: User,
-        select: "name email role station",
-      })
-      .populate({ path: "strategicPlanId", model: StrategicPlan })
-      .sort({ updatedAt: -1 });
-
-    res
-      .status(200)
-      .json({ success: true, data: indicators.map(transformIndicator) });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-export const getIndicatorByIdAdmin = async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const indicator = await Indicator.findById(id)
-      .populate({ path: "assignee", model: User })
-      .populate({ path: "strategicPlanId", model: StrategicPlan })
-      .populate({ path: "reviewHistory.reviewedBy", model: User });
-
-    if (!indicator)
-      return res
-        .status(404)
-        .json({ success: false, message: "Indicator not found" });
-
-    res
-      .status(200)
-      .json({ success: true, data: transformIndicator(indicator) });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-export const fetchResubmittedIndicators = async (
-  req: Request,
-  res: Response,
-) => {
-  try {
+// ─── 3. Get Resubmitted Indicators ────────────────────────────────────────────
+export const fetchResubmittedIndicators = asyncHandler(
+  async (_req: Request, res: Response) => {
     const indicators = await Indicator.find({
+      status: "Awaiting Admin Approval",
       submissions: {
         $elemMatch: {
           reviewStatus: "Pending",
@@ -220,15 +115,130 @@ export const fetchResubmittedIndicators = async (
         },
       },
     })
-      .populate({ path: "assignee", model: User })
-      .populate({ path: "strategicPlanId", model: StrategicPlan });
+      .populate({ path: "assignee", select: "name email pjNumber" })
+      .populate({ path: "strategicPlanId", select: "perspective objectives" })
+      .sort({ updatedAt: -1 })
+      .lean();
 
     res.status(200).json({
       success: true,
       count: indicators.length,
       data: indicators.map(transformIndicator),
     });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
   }
-};
+);
+
+// ─── 4. Admin Review (Verify or Reject) ───────────────────────────────────────
+export const adminReviewProcess = asyncHandler(
+  async (req: Request, res: Response) => {
+    const id = req.params.id as string;
+    const { decision, adminOverallComments, submissionUpdates } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      throw new AppError("Invalid indicator ID.", 400);
+    }
+
+    if (!["Verified", "Rejected"].includes(decision)) {
+      throw new AppError('Decision must be "Verified" or "Rejected".', 400);
+    }
+
+    if (!adminOverallComments?.trim()) {
+      throw new AppError("Admin comments are required.", 400);
+    }
+
+    const indicator = await Indicator.findById(id).populate(
+      "assignee",
+      "name email"
+    );
+    if (!indicator) throw new AppError("Indicator not found.", 404);
+
+    if (indicator.status !== "Awaiting Admin Approval") {
+      throw new AppError(`Indicator is not in review status.`, 400);
+    }
+
+    let finalUpdates = submissionUpdates;
+    if (!Array.isArray(finalUpdates) || finalUpdates.length === 0) {
+      finalUpdates = indicator.submissions
+        .filter((s: any) => s.reviewStatus === "Pending")
+        .map((s: any) => ({ submissionId: s._id }));
+    }
+
+    if (finalUpdates.length === 0) {
+      throw new AppError("At least one submission update is required.", 400);
+    }
+
+    const isVerified = decision === "Verified";
+
+    // Update Sub-documents
+    finalUpdates.forEach((update: any) => {
+      if (!update.submissionId) return;
+      const sub = (indicator.submissions as any).id(update.submissionId);
+      if (sub) {
+        sub.reviewStatus = isVerified ? "Verified" : "Rejected";
+        sub.adminComment = update.adminComment?.trim() || adminOverallComments.trim();
+        sub.isReviewed = true;
+      }
+    });
+
+    // Parent status and logs
+    indicator.status = isVerified ? "Awaiting Super Admin" : "Rejected by Admin";
+    indicator.adminOverallComments = adminOverallComments.trim();
+    
+    // Explicitly tell Mongoose that nested array has changed
+    indicator.markModified("submissions");
+
+    indicator.reviewHistory.push({
+      action: isVerified ? "Verified" : "Correction Requested",
+      reason: adminOverallComments.trim(),
+      reviewerRole: "admin",
+      reviewedBy: (req as any).user?._id,
+      at: new Date(),
+    } as any);
+
+    await indicator.save();
+
+    // Async Notifications
+    const assignee = indicator.assignee as any;
+    const taskTitle = indicator.instructions || "Performance Indicator";
+    const year = new Date().getFullYear();
+
+    if (isVerified) {
+      User.find({ role: "superadmin", isActive: true })
+        .select("email")
+        .then((superAdmins) => {
+          superAdmins.forEach((sa) => {
+            sendMail({
+              to: sa.email,
+              subject: "Submission Ready for Final Approval",
+              html: superAdminReviewNeededTemplate(
+                taskTitle,
+                assignee?.name || "Staff",
+                (req as any).user?.name,
+                indicator.activeQuarter,
+                year
+              ),
+            }).catch((e) => console.error("Mail Error:", e));
+          });
+        });
+    } else if (assignee?.email) {
+      sendMail({
+        to: assignee.email,
+        subject: "Submission Returned for Correction",
+        html: submissionRejectedTemplate(
+          assignee.name,
+          taskTitle,
+          indicator.activeQuarter,
+          year,
+          "Admin",
+          adminOverallComments.trim()
+        ),
+      }).catch((e) => console.error("Mail Error:", e));
+    }
+
+    res.status(200).json({
+      success: true,
+      message: isVerified ? "Verified successfully." : "Rejected for correction.",
+      data: transformIndicator(indicator),
+    });
+  }
+);

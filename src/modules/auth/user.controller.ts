@@ -1,18 +1,35 @@
 import { Request, Response } from "express";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
-import { User } from "../user/user.model";
+import { User, UserRole } from "../user/user.model";
 
-// Helper to define exactly which fields the UI needs
 const USER_FIELDS = "name email role pjNumber title isActive createdAt";
 
-// -------------------------
-// List All Users (Admin/Superadmin)
-// -------------------------
-export const listUsers = asyncHandler(async (_req: Request, res: Response) => {
-  const users = await User.find()
-    .select(USER_FIELDS)
-    .sort("-createdAt");
+const VALID_ROLES: UserRole[] = ["user", "admin", "superadmin", "examiner"];
+
+// ─── List All Users ───────────────────────────────────────────────────────────
+export const listUsers = asyncHandler(async (req: Request, res: Response) => {
+  const { role, isActive, search } = req.query;
+
+  const filter: Record<string, any> = {};
+
+  if (role && VALID_ROLES.includes(role as UserRole)) {
+    filter.role = role;
+  }
+
+  if (isActive !== undefined) {
+    filter.isActive = isActive === "true";
+  }
+
+  if (search && typeof search === "string") {
+    filter.$or = [
+      { name: { $regex: search, $options: "i" } },
+      { email: { $regex: search, $options: "i" } },
+      { pjNumber: { $regex: search, $options: "i" } },
+    ];
+  }
+
+  const users = await User.find(filter).select(USER_FIELDS).sort("-createdAt");
 
   res.status(200).json({
     success: true,
@@ -21,13 +38,10 @@ export const listUsers = asyncHandler(async (_req: Request, res: Response) => {
   });
 });
 
-// -------------------------
-// Get Single User by ID
-// -------------------------
+// ─── Get Single User ──────────────────────────────────────────────────────────
 export const getUser = asyncHandler(async (req: Request, res: Response) => {
   const user = await User.findById(req.params.id).select(USER_FIELDS);
-  
-  if (!user) throw new AppError("User not found", 404);
+  if (!user) throw new AppError("User not found.", 404);
 
   res.status(200).json({
     success: true,
@@ -35,17 +49,20 @@ export const getUser = asyncHandler(async (req: Request, res: Response) => {
   });
 });
 
-// -------------------------
-// Update User Role (Superadmin Only)
-// -------------------------
+// ─── Update User Role (SuperAdmin only) ───────────────────────────────────────
 export const updateUserRole = asyncHandler(async (req: Request, res: Response) => {
   const { role } = req.body;
-  
-  // Updated to include all roles from your Model: "user", "admin", "superadmin", "reviewer", "registrar"
-  const validRoles = ["user", "admin", "superadmin", "examiner",];
-  
-  if (!role || !validRoles.includes(role)) {
-    throw new AppError("Invalid role. Must be one of: " + validRoles.join(", "), 400);
+
+  if (!role || !VALID_ROLES.includes(role as UserRole)) {
+    throw new AppError(
+      `Invalid role. Must be one of: ${VALID_ROLES.join(", ")}.`,
+      400
+    );
+  }
+
+  // Prevent SuperAdmin from demoting themselves
+  if (req.user?._id.toString() === req.params.id && role !== "superadmin") {
+    throw new AppError("You cannot change your own role.", 403);
   }
 
   const user = await User.findByIdAndUpdate(
@@ -54,23 +71,26 @@ export const updateUserRole = asyncHandler(async (req: Request, res: Response) =
     { new: true, runValidators: true }
   ).select(USER_FIELDS);
 
-  if (!user) throw new AppError("User not found", 404);
+  if (!user) throw new AppError("User not found.", 404);
 
   res.status(200).json({
     success: true,
-    message: `User role updated to ${role}`,
+    message: `User role updated to "${role}" successfully.`,
     user,
   });
 });
 
-// -------------------------
-// Deactivate / Reactivate User
-// -------------------------
+// ─── Toggle User Active/Inactive (SuperAdmin only) ────────────────────────────
 export const toggleUserActive = asyncHandler(async (req: Request, res: Response) => {
   const { isActive } = req.body;
-  
+
   if (typeof isActive !== "boolean") {
-    throw new AppError("isActive must be true or false", 400);
+    throw new AppError("isActive must be a boolean (true or false).", 400);
+  }
+
+  // Prevent SuperAdmin from deactivating themselves
+  if (req.user?._id.toString() === req.params.id && !isActive) {
+    throw new AppError("You cannot deactivate your own account.", 403);
   }
 
   const user = await User.findByIdAndUpdate(
@@ -79,11 +99,11 @@ export const toggleUserActive = asyncHandler(async (req: Request, res: Response)
     { new: true }
   ).select(USER_FIELDS);
 
-  if (!user) throw new AppError("User not found", 404);
+  if (!user) throw new AppError("User not found.", 404);
 
   res.status(200).json({
     success: true,
-    message: `User status set to ${isActive}`,
+    message: `User account ${isActive ? "activated" : "deactivated"} successfully.`,
     user,
   });
 });

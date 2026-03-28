@@ -1,13 +1,20 @@
 import { Request, Response } from "express";
+import { asyncHandler } from "../../utils/asyncHandler";
+import { AppError } from "../../utils/AppError";
 import { Indicator, ISubmission } from "../user/Indicator.model";
-import { Types } from "mongoose";
 import { RegistryConfiguration } from "../user/RegistryConfiguration";
+import { User } from "../user/user.model";
+import { sendMail } from "../../utils/sendMail";
+import {
+  submissionApprovedTemplate,
+  submissionRejectedTemplate,
+  taskAssignedTemplate,
+} from "../../utils/mailTemplates";
 import mongoose from "mongoose";
 
-/**
- * HELPER: transformIndicator
- */
+// ─── Data Transformer ─────────────────────────────────────────────────────────
 const transformIndicator = (ind: any) => {
+  if (!ind) return null;
   const indObj = typeof ind.toObject === "function" ? ind.toObject() : ind;
   const plan = indObj.strategicPlanId;
 
@@ -18,170 +25,299 @@ const transformIndicator = (ind: any) => {
     (act: any) => act._id?.toString() === indObj.activityId?.toString()
   );
 
-  const displayName = indObj.assignee?.name || indObj.assignee?.groupName || "Unassigned";
-
   return {
     ...indObj,
     perspective: plan?.perspective || "N/A",
     objectiveTitle: objective?.title || "Unknown Objective",
-    activityDescription: activity?.description || indObj.instructions || "No activity text",
-    assigneeDisplayName: displayName,
-    // UI Logic: Needs action if rejected at any level
-    needsAction: ["Rejected by Admin", "Rejected by Super Admin"].includes(indObj.status),
+    activityDescription:
+      activity?.description || indObj.instructions || "No activity text",
+    assigneeDisplayName: indObj.assignee?.name || "Unassigned",
+    needsAction: ["Rejected by Admin", "Rejected by Super Admin"].includes(
+      indObj.status
+    ),
+    isOverdue:
+      new Date() > new Date(indObj.deadline) && indObj.status !== "Completed",
   };
 };
 
-
-/**
- * @desc 1. CREATE INDICATOR (Super Admin / Management)
- */
-export const createIndicator = async (req: Request, res: Response) => {
-  try {
+// ─── 1. Create Indicator ──────────────────────────────────────────────────────
+export const createIndicator = asyncHandler(
+  async (req: Request, res: Response) => {
     const {
-      strategicPlanId, objectiveId, activityId, assignee,
-      assignmentType, reportingCycle, weight, unit, target,
-      deadline, instructions
+      strategicPlanId,
+      objectiveId,
+      activityId,
+      assignee,
+      assignmentType,
+      reportingCycle,
+      weight,
+      unit,
+      target,
+      deadline,
+      instructions,
+      activeQuarter,
     } = req.body;
 
-    // Default activeQuarter to 0 if Annual, else 1
-    const initialQuarter = reportingCycle === "Annual" ? 0 : 1;
+    if (!strategicPlanId || !objectiveId || !activityId || !assignee || !deadline) {
+      throw new AppError("Required fields missing: plan, objective, activity, assignee, or deadline.", 400);
+    }
+
+    const assigneeUser = await User.findById(assignee).select("name email role");
+    if (!assigneeUser) throw new AppError("Assignee user not found.", 404);
+
+    const parsedDeadline = new Date(deadline);
+    if (parsedDeadline < new Date()) throw new AppError("Deadline cannot be in the past.", 400);
 
     const indicator = await Indicator.create({
       strategicPlanId,
       objectiveId,
       activityId,
       assignee,
-      assignmentType,
+      assignmentType: assignmentType || "User",
       reportingCycle: reportingCycle || "Quarterly",
       weight: weight || 5,
       unit: unit || "%",
       target: target || 100,
-      deadline,
-      instructions,
-      activeQuarter: initialQuarter,
-      assignedBy: (req as any).user?._id,
+      deadline: parsedDeadline,
+      instructions: instructions || "",
+      activeQuarter: activeQuarter || 1,
+      assignedBy: req.user!._id,
       status: "Pending",
     });
 
-    res.status(201).json({ success: true, data: indicator });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-/**
- * @desc 2. UPDATE INDICATOR
- * Refined to let the Model Hook handle status transitions.
- */
-export const updateIndicator = async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const indicator = await Indicator.findById(id);
-    
-    if (!indicator) return res.status(404).json({ success: false, message: "Not found" });
-
-    // Apply updates via Object.assign to trigger 'save' middleware correctly
-    Object.assign(indicator, req.body);
-
-    // If core tracking parameters change, we manually reset status to Pending
-    // to force a fresh review cycle, then save triggers the logic engine.
-    if (req.body.deadline || req.body.activeQuarter !== undefined || req.body.target) {
-      indicator.status = "Pending";
+    try {
+      await sendMail({
+        to: assigneeUser.email,
+        subject: "New Task Assigned",
+        html: taskAssignedTemplate(assigneeUser.name, instructions, activeQuarter, new Date().getFullYear(), parsedDeadline.toDateString()),
+      });
+    } catch (err) {
+      console.error("[MAIL] Notification failed:", err);
     }
 
-    await indicator.save();
-    
-    const populated = await indicator.populate([
-      { path: "assignee", select: "name email groupName" },
-      { path: "strategicPlanId", select: "perspective objectives" }
-    ]);
-
-    res.status(200).json({ success: true, data: transformIndicator(populated) });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(201).json({ success: true, data: indicator });
   }
-};
+);
 
+// ─── 2. Get All Indicators ────────────────────────────────────────────────────
+export const getAllIndicators = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { status, assignee } = req.query;
+    const filter: Record<string, any> = {};
 
-/**
- * @desc 3. DELETE INDICATOR
- */
-export const deleteIndicator = async (req: Request, res: Response) => {
-  try {
-    await Indicator.findByIdAndDelete(req.params.id);
-    res.status(200).json({ success: true, message: "Indicator deleted successfully" });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
+    if (status) filter.status = status;
+    if (assignee && mongoose.Types.ObjectId.isValid(assignee as string)) filter.assignee = assignee;
 
-/**
- * @desc 4. GET ALL SUBMISSIONS (Work Queue for Super Admin)
- */
-export const getAllSubmissions = async (_req: Request, res: Response) => {
-  try {
-    const indicators = await Indicator.find({ "submissions.0": { $exists: true } })
-      .populate("assignee", "name email groupName")
+    const indicators = await Indicator.find(filter)
+      .populate("assignee", "name email pjNumber")
       .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .sort({ updatedAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean();
 
-    const flatQueue = indicators.map((ind: any) => {
+    res.status(200).json({
+      success: true,
+      data: indicators.map(transformIndicator),
+    });
+  }
+);
+
+// ─── 3. Get Single Indicator (Includes Files) ─────────────────────────────────
+export const getIndicatorById = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+
+    const indicator = await Indicator.findById(id)
+      .populate("assignee", "name email title pjNumber")
+      .populate("assignedBy", "name email")
+      .populate({ path: "strategicPlanId", select: "perspective objectives" })
+      // Ensure we fetch reviewers for the history
+      .populate({ path: "reviewHistory.reviewedBy", select: "name role" })
+      .lean();
+
+    if (!indicator) throw new AppError("Indicator not found.", 404);
+
+    res.status(200).json({ success: true, data: transformIndicator(indicator) });
+  }
+);
+
+// ─── 4. Update Indicator ──────────────────────────────────────────────────────
+export const updateIndicator = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+    
+    const indicator = await Indicator.findById(id);
+    if (!indicator) throw new AppError("Indicator not found.", 404);
+
+    if (["Awaiting Admin Approval", "Awaiting Super Admin"].includes(indicator.status)) {
+      throw new AppError("Cannot edit an indicator while it is under review.", 400);
+    }
+
+    // Protection against direct status/progress manipulation
+    const protectedFields = ["submissions", "reviewHistory", "status", "progress"];
+    protectedFields.forEach(field => delete req.body[field]);
+
+    Object.assign(indicator, req.body);
+    
+    // Reset to pending if core targets or deadlines change
+    if (req.body.deadline || req.body.target) indicator.status = "Pending";
+
+    await indicator.save();
+    res.status(200).json({ success: true, data: indicator });
+  }
+);
+
+// ─── 5. Delete Indicator ──────────────────────────────────────────────────────
+export const deleteIndicator = asyncHandler(
+  async (req: Request, res: Response) => {
+    const indicator = await Indicator.findById(req.params.id);
+    if (!indicator) throw new AppError("Indicator not found.", 404);
+    
+    if (indicator.status === "Completed") throw new AppError("Cannot delete a completed indicator.", 400);
+
+    await indicator.deleteOne();
+    res.status(200).json({ success: true, message: "Indicator removed." });
+  }
+);
+
+// ─── 6. SuperAdmin Final Review (Certification Logic) ────────────────────────
+export const superAdminReviewProcess = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { decision, reason, progressOverride, nextDeadline } = req.body;
+
+    if (!["Approved", "Rejected"].includes(decision)) {
+      throw new AppError("Invalid decision.", 400);
+    }
+
+    // --- REASON VALIDATION UPDATE ---
+    // Reason is strictly required for Rejections, but optional for Approvals
+    const isApprove = decision === "Approved";
+    const trimmedReason = reason?.trim();
+
+    if (!isApprove && !trimmedReason) {
+      throw new AppError("A reason is required when rejecting a submission.", 400);
+    }
+
+    // Default audit text if approval reason is blank
+    const finalReason = trimmedReason || (isApprove ? "Approved by Super Admin" : "");
+
+    const indicator = await Indicator.findById(id).populate("assignee", "name email");
+    if (!indicator) throw new AppError("Indicator not found.", 404);
+
+    if (indicator.status !== "Awaiting Super Admin") {
+      throw new AppError(
+        `Indicator is in '${indicator.status}' state, not awaiting certification.`,
+        400
+      );
+    }
+    
+    // Find the submission for the currently active quarter
+    const currentSub = indicator.submissions.find(
+      (s: ISubmission) => s.quarter === indicator.activeQuarter
+    );
+
+    if (!currentSub) {
+      throw new AppError(`No submission found for Quarter ${indicator.activeQuarter}.`, 404);
+    }
+
+    // 1. Update the Submission Status
+    currentSub.reviewStatus = isApprove ? "Accepted" : "Rejected";
+    currentSub.isReviewed = true;
+    currentSub.adminComment = finalReason;
+
+    // 2. Handle Progress Override (if provided)
+    if (isApprove && progressOverride !== undefined) {
+      currentSub.achievedValue = Number(progressOverride);
+    }
+
+    // 3. Push to Review History
+    indicator.reviewHistory.push({
+      action: isApprove ? "Approved" : "Rejected",
+      reason: finalReason,
+      reviewerRole: "superadmin",
+      reviewedBy: req.user!._id,
+      at: new Date(),
+      nextDeadline: nextDeadline ? new Date(nextDeadline) : undefined,
+    });
+
+    // 4. Save triggers the Model's logic (pre-save hook for Q increment)
+    await indicator.save();
+
+    // 5. Mail Notification
+    const assignee = indicator.assignee as any;
+    try {
+      await sendMail({
+        to: assignee.email,
+        subject: isApprove ? "Submission Approved" : "Submission Rejected",
+        html: isApprove
+          ? submissionApprovedTemplate(
+              assignee.name,
+              indicator.instructions,
+              indicator.activeQuarter, 
+              new Date().getFullYear()
+            )
+          : submissionRejectedTemplate(
+              assignee.name,
+              indicator.instructions,
+              indicator.activeQuarter,
+              new Date().getFullYear(),
+              "Super Admin",
+              finalReason // Pass the reason to the email template
+            ),
+      });
+    } catch (err) {
+      console.error("[MAIL] Notification failed:", err);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: isApprove 
+        ? (indicator.status === "Completed" ? "Indicator Completed." : `Quarterly progress approved.`)
+        : "Submission Rejected.",
+      data: indicator
+    });
+  }
+);
+
+// ─── 7. Get All Submissions (Fetching Files & Progress) ──────────────────────
+export const getAllSubmissions = asyncHandler(
+  async (_req: Request, res: Response) => {
+    // Find indicators that have at least one submission
+    const indicators = await Indicator.find({ "submissions.0": { $exists: true } })
+      .populate("assignee", "name email pjNumber")
+      .populate({ path: "strategicPlanId", select: "perspective objectives" })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    const queue = indicators.map((ind: any) => {
       const latestSub = ind.submissions[ind.submissions.length - 1];
       const transformed = transformIndicator(ind);
       
       return {
         _id: ind._id,
-        indicatorTitle: transformed.activityDescription,
-        submittedBy: transformed.assigneeDisplayName,
+        indicatorTitle: transformed?.activityDescription,
+        submittedBy: transformed?.assigneeDisplayName,
         submittedOn: latestSub?.submittedAt,
         status: ind.status,
         progress: ind.progress,
-        quarter: latestSub?.quarter === 0 ? "Annual" : `Q${latestSub?.quarter}`,
-        // 🔹 New field: Count of attached evidence files
-        documentsCount: latestSub?.documents?.length || 0 
+        quarter: `Q${latestSub?.quarter}`,
+        // Extracting file data for the frontend to show download buttons
+        documents: latestSub?.documents || [], 
+        documentsCount: latestSub?.documents?.length || 0,
+        achievedValue: latestSub?.achievedValue
       };
     });
 
-    res.status(200).json({ success: true, data: flatQueue });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(200).json({ success: true, count: queue.length, data: queue });
   }
-};
+);
 
-/**
- * @desc 5. GET REJECTED BY ADMIN (Oversight)
- */
-export const getRejectedByAdmin = async (_req: Request, res: Response) => {
-  try {
-    const indicators = await Indicator.find({ status: "Rejected by Admin" })
-      .populate("assignee", "name email title")
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .sort({ updatedAt: -1 });
-
-    res.status(200).json({ 
-      success: true, 
-      count: indicators.length, 
-      data: indicators.map(transformIndicator) 
-    });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-/**
- * @desc 5. SUPER ADMIN STATS (Aggregates)
- */
-export const getSuperAdminStats = async (req: Request, res: Response) => {
-  try {
-    const [totalIndicators, statusCounts, perspectiveStats] = await Promise.all([
+// ─── 8. Registry & Stats ──────────────────────────────────────────────────────
+export const getSuperAdminStats = asyncHandler(
+  async (_req: Request, res: Response) => {
+    const [total, statusCounts] = await Promise.all([
       Indicator.countDocuments(),
       Indicator.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
-      Indicator.aggregate([
-        { $lookup: { from: "strategicplans", localField: "strategicPlanId", foreignField: "_id", as: "plan" } },
-        { $unwind: "$plan" },
-        { $group: { _id: "$plan.perspective", avgProgress: { $avg: "$progress" }, count: { $sum: 1 } } },
-        { $project: { name: { $toUpper: "$_id" }, val: { $round: ["$avgProgress", 0] }, count: 1, _id: 0 } }
-      ])
     ]);
 
     const stats = statusCounts.reduce((acc: any, curr: any) => {
@@ -191,215 +327,45 @@ export const getSuperAdminStats = async (req: Request, res: Response) => {
 
     res.status(200).json({
       success: true,
-      data: {
-        total: totalIndicators,
-        awaitingAdmin: stats["Awaiting Admin Approval"] || 0,
-        awaitingSuperAdmin: stats["Awaiting Super Admin"] || 0,
-        completed: stats["Completed"] || 0,
-        perspectiveStats
-      }
+      data: { total, stats },
     });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: "Internal server error" });
   }
-};
+);
 
-// --- CORE READ OPERATIONS ---
-
-export const getIndicatorById = async (req: Request, res: Response) => {
-  try {
-    const indicator = await Indicator.findById(req.params.id)
-      .populate("assignee", "name email title pjNumber groupName department")
-      .populate("assignedBy", "name email")
-      .populate({ path: "strategicPlanId", select: "perspective objectives" });
-
-    if (!indicator)
-      return res
-        .status(404)
-        .json({ success: false, message: "Indicator not found" });
-
-    res
-      .status(200)
-      .json({ success: true, data: transformIndicator(indicator) });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-export const getAllIndicators = async (_req: Request, res: Response) => {
-  try {
-    const indicators = await Indicator.find()
-      .populate("assignee", "name email groupName")
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .sort({ createdAt: -1 });
-
-    res
-      .status(200)
-      .json({ success: true, data: indicators.map(transformIndicator) });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-/**
- * @desc 3. SUBMIT PROGRESS (User)
- * Aligned with IDocument[] array and Registry validation
- */
-export const submitProgress = async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const { notes, evidenceUrl, evidencePublicId, achievedValue, fileType, fileName } = req.body;
-
-    const indicator = await Indicator.findById(id);
-    if (!indicator) return res.status(404).json({ message: "Indicator not found" });
-
-    const targetQuarter = indicator.reportingCycle === "Annual" ? 0 : indicator.activeQuarter;
-    const currentYear = new Date().getFullYear();
-
-    // 1. Registry Validation
-    const registryConfig = await RegistryConfiguration.findOne({ 
-      quarter: targetQuarter, 
-      year: currentYear 
-    });
-
-    if (!registryConfig || registryConfig.isLocked) {
-      return res.status(403).json({ message: "Reporting window is currently closed or locked for this period." });
-    }
-
-    // 2. Document Construction (Matches IDocument interface)
-    const newDocument = {
-      evidenceUrl,
-      evidencePublicId,
-      fileType: fileType || "raw",
-      fileName: fileName || "Attachment"
-    };
-
-   // 3. Update or Push Submission
-let sub = indicator.submissions.find((s: ISubmission) => s.quarter === targetQuarter);
-
-    if (sub) {
-      if (sub.reviewStatus === "Accepted") {
-        return res.status(400).json({ message: "Approved cycles are locked for editing." });
-      }
-      sub.notes = notes;
-      sub.achievedValue = Number(achievedValue);
-      sub.documents = [newDocument]; // Replaces current docs with new upload
-      sub.reviewStatus = "Pending";
-      sub.submittedAt = new Date();
-      sub.resubmissionCount += 1;
-    } else {
-      indicator.submissions.push({
-        quarter: targetQuarter,
-        notes,
-        achievedValue: Number(achievedValue),
-        documents: [newDocument],
-        reviewStatus: "Pending",
-        submittedAt: new Date(),
-        isReviewed: false,
-        resubmissionCount: 0
-      } as any);
-    }
-
-    // 4. Trigger Model Middleware
-    // This will automatically:
-    // - Recalculate progress based on 'Accepted' subs
-    // - Set status to 'Awaiting Admin Approval'
-    await indicator.save();
-
-    res.status(200).json({ success: true, message: "Progress submitted successfully." });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-
-/**
- * @desc 4. SUPER ADMIN REVIEW (Atomic Transaction)
- * Ensures history and status updates are atomic.
- */
-export const superAdminReviewProcess = async (req: Request, res: Response) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-  try {
-    const { id } = req.params;
-    const { decision, reason, progressOverride } = req.body;
-
-    const indicator = await Indicator.findById(id).session(session);
-    if (!indicator) throw new Error("Indicator not found");
-
-    const isApprove = decision === "Approved";
-    const targetQ = indicator.reportingCycle === "Annual" ? 0 : indicator.activeQuarter;
-    const currentSub = indicator.submissions.find((s: ISubmission) => s.quarter === targetQ);
-
-    // Update specific submission status
-    if (currentSub) {
-      currentSub.reviewStatus = isApprove ? "Accepted" : "Rejected";
-      currentSub.isReviewed = true;
-      if (isApprove && progressOverride !== undefined) {
-          currentSub.achievedValue = Number(progressOverride);
-      }
-      if (!isApprove) currentSub.adminComment = reason;
-    }
-
-    // Append to History
-    indicator.reviewHistory.push({
-      action: isApprove ? "Approved" : "Rejected",
-      reason: reason || (isApprove ? "Performance Certified" : "Criteria not met"),
-      reviewerRole: "superadmin",
-      reviewedBy: (req as any).user?._id,
-      at: new Date(),
-    } as any);
-
-    // Save triggers the logic engine hook to set indicator.status to "Completed" or "Rejected..."
-    await indicator.save({ session });
-    
-    await session.commitTransaction();
-    
-    const final = await indicator.populate([
-        { path: "assignee", select: "name email groupName" },
-        { path: "strategicPlanId", select: "perspective objectives" }
-    ]);
-
-    res.status(200).json({ success: true, data: transformIndicator(final) });
-  } catch (error: any) {
-    await session.abortTransaction();
-    res.status(500).json({ success: false, message: error.message });
-  } finally {
-    session.endSession();
-  }
-};
-
-/**
- * @desc 2. Super Admin Decision (Simplified Wrapper)
- * If you have a separate "Quick Decision" button, it now uses the same logic.
- */
-export const superAdminDecision = async (req: Request, res: Response) => {
-  // We simply redirect to the main process to ensure logic parity
-  return superAdminReviewProcess(req, res);
-};
-
-// --- SYSTEM & REGISTRY OPERATIONS ---
-
-export const updateRegistrySettings = async (req: Request, res: Response) => {
-  try {
+export const updateRegistrySettings = asyncHandler(
+  async (req: Request, res: Response) => {
     const { quarter, year, startDate, endDate, isLocked } = req.body;
     const config = await RegistryConfiguration.findOneAndUpdate(
       { quarter, year },
-      { startDate, endDate, isLocked },
-      { upsert: true, new: true },
+      { startDate, endDate, isLocked, createdBy: req.user!._id },
+      { upsert: true, new: true }
     );
     res.status(200).json({ success: true, data: config });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
   }
-};
+);
 
-export const getRegistryStatus = async (_req: Request, res: Response) => {
-  try {
-    const year = new Date().getFullYear();
-    const settings = await RegistryConfiguration.find({ year });
+export const getRegistryStatus = asyncHandler(
+  async (_req: Request, res: Response) => {
+    const settings = await RegistryConfiguration.find().sort({ year: -1, quarter: 1 });
     res.status(200).json({ success: true, data: settings });
-  } catch (error: any) {
-    res.status(500).json({ success: false, message: error.message });
   }
-};
+);
+
+// ─── 8. Get Rejected by Admin (Oversight for SuperAdmin) ──────────────────────
+export const getRejectedByAdmin = asyncHandler(
+  async (_req: Request, res: Response) => {
+    // This specifically fetches indicators the Registry (Admin) rejected 
+    // before they ever reached the Super Admin.
+    const indicators = await Indicator.find({ status: "Rejected by Admin" })
+      .populate("assignee", "name email title pjNumber")
+      .populate({ path: "strategicPlanId", select: "perspective objectives" })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    res.status(200).json({
+      success: true,
+      count: indicators.length,
+      data: indicators.map(transformIndicator),
+    });
+  }
+);

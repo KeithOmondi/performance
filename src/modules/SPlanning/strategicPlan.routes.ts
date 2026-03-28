@@ -4,22 +4,35 @@ import { protect, restrictTo } from "../../middleware/auth.middleware";
 
 const router = express.Router();
 
-/* Clean RESTful Design:
-  - POST   /            -> Create a new plan
-  - GET    /            -> Fetch all plans
-  - GET    /:id         -> Fetch one plan
-  - PATCH  /:id         -> Update one plan
-  - DELETE /:id         -> Delete one plan
-*/
+router.use(protect);
 
-router.post("/", protect, restrictTo("superadmin"), StrategicPlanController.createStrategicPlan);
+// ─── SuperAdmin + Admin ───────────────────────────────────────────────────────
+router.get(
+  "/",
+  restrictTo("superadmin", "admin"),
+  StrategicPlanController.fetchAllStrategicPlans,
+);
+router.get(
+  "/:id",
+  restrictTo("superadmin", "admin"),
+  StrategicPlanController.fetchStrategicPlanById,
+);
 
-router.get("/", protect, restrictTo("superadmin", "admin"), StrategicPlanController.fetchAllStrategicPlans);
-
-router.get("/:id", protect, restrictTo("superadmin"),  StrategicPlanController.fetchStrategicPlanById);
-
-router.patch("/:id", protect, restrictTo("superadmin"), StrategicPlanController.updateStrategicPlan);
-
-router.delete("/:id", protect, restrictTo("superadmin"), StrategicPlanController.deleteStrategicPlan);
+// ─── SuperAdmin only ──────────────────────────────────────────────────────────
+router.post(
+  "/",
+  restrictTo("superadmin"),
+  StrategicPlanController.createStrategicPlan,
+);
+router.patch(
+  "/:id",
+  restrictTo("superadmin"),
+  StrategicPlanController.updateStrategicPlan,
+);
+router.delete(
+  "/:id",
+  restrictTo("superadmin"),
+  StrategicPlanController.deleteStrategicPlan,
+);
 
 export const StrategicPlanRoutes = router;

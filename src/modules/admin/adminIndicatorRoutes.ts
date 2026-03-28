@@ -1,25 +1,24 @@
 import { Router } from "express";
-import { 
-  fetchIndicatorsForAdmin, 
-  getIndicatorByIdAdmin, 
-  adminReviewProcess, 
-  fetchResubmittedIndicators
+import {
+  fetchIndicatorsForAdmin,
+  getIndicatorByIdAdmin,
+  adminReviewProcess,
+  fetchResubmittedIndicators,
 } from "../admin/adminIndicatorController";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
 const router = Router();
 
-router.use(protect);
-router.use(restrictTo("admin"));
 
-// Specific routes MUST come before generic /:id routes
-router.get("/all", fetchIndicatorsForAdmin);
-router.get("/resubmitted", fetchResubmittedIndicators); // FIXED: Order matters
-router.get("/assigned", fetchIndicatorsForAdmin); 
 
-// Generic /:id route - handles everything that isn't 'all' or 'resubmitted'
-router.get("/:id", getIndicatorByIdAdmin);
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+router.get("/all", protect, restrictTo("admin"), fetchIndicatorsForAdmin);
+router.get("/resubmitted", protect, restrictTo("admin"), fetchResubmittedIndicators);
 
-router.patch("/review/:id", adminReviewProcess);
+// ─── Single Indicator ─────────────────────────────────────────────────────────
+router.get("/:id", protect, restrictTo("admin"), getIndicatorByIdAdmin);
+
+// ─── Admin Review ─────────────────────────────────────────────────────────────
+router.patch("/:id/review", protect, restrictTo("admin"), adminReviewProcess);
 
 export default router;
