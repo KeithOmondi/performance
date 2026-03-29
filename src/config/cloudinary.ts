@@ -19,26 +19,19 @@ export const uploadToCloudinary = (
     const isPdf = file.mimetype === "application/pdf";
 
     const options: UploadApiOptions = {
-      folder: folder,
-      resource_type: "auto", 
+      folder,
+      resource_type: "auto",
     };
 
     if (isVideo) {
-      options.transformation = [
-        { streaming_profile: "hd" },
-        { quality: "auto" }
-      ];
+      options.transformation = [{ streaming_profile: "hd" }, { quality: "auto" }];
       options.eager_async = true;
     } else if (isImage) {
-      // ONLY apply these to images. 
-      // If we apply these to PDFs, Cloudinary converts them to images.
       options.transformation = [
         { width: 1200, crop: "limit", quality: "auto", fetch_format: "auto" },
       ];
-    } else if (isPdf) {
-      // For PDFs, we usually want the raw file without transformation
-      options.flags = "attachment"; // Optional: forces download if preferred
     }
+    // ✅ PDFs: no flags, no transformation — stored as-is, publicly fetchable
 
     const uploadStream = cloudinary.uploader.upload_stream(
       options,
@@ -54,9 +47,6 @@ export const uploadToCloudinary = (
   });
 };
 
-/**
- * New function to handle multiple files
- */
 export const uploadMultipleToCloudinary = async (
   files: Express.Multer.File[],
   folder: string
@@ -64,3 +54,6 @@ export const uploadMultipleToCloudinary = async (
   const uploadPromises = files.map((file) => uploadToCloudinary(file, folder));
   return Promise.all(uploadPromises);
 };
+
+export { cloudinary };
+// ✅ Export the configured instance so the proxy controller can use it

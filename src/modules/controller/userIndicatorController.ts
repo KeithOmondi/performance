@@ -10,6 +10,7 @@ import {
   submissionReceivedTemplate,
   adminReviewNeededTemplate,
 } from "../../utils/mailTemplates";
+import axios from "axios";
 
 // ─── DATA TRANSFORMER ────────────────────────────────────────────────────────
 const transformIndicator = (ind: any) => {
@@ -231,5 +232,29 @@ export const UserIndicatorController = {
         });
       });
     } catch (e) { console.error("Mail Failure:", e); }
-  }
+  },
+
+   // ✅ NEW: Stream file through proxy to avoid CORS + download prompt
+  streamFile: asyncHandler(async (req: Request, res: Response) => {
+    const url = decodeURIComponent(req.query.url as string);
+
+    if (!url || !url.includes("cloudinary.com")) {
+      throw new AppError("Invalid or missing file URL.", 400);
+    }
+
+    const response = await axios({
+      method: "GET",
+      url,
+      responseType: "stream",
+    });
+
+    const contentType =
+      response.headers["content-type"] || "application/octet-stream";
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", "inline"); // ✅ Never triggers download
+    res.removeHeader("X-Frame-Options");             // ✅ Allows iframe embedding
+
+    response.data.pipe(res);
+  }),
 };
