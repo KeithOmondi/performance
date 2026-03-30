@@ -14,6 +14,13 @@ export interface IUser extends Document {
   title: string;
   isActive: boolean;
 
+  /**
+   * Reference to the Team this user belongs to (if any).
+   * Populated by the Team model when members are added/removed.
+   * A user can only belong to one team at a time.
+   */
+  team?: mongoose.Types.ObjectId;
+
   // OTP Fields for Login
   loginOtp?: string;
   loginOtpExpires?: Date;
@@ -65,8 +72,20 @@ const userSchema = new Schema<IUser>(
     isActive: {
       type: Boolean,
       default: true,
-      index: true, // frequently queried in auth middleware
+      index: true,
     },
+
+    // ── Team membership ─────────────────────────────────────────────────
+    // Set automatically by the Team controller whenever members are
+    // added to / removed from a team. Do NOT set this manually on the
+    // user document; always go through the Team CRUD.
+    team: {
+      type: Schema.Types.ObjectId,
+      ref: "Team",
+      default: null,
+      index: true,
+    },
+
     loginOtp: {
       type: String,
       select: false,
@@ -83,16 +102,16 @@ const userSchema = new Schema<IUser>(
   {
     timestamps: true,
     toJSON: {
-  transform(_doc, ret: Record<string, any>) {
-    ret.password = undefined;
-    ret.loginOtp = undefined;
-    ret.loginOtpExpires = undefined;
-    ret.passwordChangedAt = undefined;
-    ret.__v = undefined;
-    return ret;
+      transform(_doc, ret: Record<string, any>) {
+        ret.password = undefined;
+        ret.loginOtp = undefined;
+        ret.loginOtpExpires = undefined;
+        ret.passwordChangedAt = undefined;
+        ret.__v = undefined;
+        return ret;
+      },
+    },
   },
-},
-  }
 );
 
 // ---------------------- Pre-save Hooks ----------------------
@@ -113,7 +132,7 @@ userSchema.pre("save", function () {
 // ---------------------- Instance Methods ----------------------
 
 userSchema.methods.comparePassword = async function (
-  candidatePassword: string
+  candidatePassword: string,
 ): Promise<boolean> {
   if (!this.password) return false;
   return bcrypt.compare(candidatePassword, this.password);

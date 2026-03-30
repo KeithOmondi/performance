@@ -1,6 +1,8 @@
 import mongoose, { Schema, Document, Types } from "mongoose";
 
-/* --- SUB-INTERFACES --- */
+/* ------------------------------------------------------------------ */
+/*  Sub-interfaces                                                      */
+/* ------------------------------------------------------------------ */
 
 export interface IDocument {
   evidenceUrl: string;
@@ -36,7 +38,6 @@ export interface IReviewHistory {
   reviewerRole: "user" | "admin" | "superadmin" | "examiner";
   reviewedBy: Types.ObjectId;
   at: Date;
-  // NEW: Allow admin to propose a new deadline for the subsequent period
   nextDeadline?: Date;
 }
 
@@ -45,8 +46,15 @@ export interface IIndicator extends Document {
   strategicPlanId: Types.ObjectId;
   objectiveId: Types.ObjectId;
   activityId: Types.ObjectId;
+
+  /**
+   * Polymorphic assignee: points to either a User or a Team document.
+   * Mongoose resolves the correct collection via `assigneeModel` (refPath).
+   */
   assignee: Types.ObjectId;
-  assignmentType: "User" | "Team";
+  assigneeModel: "User" | "Team"; // the collection Mongoose should look in
+  assignmentType: "User" | "Team"; // kept for human-readable filtering / display
+
   reportingCycle: "Quarterly" | "Annual";
   weight: number;
   unit: string;
@@ -69,7 +77,9 @@ export interface IIndicator extends Document {
   adminOverallComments?: string;
 }
 
-/* --- SCHEMAS --- */
+/* ------------------------------------------------------------------ */
+/*  Sub-schemas                                                         */
+/* ------------------------------------------------------------------ */
 
 const DocumentSchema = new Schema<IDocument>(
   {
@@ -124,10 +134,14 @@ const ReviewHistorySchema = new Schema<IReviewHistory>(
     },
     reviewedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     at: { type: Date, default: Date.now },
-    nextDeadline: { type: Date }, // Stores the date chosen by Super Admin for the next phase
+    nextDeadline: { type: Date },
   },
   { _id: true },
 );
+
+/* ------------------------------------------------------------------ */
+/*  Main Schema                                                         */
+/* ------------------------------------------------------------------ */
 
 const IndicatorSchema = new Schema<IIndicator>(
   {
@@ -139,13 +153,27 @@ const IndicatorSchema = new Schema<IIndicator>(
     },
     objectiveId: { type: Schema.Types.ObjectId, required: true, index: true },
     activityId: { type: Schema.Types.ObjectId, required: true },
+
+    // ── Polymorphic assignee ─────────────────────────────────────────
     assignee: {
       type: Schema.Types.ObjectId,
-      ref: "User",
       required: true,
+      refPath: "assigneeModel", // Mongoose uses this field to decide the collection
       index: true,
     },
-    assignmentType: { type: String, enum: ["User", "Team"], default: "User" },
+    assigneeModel: {
+      type: String,
+      required: true,
+      enum: ["User", "Team"],
+      default: "User",
+    },
+    assignmentType: {
+      type: String,
+      enum: ["User", "Team"],
+      default: "User",
+    },
+    // ────────────────────────────────────────────────────────────────
+
     reportingCycle: {
       type: String,
       enum: ["Quarterly", "Annual"],
@@ -180,10 +208,16 @@ const IndicatorSchema = new Schema<IIndicator>(
   { timestamps: true },
 );
 
-/* --- LOGIC ENGINE --- */
+/* ------------------------------------------------------------------ */
+/*  Pre-save hook: keep assigneeModel in sync with assignmentType     */
+/*  and run the status state-machine                                   */
+/* ------------------------------------------------------------------ */
 
 IndicatorSchema.pre("save", function () {
   const indicator = this as unknown as IIndicator;
+
+  // Keep assigneeModel mirrored from assignmentType
+  indicator.assigneeModel = indicator.assignmentType === "Team" ? "Team" : "User";
 
   // 1. CALCULATE PROGRESS
   const acceptedSubmissions = indicator.submissions.filter(
@@ -193,7 +227,6 @@ IndicatorSchema.pre("save", function () {
     (acc, curr) => acc + (curr.achievedValue || 0),
     0,
   );
-
   indicator.currentTotalAchieved = totalAchieved;
   indicator.progress =
     indicator.target > 0
@@ -219,27 +252,21 @@ IndicatorSchema.pre("save", function () {
 
       case "Approved":
         if (latestReview.reviewerRole === "superadmin") {
-          // LOGIC: Check Cycle & Quarter
           if (indicator.reportingCycle === "Quarterly") {
             if (indicator.activeQuarter < 4) {
-              // Reset for next quarter
               indicator.activeQuarter = (indicator.activeQuarter + 1) as
                 | 1
                 | 2
                 | 3
                 | 4;
-              indicator.status = "Pending"; // Revert to Pending for the new quarter
-
-              // Apply new deadline if provided by Super Admin
+              indicator.status = "Pending";
               if (latestReview.nextDeadline) {
                 indicator.deadline = latestReview.nextDeadline;
               }
             } else {
-              // If Q4 is approved, it is finally complete
               indicator.status = "Completed";
             }
           } else {
-            // Annual indicators complete immediately
             indicator.status = "Completed";
           }
         }
