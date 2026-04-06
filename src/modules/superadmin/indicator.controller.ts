@@ -559,3 +559,29 @@ export const getSuperAdminStats = asyncHandler(
     });
   },
 );
+
+/*====10. SUPER ADMIN UNASSIGN ACTIVITIES */
+export const unassignIndicator = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+
+    // 1. Update the indicator to nullify assignee fields
+    const result = await pool.query(
+      `UPDATE indicators 
+       SET assignee_id = NULL, 
+           assignee_model = NULL, 
+           status = 'Pending',
+           updated_at = NOW()
+       WHERE id = $1 
+       RETURNING *`,
+      [id]
+    );
+
+    if (result.rowCount === 0) throw new AppError("Indicator not found.", 404);
+
+    res.status(200).json({ 
+      success: true, 
+      message: "Activity unassigned successfully." 
+    });
+  }
+);
