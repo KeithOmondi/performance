@@ -40,10 +40,7 @@ async function syncTeamMembers(client: any, teamId: string, userIds: string[]) {
 }
 
 async function getTeamWithMembers(teamId: string) {
-  const teamRes = await pool.query(
-    `${TEAM_SELECT} WHERE t.id = $1`,
-    [teamId]
-  );
+  const teamRes = await pool.query(`${TEAM_SELECT} WHERE t.id = $1`, [teamId]);
   const team = teamRes.rows[0];
   if (!team) return null;
 
@@ -83,18 +80,19 @@ export const createTeam = asyncHandler(async (req: Request, res: Response) => {
 
     const fullTeam = await getTeamWithMembers(teamId);
 
-    // Non-blocking email notifications
-    pool.query("SELECT name, email FROM users WHERE id = ANY($1)", [uniqueMembers])
+    // ✅ Fixed: added u.id to SELECT so the lead lookup actually works
+    pool.query("SELECT id, name, email FROM users WHERE id = ANY($1)", [uniqueMembers])
       .then(({ rows }) => {
         const lead = rows.find((u) => u.id === teamLead);
         rows.forEach((u) =>
           sendMail({
             to: u.email,
             subject: `Added to team: ${name}`,
-            html: teamAddedTemplate(u.name, name, lead?.name || "Team Lead", rows),
+            html: teamAddedTemplate(u.name, name, lead?.name ?? "Team Lead", rows),
           })
         );
-      });
+      })
+      .catch((err) => console.error("Team creation email error:", err));
 
     res.status(201).json({ success: true, data: fullTeam });
   } catch (e) {
@@ -113,8 +111,7 @@ export const getAllTeams = asyncHandler(async (_req: Request, res: Response) => 
 
 /* ─── 3. GET SINGLE TEAM (with members) ──────────────────────────────────── */
 export const getTeamById = asyncHandler(async (req: Request, res: Response) => {
-  const id = req.params.id as string;
-  const team = await getTeamWithMembers(id);
+  const team = await getTeamWithMembers(req.params.id as string);
   if (!team) throw new AppError("Team not found.", 404);
   res.status(200).json({ success: true, data: team });
 });
@@ -122,22 +119,52 @@ export const getTeamById = asyncHandler(async (req: Request, res: Response) => {
 /* ─── 4. UPDATE TEAM ──────────────────────────────────────────────────────── */
 export const updateTeam = asyncHandler(async (req: Request, res: Response) => {
   const id = req.params.id as string;
-  const { name, description, teamLead, isActive } = req.body;
+  const { name, description, teamLead, members, isActive } = req.body;
 
-  await pool.query(
-    `UPDATE teams SET
-       name         = COALESCE($1, name),
-       description  = COALESCE($2, description),
-       team_lead_id = COALESCE($3, team_lead_id),
-       is_active    = COALESCE($4, is_active),
-       updated_at   = NOW()
-     WHERE id = $5`,
-    [name, description, teamLead, isActive, id]
-  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  const team = await getTeamWithMembers(id);
-  if (!team) throw new AppError("Team not found.", 404);
-  res.status(200).json({ success: true, data: team });
+    await client.query(
+      `UPDATE teams SET
+         name         = COALESCE($1, name),
+         description  = COALESCE($2, description),
+         team_lead_id = COALESCE($3, team_lead_id),
+         is_active    = COALESCE($4, is_active),
+         updated_at   = NOW()
+       WHERE id = $5`,
+      [name, description, teamLead, isActive, id]
+    );
+
+    // ✅ Fixed: if teamLead or members changed, re-sync the join table
+    // so team_members stays consistent with the teams table
+    if (teamLead !== undefined || members !== undefined) {
+      // Fetch the current lead in case only members were passed (not teamLead)
+      const leadRes = await client.query(
+        "SELECT team_lead_id FROM teams WHERE id = $1",
+        [id]
+      );
+      const currentLeadId = leadRes.rows[0]?.team_lead_id;
+
+      const baseMembers: string[] = members ?? [];
+      const uniqueMembers = Array.from(
+        new Set([currentLeadId, ...baseMembers])
+      ) as string[];
+
+      await syncTeamMembers(client, id, uniqueMembers);
+    }
+
+    await client.query("COMMIT");
+
+    const team = await getTeamWithMembers(id);
+    if (!team) throw new AppError("Team not found.", 404);
+    res.status(200).json({ success: true, data: team });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
 });
 
 /* ─── 5. DELETE TEAM ──────────────────────────────────────────────────────── */
@@ -188,6 +215,10 @@ export const removeTeamMembers = asyncHandler(async (req: Request, res: Response
   const id = req.params.id as string;
   const { memberIds } = req.body;
 
+  if (!Array.isArray(memberIds) || memberIds.length === 0) {
+    throw new AppError("memberIds must be a non-empty array.", 400);
+  }
+
   const teamRes = await pool.query("SELECT team_lead_id FROM teams WHERE id = $1", [id]);
   if (!teamRes.rows[0]) throw new AppError("Team not found.", 404);
 
@@ -221,7 +252,7 @@ export const setTeamActiveStatus = asyncHandler(async (req: Request, res: Respon
 
   res.status(200).json({
     success: true,
-    message: `Team ${isActive ? "activated" : "deactivated"}`,
+    message: `Team ${isActive ? "activated" : "deactivated"}.`,
     data: team,
   });
 });
@@ -232,13 +263,15 @@ function teamAddedTemplate(
   memberName: string,
   teamName: string,
   leadName: string,
-  allMembers: any[]
+  allMembers: { name: string; email: string }[]
 ) {
   const memberRows = allMembers
     .map(
       (m) => `
       <tr>
-        <td style="padding:10px;border-bottom:1px solid #eee;">${m.name}${m.name === memberName ? " (You)" : ""}</td>
+        <td style="padding:10px;border-bottom:1px solid #eee;">
+          ${m.name}${m.name === memberName ? " (You)" : ""}
+        </td>
         <td style="padding:10px;border-bottom:1px solid #eee;color:#666;">${m.email}</td>
       </tr>`
     )

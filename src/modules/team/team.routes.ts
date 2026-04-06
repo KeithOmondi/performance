@@ -30,13 +30,13 @@ router
 router.patch(
   "/:id/members/add",
   restrictTo("superadmin"),
-  addTeamMembers,                                               // POST body: { memberIds: [] }
+  addTeamMembers,                                               // body: { memberIds: [] }
 );
 
 router.patch(
   "/:id/members/remove",
   restrictTo("superadmin"),
-  removeTeamMembers,                                            // POST body: { memberIds: [] }
+  removeTeamMembers,                                            // body: { memberIds: [] }
 );
 
 router.patch(
