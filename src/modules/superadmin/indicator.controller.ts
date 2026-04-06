@@ -1,100 +1,95 @@
 import { Request, Response } from "express";
-import mongoose from "mongoose";
+import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
-import { Indicator, ISubmission } from "../user/Indicator.model";
-import { RegistryConfiguration } from "../user/RegistryConfiguration";
-import { User } from "../user/user.model";
-import { Team } from "../user/team.model";
 import { sendMail } from "../../utils/sendMail";
-import {
-  submissionApprovedTemplate,
-  submissionRejectedTemplate,
-  taskAssignedTemplate,
-} from "../../utils/mailTemplates";
+import { taskAssignedTemplate } from "../../utils/mailTemplates";
 
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                             */
-/* ------------------------------------------------------------------ */
+/* ─── SHARED SELECT FRAGMENT ─────────────────────────────────────────────────
+   Every query that returns an indicator to the frontend uses this fragment.
+   All snake_case columns are aliased to camelCase so the frontend slice works
+   without any transformation.
+────────────────────────────────────────────────────────────────────────────── */
+const INDICATOR_SELECT = `
+  SELECT
+    i.id,
+    i.status,
+    i.weight,
+    i.unit,
+    i.target,
+    i.progress,
+    i.deadline,
+    i.instructions,
 
-/**
- * Given an indicator, returns the list of email addresses to notify.
- *
- * - User assignment → single email
- * - Team assignment → emails of all active team members
- *
- * Also returns a display name suitable for email copy.
- */
-async function resolveRecipients(indicator: {
-  assignmentType: "User" | "Team";
-  assignee: mongoose.Types.ObjectId | any;
-}): Promise<{ emails: string[]; displayName: string }> {
-  if (indicator.assignmentType === "User") {
-    // assignee may already be populated
-    const user =
-      indicator.assignee?.email
-        ? indicator.assignee
-        : await User.findById(indicator.assignee).select("name email");
+    i.assignee_id        AS "assigneeId",
+    i.assignee_model     AS "assignmentType",
+    i.assigned_by        AS "assignedBy",
+    i.strategic_plan_id  AS "strategicPlanId",
+    i.objective_id       AS "objectiveId",
+    i.activity_id        AS "activityId",
+    i.reporting_cycle    AS "reportingCycle",
+    i.active_quarter     AS "activeQuarter",
+    i.current_total_achieved AS "currentTotalAchieved",
+    i.created_at         AS "createdAt",
+    i.updated_at         AS "updatedAt",
 
-    if (!user) return { emails: [], displayName: "Unknown" };
-    return { emails: [user.email], displayName: user.name };
+    sp.perspective,
+
+    -- Resolved display name (works for both User and Team assignments)
+    CASE
+      WHEN i.assignee_model = 'User' THEN u.name
+      ELSE t.name
+    END AS "assigneeDisplayName",
+
+    -- Extra detail fields used by Reports and Modal
+    ab.name              AS "assignedByName",
+    so.title             AS "objectiveTitle",
+    sa.description       AS "activityDescription",
+    u.pj_number          AS "assigneePjNumber"
+`;
+
+const INDICATOR_JOINS = `
+  FROM indicators i
+  LEFT JOIN users u  ON i.assignee_id = u.id AND i.assignee_model = 'User'
+  LEFT JOIN teams t  ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+  LEFT JOIN users ab ON i.assigned_by = ab.id
+  LEFT JOIN strategic_plans     sp ON i.strategic_plan_id = sp.id
+  LEFT JOIN strategic_objectives so ON i.objective_id = so.id
+  LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+`;
+
+/* ─── HELPERS ─────────────────────────────────────────────────────────────── */
+
+async function resolveRecipients(assigneeId: string, type: "User" | "Team") {
+  if (type === "User") {
+    const { rows } = await pool.query(
+      "SELECT name, email FROM users WHERE id = $1",
+      [assigneeId],
+    );
+    return {
+      emails: rows[0] ? [rows[0].email] : [],
+      displayName: rows[0]?.name || "Unknown",
+    };
   }
-
-  // Team: fetch team + all active members
-  const team =
-    indicator.assignee?.name
-      ? indicator.assignee
-      : await Team.findById(indicator.assignee)
-          .populate("members", "name email isActive")
-          .lean();
-
-  if (!team) return { emails: [], displayName: "Unknown Team" };
-
-  const emails = (team.members as any[])
-    .filter((m: any) => m.isActive !== false)
-    .map((m: any) => m.email);
-
-  return { emails, displayName: team.name };
+  const { rows } = await pool.query(
+    `SELECT u.email, t.name AS team_name
+     FROM users u
+     JOIN team_members tm ON u.id = tm.user_id
+     JOIN teams t ON tm.team_id = t.id
+     WHERE t.id = $1 AND u.is_active = true`,
+    [assigneeId],
+  );
+  return {
+    emails: rows.map((r) => r.email),
+    displayName: rows[0]?.team_name || "Unknown Team",
+  };
 }
 
-// ─── Data Transformer ─────────────────────────────────────────────────────────
-const transformIndicator = (ind: any) => {
-  if (!ind) return null;
-  const indObj = typeof ind.toObject === "function" ? ind.toObject() : ind;
-  const plan = indObj.strategicPlanId;
+const isUUID = (val: any): boolean =>
+  typeof val === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
 
-  const objective = plan?.objectives?.find(
-    (obj: any) => obj._id?.toString() === indObj.objectiveId?.toString(),
-  );
-  const activity = objective?.activities?.find(
-    (act: any) => act._id?.toString() === indObj.activityId?.toString(),
-  );
-
-  // Works for both User (name) and Team (name)
-  const assigneeName =
-    indObj.assignmentType === "Team"
-      ? indObj.assignee?.name ?? "Unassigned Team"
-      : indObj.assignee?.name ?? "Unassigned";
-
-  return {
-    ...indObj,
-    perspective: plan?.perspective || "N/A",
-    objectiveTitle: objective?.title || "Unknown Objective",
-    activityDescription:
-      activity?.description || indObj.instructions || "No activity text",
-    assigneeDisplayName: assigneeName,
-    assigneeType: indObj.assignmentType,
-    needsAction: ["Rejected by Admin", "Rejected by Super Admin"].includes(
-      indObj.status,
-    ),
-    isOverdue:
-      new Date() > new Date(indObj.deadline) && indObj.status !== "Completed",
-  };
-};
-
-/* ------------------------------------------------------------------ */
-/*  1. Create Indicator                                                  */
-/* ------------------------------------------------------------------ */
+/* ─── 1. CREATE INDICATOR ─────────────────────────────────────────────────── */
 export const createIndicator = asyncHandler(
   async (req: Request, res: Response) => {
     const {
@@ -112,356 +107,455 @@ export const createIndicator = asyncHandler(
       activeQuarter,
     } = req.body;
 
-    if (!strategicPlanId || !objectiveId || !activityId || !assignee || !deadline) {
-      throw new AppError("Required fields missing.", 400);
-    }
+    const adminId = (req as any).user?.id;
 
-    const type: "User" | "Team" = assignmentType === "Team" ? "Team" : "User";
+    const uuidFields: [string, any][] = [
+      ["strategicPlanId", strategicPlanId],
+      ["objectiveId", objectiveId],
+      ["activityId", activityId],
+      ["assignee", assignee],
+      ["adminId", adminId],
+    ];
 
-    // Validate assignee exists in the correct collection
-    if (type === "User") {
-      const exists = await User.exists({ _id: assignee });
-      if (!exists) throw new AppError("Assignee user not found.", 404);
-    } else {
-      const exists = await Team.exists({ _id: assignee, isActive: true });
-      if (!exists) throw new AppError("Team not found or is inactive.", 404);
+    for (const [field, value] of uuidFields) {
+      if (!isUUID(value)) {
+        throw new AppError(
+          `Invalid value for "${field}": expected a UUID, got ${JSON.stringify(value) ?? "undefined"}.`,
+          400,
+        );
+      }
     }
 
     const parsedDeadline = new Date(deadline);
-    if (parsedDeadline < new Date()) {
+    if (isNaN(parsedDeadline.getTime()))
+      throw new AppError("Invalid deadline date.", 400);
+    if (parsedDeadline < new Date())
       throw new AppError("Deadline cannot be in the past.", 400);
-    }
 
-    const indicator = await Indicator.create({
+    const type = assignmentType === "Team" ? "Team" : "User";
+
+    const insertQuery = `
+    INSERT INTO indicators (
+      strategic_plan_id, objective_id, activity_id, assignee_id, assignee_model,
+      reporting_cycle, weight, unit, target, deadline, instructions,
+      active_quarter, assigned_by, status
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'Pending')
+    RETURNING id
+  `;
+
+    const { rows: inserted } = await pool.query(insertQuery, [
       strategicPlanId,
       objectiveId,
       activityId,
       assignee,
-      assignmentType: type,
-      assigneeModel: type, // keep in sync immediately
-      reportingCycle: reportingCycle || "Quarterly",
-      weight: weight ?? 5,
-      unit: unit || "%",
-      target: target ?? 100,
-      deadline: parsedDeadline,
-      instructions: instructions || "",
-      activeQuarter: activeQuarter || 1,
-      assignedBy: req.user!._id,
-      status: "Pending",
-    });
+      type,
+      reportingCycle || "Quarterly",
+      weight ?? 5,
+      unit || "%",
+      target ?? 100,
+      parsedDeadline,
+      instructions || "",
+      activeQuarter || 1,
+      adminId,
+    ]);
 
-    // Resolve recipients and notify
-    const { emails, displayName } = await resolveRecipients({
-      assignmentType: type,
-      assignee,
-    });
+    // Return the full camelCase shape using the shared fragment
+    const { rows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+      [inserted[0].id],
+    );
 
-    if (emails.length > 0) {
-      try {
-        await Promise.all(
-          emails.map((email) =>
-            sendMail({
-              to: email,
-              subject: "New Task Assigned",
-              html: taskAssignedTemplate(
-                displayName,
-                instructions || "—",
-                activeQuarter || 1,
-                new Date().getFullYear(),
-                parsedDeadline.toDateString(),
-              ),
-            }),
+    // Non-blocking email notifications
+    resolveRecipients(assignee, type).then(({ emails, displayName }) => {
+      emails.forEach((email) =>
+        sendMail({
+          to: email,
+          subject: "New Task Assigned",
+          html: taskAssignedTemplate(
+            displayName,
+            instructions || "—",
+            activeQuarter || 1,
+            new Date().getFullYear(),
+            parsedDeadline.toDateString(),
           ),
-        );
-      } catch (err) {
-        console.error("[MAIL] Assignment notification failed:", err);
-      }
-    }
+        }),
+      );
+    });
 
-    res.status(201).json({ success: true, data: indicator });
+    res.status(201).json({ success: true, data: rows[0] });
   },
 );
 
-/* ------------------------------------------------------------------ */
-/*  2. Get All Indicators                                               */
-/* ------------------------------------------------------------------ */
+/* ─── 2. GET ALL INDICATORS ───────────────────────────────────────────────── */
 export const getAllIndicators = asyncHandler(
   async (req: Request, res: Response) => {
     const { status, assignee, assignmentType } = req.query;
-    const filter: Record<string, any> = {};
 
-    if (status) filter.status = status;
-    if (assignmentType) filter.assignmentType = assignmentType;
-    if (assignee && mongoose.Types.ObjectId.isValid(assignee as string)) {
-      filter.assignee = assignee;
+    let whereClause = "WHERE 1=1";
+    const params: any[] = [];
+
+    if (status) {
+      params.push(status);
+      whereClause += ` AND i.status = $${params.length}`;
+    }
+    if (assignee) {
+      params.push(assignee);
+      whereClause += ` AND i.assignee_id = $${params.length}`;
+    }
+    if (assignmentType) {
+      params.push(assignmentType);
+      whereClause += ` AND i.assignee_model = $${params.length}`;
     }
 
-    const indicators = await Indicator.find(filter)
-      // refPath makes Mongoose look in 'User' or 'Team' automatically
-      .populate("assignee", "name email pjNumber")
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .sort({ createdAt: -1 })
-      .lean();
+    const { rows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS} ${whereClause} ORDER BY i.created_at DESC`,
+      params,
+    );
+
+    res.status(200).json({ success: true, count: rows.length, data: rows });
+  },
+);
+
+export const getIndicatorById = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+
+    // 1. Fetch the indicator using the shared camelCase fragment
+    const { rows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+      [id],
+    );
+    if (!rows[0]) throw new AppError("Indicator not found.", 404);
+
+    const indicator = rows[0];
+
+    // 2. Fetch submissions with their documents aggregated
+    const { rows: submissions } = await pool.query(
+      `
+      SELECT
+        s.id,
+        s.indicator_id          AS "indicatorId",
+        s.quarter,
+        s.notes,
+        s.admin_description_edit AS "adminDescriptionEdit",
+        s.submitted_at          AS "submittedAt",
+        s.achieved_value        AS "achievedValue",
+        s.is_reviewed           AS "isReviewed",
+        s.review_status         AS "reviewStatus",
+        s.admin_comment         AS "adminComment",
+        s.resubmission_count    AS "resubmissionCount",
+
+        -- ✅ Documents nested inside each submission
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id',               sd.id,
+              'submissionId',     sd.submission_id,
+              'evidenceUrl',      sd.evidence_url,
+              'evidencePublicId', sd.evidence_public_id,
+              'fileType',         sd.file_type,
+              'fileName',         sd.file_name,
+              'uploadedAt',       sd.uploaded_at
+            )
+          ) FILTER (WHERE sd.id IS NOT NULL),
+          '[]'
+        )                       AS "documents"
+
+      FROM submissions s
+      LEFT JOIN submission_documents sd ON sd.submission_id = s.id
+      WHERE s.indicator_id = $1
+      GROUP BY s.id
+      ORDER BY s.quarter ASC
+      `,
+      [id],
+    );
+
+    // 3. Fetch review history
+    const { rows: reviewHistory } = await pool.query(
+      `
+      SELECT
+        rh.id,
+        rh.indicator_id   AS "indicatorId",
+        rh.action,
+        rh.reason,
+        rh.reviewer_role  AS "reviewerRole",
+        rh.reviewed_by    AS "reviewedBy",
+        rh.at,
+        rh.next_deadline  AS "nextDeadline",
+        u.name            AS "reviewedByName"
+      FROM review_history rh
+      LEFT JOIN users u ON rh.reviewed_by = u.id
+      WHERE rh.indicator_id = $1
+      ORDER BY rh.at DESC
+      `,
+      [id],
+    );
 
     res.status(200).json({
       success: true,
-      count: indicators.length,
-      data: indicators.map(transformIndicator),
+      data: {
+        ...indicator,
+        submissions,
+        reviewHistory,
+      },
     });
   },
 );
 
-/* ------------------------------------------------------------------ */
-/*  3. Get Single Indicator                                             */
-/* ------------------------------------------------------------------ */
-export const getIndicatorById = asyncHandler(
-  async (req: Request, res: Response) => {
-    const indicator = await Indicator.findById(req.params.id)
-      .populate("assignee", "name email title pjNumber") // works for User and Team via refPath
-      .populate("assignedBy", "name email")
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .populate({ path: "reviewHistory.reviewedBy", select: "name role" })
-      .lean();
-
-    if (!indicator) throw new AppError("Indicator not found.", 404);
-
-    res.status(200).json({ success: true, data: transformIndicator(indicator) });
-  },
-);
-
-/* ------------------------------------------------------------------ */
-/*  4. Update Indicator                                                 */
-/* ------------------------------------------------------------------ */
+/* ─── 4. UPDATE INDICATOR ─────────────────────────────────────────────────── */
 export const updateIndicator = asyncHandler(
   async (req: Request, res: Response) => {
-    const indicator = await Indicator.findById(req.params.id);
-    if (!indicator) throw new AppError("Indicator not found.", 404);
+    const { id } = req.params as { id: string };
+    const { weight, target, deadline, instructions, reportingCycle } = req.body;
 
+    const check = await pool.query(
+      "SELECT status FROM indicators WHERE id = $1",
+      [id],
+    );
+    if (!check.rows[0]) throw new AppError("Indicator not found.", 404);
     if (
       ["Awaiting Admin Approval", "Awaiting Super Admin"].includes(
-        indicator.status,
+        check.rows[0].status,
       )
     ) {
-      throw new AppError(
-        "Cannot edit an indicator while it is under review.",
-        400,
-      );
+      throw new AppError("Cannot edit while under review.", 400);
     }
 
-    const protectedFields = ["submissions", "reviewHistory", "status", "progress"];
-    protectedFields.forEach((field) => delete req.body[field]);
+    await pool.query(
+      `UPDATE indicators SET
+      weight          = COALESCE($1, weight),
+      target          = COALESCE($2, target),
+      deadline        = COALESCE($3, deadline),
+      instructions    = COALESCE($4, instructions),
+      reporting_cycle = COALESCE($5, reporting_cycle),
+      status          = CASE WHEN $3 IS NOT NULL OR $2 IS NOT NULL THEN 'Pending' ELSE status END,
+      updated_at      = NOW()
+    WHERE id = $6`,
+      [weight, target, deadline, instructions, reportingCycle, id],
+    );
 
-    Object.assign(indicator, req.body);
+    const { rows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+      [id],
+    );
 
-    // Keep assigneeModel in sync if assignmentType is being changed
-    if (req.body.assignmentType) {
-      indicator.assigneeModel =
-        req.body.assignmentType === "Team" ? "Team" : "User";
-    }
-
-    if (req.body.deadline || req.body.target) indicator.status = "Pending";
-
-    await indicator.save();
-    res.status(200).json({ success: true, data: indicator });
+    res.status(200).json({ success: true, data: rows[0] });
   },
 );
 
-/* ------------------------------------------------------------------ */
-/*  5. Delete Indicator                                                 */
-/* ------------------------------------------------------------------ */
+/* ─── 5. DELETE INDICATOR ─────────────────────────────────────────────────── */
 export const deleteIndicator = asyncHandler(
   async (req: Request, res: Response) => {
-    const indicator = await Indicator.findById(req.params.id);
-    if (!indicator) throw new AppError("Indicator not found.", 404);
+    const { id } = req.params as { id: string };
+    const { rows } = await pool.query(
+      "SELECT status FROM indicators WHERE id = $1",
+      [id],
+    );
+    if (!rows[0]) throw new AppError("Indicator not found.", 404);
+    if (rows[0].status === "Completed")
+      throw new AppError("Cannot delete completed task.", 400);
 
-    if (indicator.status === "Completed") {
-      throw new AppError("Cannot delete a completed indicator.", 400);
-    }
-
-    await indicator.deleteOne();
+    await pool.query("DELETE FROM indicators WHERE id = $1", [id]);
     res.status(200).json({ success: true, message: "Indicator removed." });
   },
 );
 
-/* ------------------------------------------------------------------ */
-/*  6. SuperAdmin Final Review                                          */
-/* ------------------------------------------------------------------ */
-export const superAdminReviewProcess = asyncHandler(
-  async (req: Request, res: Response) => {
-    const { id } = req.params;
-    const { decision, reason, nextDeadline } = req.body;
-
-    const isApprove = decision === "Approved";
-
-    const indicator = await Indicator.findById(id)
-      .populate("assignee", "name email isActive members") // Team populate also returns members array if populated deeper — see below
-      .lean();
-
-    if (!indicator) throw new AppError("Indicator not found.", 404);
-
-    if (indicator.status !== "Awaiting Super Admin") {
-      throw new AppError(
-        `Indicator is in '${indicator.status}' state, not 'Awaiting Super Admin'.`,
-        400,
-      );
-    }
-
-    // Reload as Mongoose document for mutation
-    const indicatorDoc = await Indicator.findById(id);
-    if (!indicatorDoc) throw new AppError("Indicator not found.", 404);
-
-    const currentSub = indicatorDoc.submissions.find(
-      (s: ISubmission) => s.quarter === indicatorDoc.activeQuarter,
+/* ─── 6. GET REJECTED BY ADMIN ────────────────────────────────────────────── */
+export const getRejectedByAdmin = asyncHandler(
+  async (_req: Request, res: Response) => {
+    const { rows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS}
+     WHERE i.status = 'Rejected by Admin'
+     ORDER BY i.updated_at DESC`,
     );
-    if (!currentSub) throw new AppError("No submission found for active quarter.", 404);
-
-    currentSub.reviewStatus = isApprove ? "Accepted" : "Rejected";
-    currentSub.isReviewed = true;
-    currentSub.adminComment = reason?.trim() || (isApprove ? "Approved" : "");
-
-    (indicatorDoc.reviewHistory as any).push({
-      action: isApprove ? "Approved" : "Rejected",
-      reason: currentSub.adminComment,
-      reviewerRole: "superadmin",
-      reviewedBy: req.user!._id,
-      at: new Date(),
-      nextDeadline: nextDeadline ? new Date(nextDeadline) : undefined,
-    });
-
-    await indicatorDoc.save();
-
-    // Notify assignee(s)
-    const { emails, displayName } = await resolveRecipients({
-      assignmentType: indicatorDoc.assignmentType,
-      assignee: indicatorDoc.assignee,
-    });
-
-    if (emails.length > 0) {
-      try {
-        await Promise.all(
-          emails.map((email) =>
-            sendMail({
-              to: email,
-              subject: isApprove ? "Submission Approved" : "Submission Rejected",
-              html: isApprove
-                ? submissionApprovedTemplate(
-                    displayName,
-                    indicatorDoc.instructions ?? "—",
-                    indicatorDoc.activeQuarter,
-                    new Date().getFullYear(),
-                  )
-                : submissionRejectedTemplate(
-                    displayName,
-                    indicatorDoc.instructions ?? "—",
-                    indicatorDoc.activeQuarter,
-                    new Date().getFullYear(),
-                    "Super Admin",
-                    reason,
-                  ),
-            }),
-          ),
-        );
-      } catch (err) {
-        console.error("[MAIL] SuperAdmin review notification failed:", err);
-      }
-    }
-
-    res.status(200).json({ success: true, data: indicatorDoc });
+    res.status(200).json({ success: true, count: rows.length, data: rows });
   },
 );
 
-/* ------------------------------------------------------------------ */
-/*  7. Get All Submissions Queue                                        */
-/* ------------------------------------------------------------------ */
+/* ─── 7. SUPER ADMIN FINAL REVIEW ─────────────────────────────────────────── */
+export const superAdminReviewProcess = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+    const { decision, reason, progressOverride, nextDeadline } = req.body;
+    const adminId = (req as any).user.id;
+    const isApprove = decision === "Approved";
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1",
+        [id],
+      );
+      const indicator = indRes.rows[0];
+
+      if (!indicator || indicator.status !== "Awaiting Super Admin") {
+        throw new AppError("Not in Super Admin review state.", 400);
+      }
+
+      const subStatus = isApprove ? "Accepted" : "Rejected";
+
+      // Update the submission for the active quarter
+      await client.query(
+        `UPDATE submissions
+       SET review_status = $1, is_reviewed = true, admin_comment = $2
+       WHERE indicator_id = $3 AND quarter = $4`,
+        [subStatus, reason || "", id, indicator.active_quarter],
+      );
+
+      // Determine next indicator status
+      let nextStatus: string;
+      let nextQuarter = indicator.active_quarter;
+      let newDeadline = indicator.deadline;
+
+      if (isApprove) {
+        if (
+          indicator.reporting_cycle === "Quarterly" &&
+          indicator.active_quarter < 4
+        ) {
+          nextStatus = "Pending";
+          nextQuarter = indicator.active_quarter + 1;
+          if (nextDeadline) newDeadline = new Date(nextDeadline);
+        } else {
+          nextStatus = "Completed";
+        }
+      } else {
+        nextStatus = "Rejected by Super Admin";
+      }
+
+      // Apply progress override if provided
+      const achievedValue =
+        progressOverride ?? indicator.current_total_achieved;
+
+      await client.query(
+        `UPDATE indicators
+       SET status                = $1,
+           active_quarter        = $2,
+           deadline              = $3,
+           current_total_achieved = $4,
+           updated_at            = NOW()
+       WHERE id = $5`,
+        [nextStatus, nextQuarter, newDeadline, achievedValue, id],
+      );
+
+      await client.query(
+        `INSERT INTO review_history
+         (indicator_id, action, reason, reviewer_role, reviewed_by, next_deadline)
+       VALUES ($1, $2, $3, 'superadmin', $4, $5)`,
+        [
+          id,
+          isApprove ? "Approved" : "Rejected",
+          reason,
+          adminId,
+          nextDeadline || null,
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      // Return the full updated indicator in camelCase shape
+      const { rows } = await pool.query(
+        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+        [id],
+      );
+
+      res.status(200).json({ success: true, data: rows[0] });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  },
+);
+
 export const getAllSubmissions = asyncHandler(
   async (_req: Request, res: Response) => {
-    const indicators = await Indicator.find({ "submissions.0": { $exists: true } })
-      .populate("assignee", "name email pjNumber")
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .sort({ updatedAt: -1 })
-      .lean();
+    const { rows } = await pool.query(`
+      SELECT
+        i.id,
+        i.status,
+        i.assignee_model                  AS "assigneeType",
+        i.active_quarter                  AS "quarter",
+        s.id                              AS "submissionId",
+        s.submitted_at                    AS "submittedOn",
+        s.achieved_value                  AS "achievedValue",
+        s.notes,
+        s.admin_description_edit          AS "adminDescriptionEdit",
+        s.is_reviewed                     AS "isReviewed",
+        s.review_status                   AS "reviewStatus",
+        s.admin_comment                   AS "adminComment",
+        s.resubmission_count              AS "resubmissionCount",
+        sa.description                    AS "indicatorTitle",
+        CASE
+          WHEN i.assignee_model = 'User' THEN u.name
+          ELSE t.name
+        END                               AS "submittedBy",
 
-    const queue = indicators.map((ind: any) => {
-      const latestSub = ind.submissions[ind.submissions.length - 1];
-      const transformed = transformIndicator(ind);
+        -- ✅ Aggregate documents into a JSON array
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'id',               sd.id,
+              'evidenceUrl',      sd.evidence_url,
+              'evidencePublicId', sd.evidence_public_id,
+              'fileType',         sd.file_type,
+              'fileName',         sd.file_name,
+              'uploadedAt',       sd.uploaded_at
+            )
+          ) FILTER (WHERE sd.id IS NOT NULL),
+          '[]'
+        )                                 AS "documents",
+        COUNT(sd.id)                      AS "documentsCount"
 
-      return {
-        _id: ind._id,
-        indicatorTitle: transformed?.activityDescription,
-        submittedBy: transformed?.assigneeDisplayName,
-        assigneeType: ind.assignmentType,
-        submittedOn: latestSub?.submittedAt,
-        status: ind.status,
-        progress: ind.progress,
-        quarter: `Q${latestSub?.quarter}`,
-        documents: latestSub?.documents || [],
-        documentsCount: latestSub?.documents?.length || 0,
-        achievedValue: latestSub?.achievedValue,
-      };
-    });
+      FROM submissions s
+      JOIN    indicators i          ON s.indicator_id = i.id
+      LEFT JOIN users u             ON i.assignee_id = u.id  AND i.assignee_model = 'User'
+      LEFT JOIN teams t             ON i.assignee_id = t.id  AND i.assignee_model = 'Team'
+      LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+
+      -- ✅ Join documents here
+      LEFT JOIN submission_documents sd ON sd.submission_id = s.id
+
+      GROUP BY
+        i.id, i.status, i.assignee_model, i.active_quarter,
+        s.id, s.submitted_at, s.achieved_value, s.notes,
+        s.admin_description_edit, s.is_reviewed, s.review_status,
+        s.admin_comment, s.resubmission_count,
+        sa.description, u.name, t.name
+
+      ORDER BY s.submitted_at DESC
+    `);
+
+    const queue = rows.map((row) => ({
+      ...row,
+      quarter:       `Q${row.quarter}`,
+      documentsCount: parseInt(row.documentsCount),
+    }));
 
     res.status(200).json({ success: true, count: queue.length, data: queue });
   },
 );
 
-/* ------------------------------------------------------------------ */
-/*  8. Registry & Stats                                                 */
-/* ------------------------------------------------------------------ */
+/* ─── 9. SUPER ADMIN DASHBOARD STATS ─────────────────────────────────────── */
 export const getSuperAdminStats = asyncHandler(
   async (_req: Request, res: Response) => {
-    const [total, statusCounts] = await Promise.all([
-      Indicator.countDocuments(),
-      Indicator.aggregate([
-        { $group: { _id: "$status", count: { $sum: 1 } } },
-      ]),
+    const [totalRes, statusRes] = await Promise.all([
+      pool.query("SELECT COUNT(*) AS total FROM indicators"),
+      pool.query(
+        "SELECT status, COUNT(*) AS count FROM indicators GROUP BY status",
+      ),
     ]);
 
-    const stats = statusCounts.reduce((acc: any, curr: any) => {
-      acc[curr._id] = curr.count;
+    const stats = statusRes.rows.reduce((acc: any, curr: any) => {
+      acc[curr.status] = parseInt(curr.count);
       return acc;
     }, {});
 
-    res.status(200).json({ success: true, data: { total, stats } });
-  },
-);
-
-export const updateRegistrySettings = asyncHandler(
-  async (req: Request, res: Response) => {
-    const { quarter, year, startDate, endDate, isLocked } = req.body;
-    const config = await RegistryConfiguration.findOneAndUpdate(
-      { quarter, year },
-      { startDate, endDate, isLocked, createdBy: req.user!._id },
-      { upsert: true, new: true },
-    );
-    res.status(200).json({ success: true, data: config });
-  },
-);
-
-export const getRegistryStatus = asyncHandler(
-  async (_req: Request, res: Response) => {
-    const settings = await RegistryConfiguration.find().sort({
-      year: -1,
-      quarter: 1,
-    });
-    res.status(200).json({ success: true, data: settings });
-  },
-);
-
-/* ------------------------------------------------------------------ */
-/*  9. Get Rejected by Admin (SuperAdmin oversight)                    */
-/* ------------------------------------------------------------------ */
-export const getRejectedByAdmin = asyncHandler(
-  async (_req: Request, res: Response) => {
-    const indicators = await Indicator.find({ status: "Rejected by Admin" })
-      .populate("assignee", "name email title pjNumber")
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .sort({ updatedAt: -1 })
-      .lean();
-
     res.status(200).json({
       success: true,
-      count: indicators.length,
-      data: indicators.map(transformIndicator),
+      data: { total: parseInt(totalRes.rows[0].total), stats },
     });
   },
 );

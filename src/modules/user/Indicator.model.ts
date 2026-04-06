@@ -1,288 +1,118 @@
-import mongoose, { Schema, Document, Types } from "mongoose";
+import { pool } from "../../config/db";
+import { IIndicator } from "../../types/indicator.types";
 
-/* ------------------------------------------------------------------ */
-/*  Sub-interfaces                                                      */
-/* ------------------------------------------------------------------ */
 
-export interface IDocument {
-  evidenceUrl: string;
-  evidencePublicId: string;
-  fileType: "image" | "video" | "raw";
-  fileName?: string;
-  uploadedAt: Date;
-}
-
-export interface ISubmission {
-  _id: Types.ObjectId;
-  quarter: 1 | 2 | 3 | 4;
-  documents: IDocument[];
-  notes: string;
-  adminDescriptionEdit?: string;
-  submittedAt: Date;
-  achievedValue: number;
-  isReviewed: boolean;
-  reviewStatus: "Pending" | "Verified" | "Accepted" | "Rejected";
-  adminComment?: string;
-  resubmissionCount: number;
-}
-
-export interface IReviewHistory {
-  action:
-    | "Submitted"
-    | "Verified"
-    | "Approved"
-    | "Rejected"
-    | "Resubmitted"
-    | "Correction Requested";
-  reason?: string;
-  reviewerRole: "user" | "admin" | "superadmin" | "examiner";
-  reviewedBy: Types.ObjectId;
-  at: Date;
-  nextDeadline?: Date;
-}
-
-export interface IIndicator extends Document {
-  _id: Types.ObjectId;
-  strategicPlanId: Types.ObjectId;
-  objectiveId: Types.ObjectId;
-  activityId: Types.ObjectId;
-
+export class IndicatorService {
   /**
-   * Polymorphic assignee: points to either a User or a Team document.
-   * Mongoose resolves the correct collection via `assigneeModel` (refPath).
+   * REPLACES: IndicatorSchema.pre("save") logic
+   * Recalculates progress and updates the State Machine
    */
-  assignee: Types.ObjectId;
-  assigneeModel: "User" | "Team"; // the collection Mongoose should look in
-  assignmentType: "User" | "Team"; // kept for human-readable filtering / display
+  static async syncIndicatorState(indicatorId: string) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
 
-  reportingCycle: "Quarterly" | "Annual";
-  weight: number;
-  unit: string;
-  target: number;
-  deadline: Date;
-  submissions: mongoose.Types.DocumentArray<ISubmission>;
-  currentTotalAchieved: number;
-  progress: number;
-  status:
-    | "Pending"
-    | "Awaiting Admin Approval"
-    | "Rejected by Admin"
-    | "Awaiting Super Admin"
-    | "Rejected by Super Admin"
-    | "Completed";
-  instructions?: string;
-  assignedBy: Types.ObjectId;
-  activeQuarter: 1 | 2 | 3 | 4;
-  reviewHistory: IReviewHistory[];
-  adminOverallComments?: string;
-}
+      // 1. CALCULATE PROGRESS & TOTAL ACHIEVED
+      const statsQuery = `
+        SELECT COALESCE(SUM(achieved_value), 0) as total_achieved 
+        FROM submissions 
+        WHERE indicator_id = $1 AND review_status = 'Accepted'
+      `;
+      const statsRes = await client.query(statsQuery, [indicatorId]);
+      const totalAchieved = parseFloat(statsRes.rows[0].total_achieved);
 
-/* ------------------------------------------------------------------ */
-/*  Sub-schemas                                                         */
-/* ------------------------------------------------------------------ */
+      // Get target and current metadata
+      const metaRes = await client.query(
+        "SELECT target, reporting_cycle, active_quarter FROM indicators WHERE id = $1",
+        [indicatorId]
+      );
+      const { target, reporting_cycle, active_quarter } = metaRes.rows[0];
 
-const DocumentSchema = new Schema<IDocument>(
-  {
-    evidenceUrl: { type: String, required: true },
-    evidencePublicId: { type: String, required: true },
-    fileType: { type: String, enum: ["image", "video", "raw"], required: true },
-    fileName: { type: String, default: "" },
-    uploadedAt: { type: Date, default: Date.now },
-  },
-  { _id: true },
-);
+      const progress = target > 0 
+        ? Math.min(Math.round((totalAchieved / target) * 100), 100) 
+        : 0;
 
-const SubmissionSchema = new Schema<ISubmission>(
-  {
-    quarter: { type: Number, enum: [1, 2, 3, 4], required: true },
-    documents: { type: [DocumentSchema], default: [] },
-    notes: { type: String, required: true, trim: true },
-    adminDescriptionEdit: { type: String, default: "" },
-    submittedAt: { type: Date, default: Date.now },
-    achievedValue: { type: Number, default: 0, min: 0 },
-    isReviewed: { type: Boolean, default: false },
-    reviewStatus: {
-      type: String,
-      enum: ["Pending", "Verified", "Accepted", "Rejected"],
-      default: "Pending",
-    },
-    adminComment: { type: String, default: "" },
-    resubmissionCount: { type: Number, default: 0, min: 0 },
-  },
-  { _id: true },
-);
+      // 2. STATE MACHINE (Based on latest review history)
+      const historyQuery = `
+        SELECT action, reviewer_role, next_deadline 
+        FROM review_history 
+        WHERE indicator_id = $1 
+        ORDER BY at DESC LIMIT 1
+      `;
+      const historyRes = await client.query(historyQuery, [indicatorId]);
+      const latestReview = historyRes.rows[0];
 
-const ReviewHistorySchema = new Schema<IReviewHistory>(
-  {
-    action: {
-      type: String,
-      enum: [
-        "Submitted",
-        "Verified",
-        "Approved",
-        "Rejected",
-        "Resubmitted",
-        "Correction Requested",
-      ],
-      required: true,
-    },
-    reason: { type: String, default: "" },
-    reviewerRole: {
-      type: String,
-      enum: ["user", "admin", "superadmin", "examiner"],
-      required: true,
-    },
-    reviewedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
-    at: { type: Date, default: Date.now },
-    nextDeadline: { type: Date },
-  },
-  { _id: true },
-);
+      let nextStatus = "Pending";
+      let nextQuarter = active_quarter;
+      let nextDeadlineUpdate = null;
 
-/* ------------------------------------------------------------------ */
-/*  Main Schema                                                         */
-/* ------------------------------------------------------------------ */
-
-const IndicatorSchema = new Schema<IIndicator>(
-  {
-    strategicPlanId: {
-      type: Schema.Types.ObjectId,
-      ref: "StrategicPlan",
-      required: true,
-      index: true,
-    },
-    objectiveId: { type: Schema.Types.ObjectId, required: true, index: true },
-    activityId: { type: Schema.Types.ObjectId, required: true },
-
-    // ── Polymorphic assignee ─────────────────────────────────────────
-    assignee: {
-      type: Schema.Types.ObjectId,
-      required: true,
-      refPath: "assigneeModel", // Mongoose uses this field to decide the collection
-      index: true,
-    },
-    assigneeModel: {
-      type: String,
-      required: true,
-      enum: ["User", "Team"],
-      default: "User",
-    },
-    assignmentType: {
-      type: String,
-      enum: ["User", "Team"],
-      default: "User",
-    },
-    // ────────────────────────────────────────────────────────────────
-
-    reportingCycle: {
-      type: String,
-      enum: ["Quarterly", "Annual"],
-      default: "Quarterly",
-    },
-    target: { type: Number, default: 100, min: 0 },
-    weight: { type: Number, default: 5, min: 0, max: 100 },
-    unit: { type: String, default: "%" },
-    deadline: { type: Date, required: true },
-    submissions: { type: [SubmissionSchema], default: [] },
-    currentTotalAchieved: { type: Number, default: 0, min: 0 },
-    progress: { type: Number, default: 0, min: 0, max: 100 },
-    activeQuarter: { type: Number, enum: [1, 2, 3, 4], default: 1 },
-    instructions: { type: String, default: "" },
-    assignedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
-    status: {
-      type: String,
-      enum: [
-        "Pending",
-        "Awaiting Admin Approval",
-        "Rejected by Admin",
-        "Awaiting Super Admin",
-        "Rejected by Super Admin",
-        "Completed",
-      ],
-      default: "Pending",
-      index: true,
-    },
-    reviewHistory: { type: [ReviewHistorySchema], default: [] },
-    adminOverallComments: { type: String, default: "" },
-  },
-  { timestamps: true },
-);
-
-/* ------------------------------------------------------------------ */
-/*  Pre-save hook: keep assigneeModel in sync with assignmentType     */
-/*  and run the status state-machine                                   */
-/* ------------------------------------------------------------------ */
-
-IndicatorSchema.pre("save", function () {
-  const indicator = this as unknown as IIndicator;
-
-  // Keep assigneeModel mirrored from assignmentType
-  indicator.assigneeModel = indicator.assignmentType === "Team" ? "Team" : "User";
-
-  // 1. CALCULATE PROGRESS
-  const acceptedSubmissions = indicator.submissions.filter(
-    (s) => s.reviewStatus === "Accepted",
-  );
-  const totalAchieved = acceptedSubmissions.reduce(
-    (acc, curr) => acc + (curr.achievedValue || 0),
-    0,
-  );
-  indicator.currentTotalAchieved = totalAchieved;
-  indicator.progress =
-    indicator.target > 0
-      ? Math.min(Math.round((totalAchieved / indicator.target) * 100), 100)
-      : 0;
-
-  // 2. STATE MACHINE
-  const latestReview =
-    indicator.reviewHistory[indicator.reviewHistory.length - 1];
-
-  if (latestReview) {
-    switch (latestReview.action) {
-      case "Submitted":
-      case "Resubmitted":
-        indicator.status = "Awaiting Admin Approval";
-        break;
-
-      case "Verified":
-        if (latestReview.reviewerRole === "admin") {
-          indicator.status = "Awaiting Super Admin";
-        }
-        break;
-
-      case "Approved":
-        if (latestReview.reviewerRole === "superadmin") {
-          if (indicator.reportingCycle === "Quarterly") {
-            if (indicator.activeQuarter < 4) {
-              indicator.activeQuarter = (indicator.activeQuarter + 1) as
-                | 1
-                | 2
-                | 3
-                | 4;
-              indicator.status = "Pending";
-              if (latestReview.nextDeadline) {
-                indicator.deadline = latestReview.nextDeadline;
+      if (latestReview) {
+        switch (latestReview.action) {
+          case "Submitted":
+          case "Resubmitted":
+            nextStatus = "Awaiting Admin Approval";
+            break;
+          case "Verified":
+            if (latestReview.reviewer_role === "admin") nextStatus = "Awaiting Super Admin";
+            break;
+          case "Approved":
+            if (latestReview.reviewer_role === "superadmin") {
+              if (reporting_cycle === "Quarterly" && active_quarter < 4) {
+                nextQuarter = active_quarter + 1;
+                nextStatus = "Pending";
+                if (latestReview.next_deadline) nextDeadlineUpdate = latestReview.next_deadline;
+              } else {
+                nextStatus = "Completed";
               }
-            } else {
-              indicator.status = "Completed";
             }
-          } else {
-            indicator.status = "Completed";
-          }
+            break;
+          case "Correction Requested":
+          case "Rejected":
+            nextStatus = latestReview.reviewer_role === "superadmin" ? "Rejected by Super Admin" : "Rejected by Admin";
+            break;
         }
-        break;
+      }
 
-      case "Correction Requested":
-      case "Rejected":
-        indicator.status =
-          latestReview.reviewerRole === "superadmin"
-            ? "Rejected by Super Admin"
-            : "Rejected by Admin";
-        break;
+      // 3. APPLY UPDATES
+      const updateQuery = `
+        UPDATE indicators 
+        SET current_total_achieved = $1, 
+            progress = $2, 
+            status = $3, 
+            active_quarter = $4,
+            deadline = COALESCE($5, deadline),
+            updated_at = NOW()
+        WHERE id = $6
+      `;
+      await client.query(updateQuery, [totalAchieved, progress, nextStatus, nextQuarter, nextDeadlineUpdate, indicatorId]);
+
+      await client.query("COMMIT");
+      console.log(`✅ Indicator ${indicatorId} synced: ${progress}% - ${nextStatus}`);
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
     }
   }
-});
 
-export const Indicator =
-  mongoose.models.Indicator ||
-  mongoose.model<IIndicator>("Indicator", IndicatorSchema);
+  /**
+   * Helper to fetch the "Full" Indicator (including nested submissions/history)
+   */
+  static async getFullIndicator(id: string): Promise<IIndicator | null> {
+    const indicatorRes = await pool.query("SELECT * FROM indicators WHERE id = $1", [id]);
+    if (indicatorRes.rows.length === 0) return null;
+
+    const indicator = indicatorRes.rows[0];
+
+    // Fetch nested submissions
+    const subRes = await pool.query("SELECT * FROM submissions WHERE indicator_id = $1", [id]);
+    indicator.submissions = subRes.rows;
+
+    // Fetch nested history
+    const histRes = await pool.query("SELECT * FROM review_history WHERE indicator_id = $1 ORDER BY at DESC", [id]);
+    indicator.reviewHistory = histRes.rows;
+
+    return indicator;
+  }
+}

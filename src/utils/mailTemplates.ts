@@ -1,5 +1,5 @@
 const brandName = "Performance Management System";
-const brandColor = "#2563EB"; // blue — change to match your frontend
+const brandColor = "#2563EB"; 
 
 const baseLayout = (content: string) => `
   <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff;">
@@ -17,6 +17,14 @@ const baseLayout = (content: string) => `
   </div>
 `;
 
+// Helper to format the period string (e.g., "Q1" or "Annual")
+const formatPeriod = (quarter: string | number) => {
+  if (typeof quarter === 'string' && (quarter.toLowerCase() === 'annual' || quarter.startsWith('Q'))) {
+    return quarter;
+  }
+  return `Q${quarter}`;
+};
+
 // ─── OTP / Login ───────────────────────────────────────────────────────────
 export const otpTemplate = (name: string, otp: string) =>
   baseLayout(`
@@ -29,11 +37,11 @@ export const otpTemplate = (name: string, otp: string) =>
     <p style="color: #6b7280; font-size: 13px;">If you didn't request this code, please contact your administrator immediately.</p>
   `);
 
-// ─── Task Assignment (User receives a new task) ────────────────────────────
+// ─── Task Assignment ────────────────────────────
 export const taskAssignedTemplate = (
   name: string,
   taskTitle: string,
-  quarter: number,
+  quarter: string | number, // Updated type
   year: number,
   deadline: string,
 ) =>
@@ -47,7 +55,7 @@ export const taskAssignedTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Q${quarter} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Deadline</td>
@@ -57,11 +65,11 @@ export const taskAssignedTemplate = (
     <p style="color: #374151;">Please log in to the system to view and submit your task.</p>
   `);
 
-// ─── Submission Received (User confirms their submission went through) ──────
+// ─── Submission Received ──────
 export const submissionReceivedTemplate = (
   name: string,
   taskTitle: string,
-  quarter: number,
+  quarter: string | number, // Updated type
   year: number,
 ) =>
   baseLayout(`
@@ -74,21 +82,20 @@ export const submissionReceivedTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Q${quarter} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Status</td>
         <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; color: #d97706;">Pending Admin Review</td>
       </tr>
     </table>
-    <p style="color: #6b7280; font-size: 13px;">You will be notified once your submission has been reviewed.</p>
   `);
 
-// ─── Submission Rejected (User needs to fix and resubmit) ──────────────────
+// ─── Submission Rejected ──────────────────
 export const submissionRejectedTemplate = (
   name: string,
   taskTitle: string,
-  quarter: number,
+  quarter: string | number, // Updated type
   year: number,
   rejectedBy: "Admin" | "Super Admin",
   reason: string,
@@ -103,25 +110,20 @@ export const submissionRejectedTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Q${quarter} ${year}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Rejected By</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${rejectedBy}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
       </tr>
     </table>
     <div style="background: #fef2f2; border-left: 4px solid #dc2626; padding: 16px; margin: 20px 0; border-radius: 4px;">
       <strong style="color: #dc2626;">Reason for Rejection:</strong>
       <p style="color: #374151; margin: 8px 0 0 0;">${reason}</p>
     </div>
-    <p style="color: #374151;">Please log in, make the necessary corrections, and resubmit.</p>
   `);
 
-// ─── Submission Approved (Final approval by SuperAdmin) ────────────────────
+// ─── Submission Approved ────────────────────
 export const submissionApprovedTemplate = (
   name: string,
   taskTitle: string,
-  quarter: number,
+  quarter: string | number, // Updated type
   year: number,
 ) =>
   baseLayout(`
@@ -134,22 +136,17 @@ export const submissionApprovedTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Q${quarter} ${year}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Status</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; color: #16a34a;"><strong>Fully Approved</strong></td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
       </tr>
     </table>
-    <p style="color: #6b7280; font-size: 13px;">No further action is required for this submission.</p>
   `);
 
-// ─── Admin Review Needed (Admin notified of new submission) ────────────────
+// ─── Admin Review Needed ────────────────
 export const adminReviewNeededTemplate = (
   adminName: string,
   submittedBy: string,
   taskTitle: string,
-  quarter: number,
+  quarter: string | number, // Updated type
   year: number,
 ) =>
   baseLayout(`
@@ -166,18 +163,17 @@ export const adminReviewNeededTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Q${quarter} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
       </tr>
     </table>
-    <p style="color: #374151;">Please log in to review and take action on this submission.</p>
   `);
 
-// ─── SuperAdmin Review Needed (SuperAdmin notified after admin approves) ───
+// ─── SuperAdmin Review Needed ───
 export const superAdminReviewNeededTemplate = (
   taskTitle: string,
   submittedBy: string,
   approvedByAdmin: string,
-  quarter: number,
+  quarter: string | number, // Updated type
   year: number,
 ) =>
   baseLayout(`
@@ -198,8 +194,7 @@ export const superAdminReviewNeededTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">Q${quarter} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
       </tr>
     </table>
-    <p style="color: #374151;">Please log in to give your final approval or rejection.</p>
   `);

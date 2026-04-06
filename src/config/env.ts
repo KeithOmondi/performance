@@ -5,7 +5,7 @@ dotenv.config();
 
 const requiredEnvVars = [
   "PORT",
-  "MONGO_URI",
+  "DATABASE_URL",
   "DB_NAME",
   "JWT_SECRET",
   "JWT_EXPIRES_IN",
@@ -27,7 +27,7 @@ requiredEnvVars.forEach((key) => {
 export const env = {
   PORT: Number(process.env.PORT) || 5000,
   NODE_ENV: process.env.NODE_ENV || "production",
-  MONGO_URI: process.env.MONGO_URI as string,
+  DATABASE_URL: process.env.DATABASE_URL as string,
   DB_NAME: process.env.DB_NAME as string,
 
   JWT_SECRET: process.env.JWT_SECRET || "supersecret",

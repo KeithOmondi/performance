@@ -1,58 +1,52 @@
-// models/RegistryConfiguration.ts
-import mongoose, { Schema, Document } from "mongoose";
+import { pool } from "../../config/db";
+import { IRegistryConfiguration, RegistryQuarter } from "../../types/registry.types";
 
-export type RegistryQuarter = 0 | 1 | 2 | 3 | 4;
 
-export interface IRegistryConfiguration extends Document {
-  _id: mongoose.Types.ObjectId;
+export class RegistryService {
   /**
-   * 0 = Annual cycle registry
-   * 1–4 = Quarterly cycle registries
+   * Create or Update a configuration
+   * Replaces the .pre("save") hook and uniqueness logic
    */
-  quarter: RegistryQuarter;
-  year: number;
-  startDate: Date;
-  endDate: Date;
-  isLocked: boolean;
-  lockedReason?: string;
-  createdBy: mongoose.Types.ObjectId;
-}
+  static async setConfiguration(data: Partial<IRegistryConfiguration>): Promise<IRegistryConfiguration> {
+    // 1. Date Validation (Manual check to provide clean error messages)
+    if (data.startDate && data.endDate && new Date(data.endDate) <= new Date(data.startDate)) {
+      throw new Error("End date must be after start date.");
+    }
 
-const RegistryConfigSchema = new Schema<IRegistryConfiguration>(
-  {
-    quarter: { type: Number, enum: [0, 1, 2, 3, 4], required: true },
-    year: {
-      type: Number,
-      required: true,
-      min: [2020, "Year must be 2020 or later"],
-      max: [2100, "Year must be 2100 or earlier"],
-    },
-    startDate: { type: Date, required: true },
-    endDate: { type: Date, required: true },
-    isLocked: { type: Boolean, default: false },
-    lockedReason: { type: String, default: "" },
-    createdBy: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-  },
-  { timestamps: true }
-);
+    const query = `
+      INSERT INTO registry_configurations 
+        (quarter, year, start_date, end_date, is_locked, locked_reason, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (quarter, year) 
+      DO UPDATE SET 
+        start_date = EXCLUDED.start_date,
+        end_date = EXCLUDED.end_date,
+        is_locked = EXCLUDED.is_locked,
+        locked_reason = EXCLUDED.locked_reason,
+        updated_at = NOW()
+      RETURNING *;
+    `;
 
-// One config per quarter/year combination
-RegistryConfigSchema.index({ quarter: 1, year: 1 }, { unique: true });
+    const values = [
+      data.quarter,
+      data.year,
+      data.startDate,
+      data.endDate,
+      data.isLocked ?? false,
+      data.lockedReason || "",
+      data.createdBy
+    ];
 
-// Validate that endDate is always after startDate
-RegistryConfigSchema.pre("save", function () {
-  if (this.endDate <= this.startDate) {
-    throw new Error("End date must be after start date.");
+    const { rows } = await pool.query(query, values);
+    return rows[0];
   }
-});
 
-export const RegistryConfiguration =
-  mongoose.models.RegistryConfiguration ||
-  mongoose.model<IRegistryConfiguration>(
-    "RegistryConfiguration",
-    RegistryConfigSchema
-  );
+  /**
+   * Helper to check if a specific quarter is currently locked
+   */
+  static async isQuarterLocked(quarter: RegistryQuarter, year: number): Promise<boolean> {
+    const query = `SELECT is_locked FROM registry_configurations WHERE quarter = $1 AND year = $2`;
+    const { rows } = await pool.query(query, [quarter, year]);
+    return rows.length > 0 ? rows[0].is_locked : false;
+  }
+}

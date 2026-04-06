@@ -1,35 +1,38 @@
 import { Request, Response } from "express";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
-import { User, UserRole } from "../user/user.model";
+import { pool } from "../../config/db";
+import { UserRole } from "../../types/user.types";
 
-const USER_FIELDS = "name email role pjNumber title isActive createdAt";
-
+const USER_FIELDS = `id, name, email, role, pj_number AS "pjNumber", title, is_active AS "isActive", created_at AS "createdAt"`;
 const VALID_ROLES: UserRole[] = ["user", "admin", "superadmin", "examiner"];
 
 // ─── List All Users ───────────────────────────────────────────────────────────
 export const listUsers = asyncHandler(async (req: Request, res: Response) => {
   const { role, isActive, search } = req.query;
-
-  const filter: Record<string, any> = {};
+  
+  let query = `SELECT ${USER_FIELDS} FROM users WHERE 1=1`;
+  const values: any[] = [];
 
   if (role && VALID_ROLES.includes(role as UserRole)) {
-    filter.role = role;
+    values.push(role);
+    query += ` AND role = $${values.length}`;
   }
 
   if (isActive !== undefined) {
-    filter.isActive = isActive === "true";
+    values.push(isActive === "true");
+    query += ` AND is_active = $${values.length}`;
   }
 
   if (search && typeof search === "string") {
-    filter.$or = [
-      { name: { $regex: search, $options: "i" } },
-      { email: { $regex: search, $options: "i" } },
-      { pjNumber: { $regex: search, $options: "i" } },
-    ];
+    values.push(`%${search}%`);
+    const idx = values.length;
+    query += ` AND (name ILIKE $${idx} OR email ILIKE $${idx} OR pj_number ILIKE $${idx})`;
   }
 
-  const users = await User.find(filter).select(USER_FIELDS).sort("-createdAt");
+  query += ` ORDER BY created_at DESC`;
+
+  const { rows: users } = await pool.query(query, values);
 
   res.status(200).json({
     success: true,
@@ -40,150 +43,142 @@ export const listUsers = asyncHandler(async (req: Request, res: Response) => {
 
 // ─── Get Single User ──────────────────────────────────────────────────────────
 export const getUser = asyncHandler(async (req: Request, res: Response) => {
-  const user = await User.findById(req.params.id).select(USER_FIELDS);
-  if (!user) throw new AppError("User not found.", 404);
+  const { id } = req.params;
+  const { rows } = await pool.query(`SELECT ${USER_FIELDS} FROM users WHERE id = $1`, [id]);
+  
+  if (rows.length === 0) throw new AppError("User not found.", 404);
 
   res.status(200).json({
     success: true,
-    user,
+    user: rows[0],
   });
 });
 
 // ─── Update User Role (SuperAdmin only) ───────────────────────────────────────
 export const updateUserRole = asyncHandler(async (req: Request, res: Response) => {
   const { role } = req.body;
+  const { id } = req.params;
 
   if (!role || !VALID_ROLES.includes(role as UserRole)) {
-    throw new AppError(
-      `Invalid role. Must be one of: ${VALID_ROLES.join(", ")}.`,
-      400
-    );
+    throw new AppError(`Invalid role. Must be one of: ${VALID_ROLES.join(", ")}.`, 400);
   }
 
-  // Prevent SuperAdmin from demoting themselves
-  if (req.user?._id.toString() === req.params.id && role !== "superadmin") {
+  // Prevent SuperAdmin from demoting themselves (req.user.id from protect middleware)
+  if (req.user?.id === id && role !== "superadmin") {
     throw new AppError("You cannot change your own role.", 403);
   }
 
-  const user = await User.findByIdAndUpdate(
-    req.params.id,
-    { role },
-    { new: true, runValidators: true }
-  ).select(USER_FIELDS);
+  const { rows } = await pool.query(
+    `UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2 RETURNING ${USER_FIELDS}`,
+    [role, id]
+  );
 
-  if (!user) throw new AppError("User not found.", 404);
+  if (rows.length === 0) throw new AppError("User not found.", 404);
 
   res.status(200).json({
     success: true,
     message: `User role updated to "${role}" successfully.`,
-    user,
+    user: rows[0],
   });
 });
 
 // ─── Toggle User Active/Inactive (SuperAdmin only) ────────────────────────────
 export const toggleUserActive = asyncHandler(async (req: Request, res: Response) => {
   const { isActive } = req.body;
+  const { id } = req.params;
 
   if (typeof isActive !== "boolean") {
-    throw new AppError("isActive must be a boolean (true or false).", 400);
+    throw new AppError("isActive must be a boolean.", 400);
   }
 
-  // Prevent SuperAdmin from deactivating themselves
-  if (req.user?._id.toString() === req.params.id && !isActive) {
+  if (req.user?.id === id && !isActive) {
     throw new AppError("You cannot deactivate your own account.", 403);
   }
 
-  const user = await User.findByIdAndUpdate(
-    req.params.id,
-    { isActive },
-    { new: true }
-  ).select(USER_FIELDS);
+  const { rows } = await pool.query(
+    `UPDATE users SET is_active = $1, updated_at = NOW() WHERE id = $2 RETURNING ${USER_FIELDS}`,
+    [isActive, id]
+  );
 
-  if (!user) throw new AppError("User not found.", 404);
+  if (rows.length === 0) throw new AppError("User not found.", 404);
 
   res.status(200).json({
     success: true,
     message: `User account ${isActive ? "activated" : "deactivated"} successfully.`,
-    user,
+    user: rows[0],
   });
 });
 
 // ─── Create New User (SuperAdmin only) ────────────────────────────────────────
 export const createUser = asyncHandler(async (req: Request, res: Response) => {
-  const { name, email, password, role, pjNumber, title } = req.body;
+  const { name, email, role, pjNumber, title } = req.body;
 
-  // Check if user already exists
-  const existingUser = await User.findOne({ email });
-  if (existingUser) {
-    throw new AppError("A user with this email already exists.", 400);
+  // 1. Check existence
+  const existing = await pool.query("SELECT id FROM users WHERE email = $1 OR pj_number = $2", [email, pjNumber]);
+  if (existing.rows.length > 0) {
+    throw new AppError("A user with this email or PJ number already exists.", 400);
   }
 
-  const user = await User.create({
-    name,
-    email,
-    password, // Ensure your model hashes this!
-    role: role || "user",
-    pjNumber,
-    title,
-    isActive: true
-  });
-
-  // Remove password from response
-  const userResponse = await User.findById(user._id).select(USER_FIELDS);
+  // 2. Insert
+  const { rows } = await pool.query(
+    `INSERT INTO users (name, email, role, pj_number, title, is_active) 
+     VALUES ($1, $2, $3, $4, $5, true) 
+     RETURNING ${USER_FIELDS}`,
+    [name, email.toLowerCase().trim(), role || "user", pjNumber.trim(), title]
+  );
 
   res.status(201).json({
     success: true,
     message: "User created successfully.",
-    user: userResponse,
+    user: rows[0],
   });
 });
 
 // ─── Update User Details (SuperAdmin only) ────────────────────────────────────
 export const updateUser = asyncHandler(async (req: Request, res: Response) => {
   const { name, email, pjNumber, title, role } = req.body;
+  const { id } = req.params;
 
-  // 1. Check if user exists
-  const user = await User.findById(req.params.id);
-  if (!user) throw new AppError("User not found.", 404);
-
-  // 2. Prevent SuperAdmin from demoting themselves via general update
-  if (req.user?._id.toString() === req.params.id && role && role !== "superadmin") {
+  if (req.user?.id === id && role && role !== "superadmin") {
     throw new AppError("You cannot change your own role to a lower level.", 403);
   }
 
-  // 3. Update the fields
-  const updatedUser = await User.findByIdAndUpdate(
-    req.params.id,
-    { name, email, pjNumber, title, role },
-    { new: true, runValidators: true }
-  ).select(USER_FIELDS);
+  const { rows } = await pool.query(
+    `UPDATE users 
+     SET name = COALESCE($1, name), 
+         email = COALESCE($2, email), 
+         pj_number = COALESCE($3, pj_number), 
+         title = COALESCE($4, title), 
+         role = COALESCE($5, role),
+         updated_at = NOW()
+     WHERE id = $6 
+     RETURNING ${USER_FIELDS}`,
+    [name, email?.toLowerCase().trim(), pjNumber?.trim(), title, role, id]
+  );
+
+  if (rows.length === 0) throw new AppError("User not found.", 404);
 
   res.status(200).json({
     success: true,
     message: "User details updated successfully.",
-    user: updatedUser,
+    user: rows[0],
   });
 });
 
 // ─── Delete User (SuperAdmin only) ───────────────────────────────────────────
 export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
-  const user = await User.findById(req.params.id);
+  const { id } = req.params;
 
-  if (!user) throw new AppError("User not found.", 404);
-
-  // Prevent SuperAdmin from deleting themselves
-  if (req.user?._id.toString() === req.params.id) {
+  if (req.user?.id === id) {
     throw new AppError("You cannot delete your own account.", 403);
   }
 
-  // Optional: Check if user has assigned indicators/tasks before allowing deletion
-  // If your system requires history, you might prefer toggleUserActive (Soft Delete)
-  
-  await User.findByIdAndDelete(req.params.id);
+  const { rowCount } = await pool.query("DELETE FROM users WHERE id = $1", [id]);
+  if (rowCount === 0) throw new AppError("User not found.", 404);
 
   res.status(200).json({
     success: true,
     message: "User has been removed from the system.",
-    id: req.params.id
+    id
   });
 });

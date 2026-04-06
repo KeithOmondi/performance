@@ -1,4 +1,5 @@
-import { User, IUser, UserRole } from "../user/user.model";
+import { pool } from "../../config/db";
+import { IUser, UserRole } from "../../types/user.types";
 import { AppError } from "../../utils/AppError";
 import { sendOtpMail } from "../../utils/sendMail";
 import { generateOTP } from "../../utils/generateOTP";
@@ -12,7 +13,6 @@ interface IRegisterPayload {
   role?: UserRole;
 }
 
-// Mask email for safe display: k***@gmail.com
 const maskEmail = (email: string): string => {
   const [local, domain] = email.split("@");
   return `${local[0]}***@${domain}`;
@@ -21,129 +21,114 @@ const maskEmail = (email: string): string => {
 export class AuthService {
   // ─── Register ────────────────────────────────────────────────────────────
   static async register(payload: IRegisterPayload): Promise<IUser> {
-    const existingUser = await User.findOne({
-      $or: [
-        { email: payload.email.toLowerCase().trim() },
-        { pjNumber: payload.pjNumber.trim() },
-      ],
-    });
+    const email = payload.email.toLowerCase().trim();
+    const pjNumber = payload.pjNumber.trim();
 
-    if (existingUser) {
-      throw new AppError(
-        "An account with this Email or PJ Number already exists.",
-        409
-      );
+    // 1. Check for existing user (SQL OR check)
+    const existingRes = await pool.query(
+      "SELECT id FROM users WHERE email = $1 OR pj_number = $2 LIMIT 1",
+      [email, pjNumber]
+    );
+
+    if (existingRes.rows.length > 0) {
+      throw new AppError("An account with this Email or PJ Number already exists.", 409);
     }
 
-    const user = await User.create({
-      ...payload,
-      email: payload.email.toLowerCase().trim(),
-      pjNumber: payload.pjNumber.trim(),
-      role: payload.role || "user",
-    });
+    // 2. Insert into PostgreSQL
+    const insertQuery = `
+      INSERT INTO users (name, email, pj_number, title, role)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING id, name, email, role, pj_number as "pjNumber";
+    `;
 
-    return user;
+    const { rows } = await pool.query(insertQuery, [
+      payload.name,
+      email,
+      pjNumber,
+      payload.title,
+      payload.role || "user",
+    ]);
+
+    return rows[0];
   }
 
   // ─── Request OTP ─────────────────────────────────────────────────────────
   static async requestLoginOTP(pjNumber: string): Promise<string> {
-    const user = await User.findOne({
-      pjNumber: pjNumber.trim(),
-      isActive: true,
-    }).select("+loginOtp +loginOtpExpires");
+    const cleanPj = pjNumber.trim();
 
-    if (!user) {
-      throw new AppError(
-        "No active account found with this PJ Number.",
-        404
-      );
+    const userRes = await pool.query(
+      "SELECT id, name, email, login_otp_expires FROM users WHERE pj_number = $1 AND is_active = true",
+      [cleanPj]
+    );
+
+    const user = userRes.rows[0];
+    if (!user) throw new AppError("No active account found with this PJ Number.", 404);
+
+    // Rate limit: prevent OTP spam (1 minute window)
+    if (user.login_otp_expires && (new Date(user.login_otp_expires).getTime() - Date.now() > 9 * 60 * 1000)) {
+      throw new AppError("An OTP was recently sent. Please wait before requesting a new one.", 429);
     }
 
-    // Rate limit: prevent OTP spam — block if an OTP was sent in the last 60s
-    if (
-      user.loginOtpExpires &&
-      user.loginOtpExpires.getTime() - Date.now() > 9 * 60 * 1000
-    ) {
-      throw new AppError(
-        "An OTP was recently sent. Please wait before requesting a new one.",
-        429
-      );
-    }
-
-    // Use the secure generateOTP utility (crypto.randomInt)
     const { otp, hashedOtp, expiresAt } = generateOTP(6, 10);
 
-    user.loginOtp = hashedOtp;
-    user.loginOtpExpires = expiresAt;
-    await user.save({ validateBeforeSave: false });
+    // Update OTP fields in DB
+    await pool.query(
+      "UPDATE users SET login_otp = $1, login_otp_expires = $2 WHERE id = $3",
+      [hashedOtp, expiresAt, user.id]
+    );
 
     await sendOtpMail(user.email, otp, user.name);
 
-    // Return masked email so frontend can show "OTP sent to k***@gmail.com"
     return maskEmail(user.email);
   }
 
   // ─── Verify OTP ──────────────────────────────────────────────────────────
   static async verifyOTP(pjNumber: string, otp: string): Promise<IUser> {
-    const user = await User.findOne({
-      pjNumber: pjNumber.trim(),
-      isActive: true,
-    }).select("+loginOtp +loginOtpExpires");
+    const userRes = await pool.query(
+      "SELECT id, name, email, role, pj_number as \"pjNumber\", login_otp, login_otp_expires FROM users WHERE pj_number = $1 AND is_active = true",
+      [pjNumber.trim()]
+    );
 
-    if (!user) {
-      throw new AppError("No active account found with this PJ Number.", 404);
-    }
+    const user = userRes.rows[0];
+    if (!user) throw new AppError("No active account found with this PJ Number.", 404);
 
-    // Check expiry first
-    if (!user.loginOtpExpires || user.loginOtpExpires < new Date()) {
-      user.loginOtp = undefined;
-      user.loginOtpExpires = undefined;
-      await user.save({ validateBeforeSave: false });
+    // Check expiry
+    if (!user.login_otp_expires || new Date(user.login_otp_expires) < new Date()) {
+      await pool.query("UPDATE users SET login_otp = NULL, login_otp_expires = NULL WHERE id = $1", [user.id]);
       throw new AppError("Your OTP has expired. Please request a new one.", 401);
     }
 
-    // Verify the hash
-    const hashedInput = crypto
-      .createHash("sha256")
-      .update(otp.trim())
-      .digest("hex");
-
-    if (user.loginOtp !== hashedInput) {
+    // Verify hash
+    const hashedInput = crypto.createHash("sha256").update(otp.trim()).digest("hex");
+    if (user.login_otp !== hashedInput) {
       throw new AppError("Invalid OTP. Please try again.", 401);
     }
 
-    // Clear OTP after successful verification
-    user.loginOtp = undefined;
-    user.loginOtpExpires = undefined;
-    await user.save({ validateBeforeSave: false });
+    // Clear OTP and return user
+    const finalRes = await pool.query(
+      "UPDATE users SET login_otp = NULL, login_otp_expires = NULL WHERE id = $1 RETURNING id, name, email, role, pj_number as \"pjNumber\"",
+      [user.id]
+    );
 
-    return user;
+    return finalRes.rows[0];
   }
 
   // ─── Get User By ID ───────────────────────────────────────────────────────
   static async getUserById(userId: string): Promise<IUser> {
-    const user = await User.findById(userId);
-    if (!user) throw new AppError("User not found.", 404);
-    return user;
+    const { rows } = await pool.query(
+      "SELECT id, name, email, role, pj_number as \"pjNumber\", is_active as \"isActive\" FROM users WHERE id = $1",
+      [userId]
+    );
+    if (rows.length === 0) throw new AppError("User not found.", 404);
+    return rows[0];
   }
 
-  // ─── Deactivate User ──────────────────────────────────────────────────────
-  static async deactivateUser(userId: string): Promise<void> {
-    const user = await User.findById(userId);
-    if (!user) throw new AppError("User not found.", 404);
-    if (!user.isActive) throw new AppError("User is already deactivated.", 400);
-
-    user.isActive = false;
-    await user.save({ validateBeforeSave: false });
-  }
-
-  // ─── Reactivate User ──────────────────────────────────────────────────────
-  static async reactivateUser(userId: string): Promise<void> {
-    const user = await User.findById(userId);
-    if (!user) throw new AppError("User not found.", 404);
-    if (user.isActive) throw new AppError("User is already active.", 400);
-
-    user.isActive = true;
-    await user.save({ validateBeforeSave: false });
+  // ─── Deactivate/Reactivate ────────────────────────────────────────────────
+  static async toggleUserStatus(userId: string, status: boolean): Promise<void> {
+    const { rowCount } = await pool.query(
+      "UPDATE users SET is_active = $1 WHERE id = $2",
+      [status, userId]
+    );
+    if (rowCount === 0) throw new AppError("User not found.", 404);
   }
 }

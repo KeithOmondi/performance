@@ -1,244 +1,273 @@
 import { Request, Response } from "express";
+import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
-import { Indicator } from "../user/Indicator.model";
-import { User } from "../user/user.model";
-import { sendMail } from "../../utils/sendMail";
-import {
-  submissionRejectedTemplate,
-  superAdminReviewNeededTemplate,
-} from "../../utils/mailTemplates";
-import mongoose from "mongoose";
+import sendMail from "../../utils/sendMail";
+import { submissionRejectedTemplate, superAdminReviewNeededTemplate } from "../../utils/mailTemplates";
 
-// ─── Data Transformer (Enhanced for Lean Objects & Nested Documents) ──────────
-const transformIndicator = (ind: any) => {
-  if (!ind) return null;
-  const indObj = typeof ind.toObject === "function" ? ind.toObject() : ind;
-  const plan = indObj.strategicPlanId;
+/**
+ * SQL Helper: Explicitly maps Postgres snake_case to Frontend camelCase
+ * FIX: Moved ORDER BY inside a derived subquery before json_agg to avoid
+ *      "column must appear in GROUP BY or aggregate function" error.
+ */
+const INDICATOR_DETAIL_QUERY = `
+  SELECT 
+    i.*,
+    i.active_quarter        AS "activeQuarter",
+    i.reporting_cycle       AS "reportingCycle",
+    i.strategic_plan_id     AS "strategicPlanId",
+    i.objective_id          AS "objectiveId",
+    i.activity_id           AS "activityId",
+    i.assignee_id           AS "assigneeId",
+    i.updated_at            AS "updatedAt",
+    u.name                  AS "assigneeName",
+    u.email                 AS "assigneeEmail",
+    u.pj_number             AS "pjNumber",
+    ab.name                 AS "assignedByName",
+    sp.perspective,
 
-  const objective = plan?.objectives?.find(
-    (obj: any) => obj._id?.toString() === indObj.objectiveId?.toString()
+    -- FETCH OBJECTIVE AS OBJECT
+    (
+      SELECT json_build_object('title', title)
+      FROM strategic_objectives
+      WHERE id = i.objective_id
+    ) AS objective,
+
+    -- FETCH ACTIVITY AS OBJECT
+    (
+      SELECT json_build_object('description', description)
+      FROM strategic_activities
+      WHERE id = i.activity_id
+    ) AS activity,
+
+    -- NESTED SUBMISSIONS (ordered inside derived subquery, then aggregated)
+    COALESCE(
+      (
+        SELECT json_agg(sub)
+        FROM (
+          SELECT json_build_object(
+            'id',                s.id,
+            'indicatorId',       s.indicator_id,
+            'quarter',           s.quarter,
+            'year',              s.year,
+            'reviewStatus',      s.review_status,
+            'adminComment',      s.admin_comment,
+            'resubmissionCount', s.resubmission_count,
+            'achievedValue',     s.achieved_value,
+            'notes',             s.notes,
+            'submittedAt',       s.submitted_at,
+            'isReviewed',        s.is_reviewed,
+            'documents', (
+              SELECT json_agg(json_build_object(
+                'id',                d.id,
+                'submissionId',      d.submission_id,
+                'evidenceUrl',       d.evidence_url,
+                'evidencePublicId',  d.evidence_public_id,
+                'fileType',          d.file_type,
+                'fileName',          d.file_name,
+                'uploadedAt',        d.uploaded_at
+              ))
+              FROM submission_documents d
+              WHERE d.submission_id = s.id
+            )
+          ) AS sub
+          FROM submissions s
+          WHERE s.indicator_id = i.id
+          ORDER BY s.submitted_at DESC
+        ) ordered_subs
+      ),
+      '[]'
+    ) AS submissions
+
+  FROM indicators i
+  LEFT JOIN users u  ON i.assignee_id = u.id
+  LEFT JOIN users ab ON i.assigned_by  = ab.id
+  LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
+`;
+
+// ─── 1. Fetch All Indicators ──────────────────────────────────────────────────
+export const fetchIndicatorsForAdmin = asyncHandler(async (req: Request, res: Response) => {
+  const { status, search } = req.query;
+  const values: any[] = [];
+  let whereClause = "WHERE 1=1";
+
+  if (status && status !== "all") {
+    values.push(status);
+    whereClause += ` AND i.status = $${values.length}`;
+  }
+
+  if (search) {
+    values.push(`%${search}%`);
+    whereClause += ` AND (u.name ILIKE $${values.length} OR u.pj_number ILIKE $${values.length})`;
+  }
+
+  const query = `${INDICATOR_DETAIL_QUERY} ${whereClause} ORDER BY i.updated_at DESC`;
+  const { rows: indicators } = await pool.query(query, values);
+
+  res.status(200).json({ success: true, data: indicators });
+});
+
+// ─── 2. Get Indicator By ID ───────────────────────────────────────────────────
+export const getIndicatorByIdAdmin = asyncHandler(async (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  const query = `${INDICATOR_DETAIL_QUERY} WHERE i.id = $1 LIMIT 1`;
+  const { rows } = await pool.query(query, [id]);
+  const indicator = rows[0];
+
+  if (!indicator) throw new AppError("Indicator not found.", 404);
+
+  const historyRes = await pool.query(
+    `SELECT 
+       h.*,
+       h.reviewer_role AS "reviewerRole",
+       u.name          AS "reviewerName"
+     FROM review_history h
+     LEFT JOIN users u ON h.reviewed_by = u.id
+     WHERE h.indicator_id = $1
+     ORDER BY h.at DESC`,
+    [id]
   );
 
-  const activity = objective?.activities?.find(
-    (act: any) => act._id?.toString() === indObj.activityId?.toString()
-  );
+  indicator.reviewHistory = historyRes.rows;
+  res.status(200).json({ success: true, data: indicator });
+});
 
-  return {
-    ...indObj,
-    _id: indObj._id.toString(),
-    perspective: plan?.perspective || "N/A",
-    objectiveTitle: objective?.title || "Unknown Objective",
-    activityDescription:
-      activity?.description || indObj.instructions || "No activity text",
-    assigneeDisplayName: indObj.assignee?.name || "Unassigned",
-    // FIX: Deep map submissions to ensure documents array is always present
-    submissions: (indObj.submissions || []).map((sub: any) => ({
-      ...sub,
-      _id: sub._id?.toString(),
-      documents: sub.documents || [],
-    })),
-    isOverdue:
-      new Date() > new Date(indObj.deadline) && indObj.status !== "Completed",
-  };
-};
+// ─── 3. Admin Review Process ──────────────────────────────────────────────────
+export const adminReviewProcess = asyncHandler(async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { decision, adminOverallComments, submissionUpdates } = req.body;
+  const adminId = (req as any).user.id;
 
-// ─── 1. Get All Indicators (Admin Dashboard) ──────────────────────────────────
-export const fetchIndicatorsForAdmin = asyncHandler(
-  async (req: Request, res: Response) => {
-    const { status, search } = req.query;
-    const filter: Record<string, any> = {};
-
-    if (status && typeof status === "string" && status !== "all") {
-      filter.status = status;
-    }
-
-    if (search && typeof search === "string") {
-      const matchingUsers = await User.find({
-        $or: [
-          { name: { $regex: search, $options: "i" } },
-          { pjNumber: { $regex: search, $options: "i" } },
-        ],
-      }).select("_id");
-      filter.assignee = { $in: matchingUsers.map((u) => u._id) };
-    }
-
-    const indicators = await Indicator.find(filter)
-      .populate({ path: "assignee", select: "name email pjNumber" })
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .populate({ path: "assignedBy", select: "name" })
-      .sort({ updatedAt: -1 })
-      .lean();
-
-    res.status(200).json({
-      success: true,
-      count: indicators.length,
-      data: indicators.map(transformIndicator),
-    });
+  if (!["Verified", "Rejected"].includes(decision)) {
+    throw new AppError('Decision must be "Verified" or "Rejected".', 400);
   }
-);
 
-// ─── 2. Get Single Indicator (Admin View) ─────────────────────────────────────
-export const getIndicatorByIdAdmin = asyncHandler(
-  async (req: Request, res: Response) => {
-    const id = req.params.id as string;
+  const isVerified = decision === "Verified";
+  const client = await pool.connect();
 
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      throw new AppError("Invalid indicator ID.", 400);
-    }
+  try {
+    await client.query("BEGIN");
 
-    const indicator = await Indicator.findById(id)
-      .populate({ path: "assignee", select: "name email pjNumber" })
-      .populate({ path: "assignedBy", select: "name" })
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .populate({ path: "reviewHistory.reviewedBy", select: "name role" })
-      .lean();
-
-    if (!indicator) throw new AppError("Indicator not found.", 404);
-
-    res.status(200).json({
-      success: true,
-      data: transformIndicator(indicator),
-    });
-  }
-);
-
-// ─── 3. Get Resubmitted Indicators ────────────────────────────────────────────
-export const fetchResubmittedIndicators = asyncHandler(
-  async (_req: Request, res: Response) => {
-    const indicators = await Indicator.find({
-      status: "Awaiting Admin Approval",
-      submissions: {
-        $elemMatch: {
-          reviewStatus: "Pending",
-          resubmissionCount: { $gt: 0 },
-        },
-      },
-    })
-      .populate({ path: "assignee", select: "name email pjNumber" })
-      .populate({ path: "strategicPlanId", select: "perspective objectives" })
-      .sort({ updatedAt: -1 })
-      .lean();
-
-    res.status(200).json({
-      success: true,
-      count: indicators.length,
-      data: indicators.map(transformIndicator),
-    });
-  }
-);
-
-// ─── 4. Admin Review (Verify or Reject) ───────────────────────────────────────
-export const adminReviewProcess = asyncHandler(
-  async (req: Request, res: Response) => {
-    const id = req.params.id as string;
-    const { decision, adminOverallComments, submissionUpdates } = req.body;
-
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      throw new AppError("Invalid indicator ID.", 400);
-    }
-
-    if (!["Verified", "Rejected"].includes(decision)) {
-      throw new AppError('Decision must be "Verified" or "Rejected".', 400);
-    }
-
-    if (!adminOverallComments?.trim()) {
-      throw new AppError("Admin comments are required.", 400);
-    }
-
-    const indicator = await Indicator.findById(id).populate(
-      "assignee",
-      "name email"
+    const indRes = await client.query(
+      `SELECT 
+         i.*,
+         i.active_quarter    AS "activeQuarter",
+         i.reporting_cycle   AS "reportingCycle",
+         u.name,
+         u.email
+       FROM indicators i
+       JOIN users u ON i.assignee_id = u.id
+       WHERE i.id = $1`,
+      [id]
     );
+    const indicator = indRes.rows[0];
+
     if (!indicator) throw new AppError("Indicator not found.", 404);
-
     if (indicator.status !== "Awaiting Admin Approval") {
-      throw new AppError(`Indicator is not in review status.`, 400);
+      throw new AppError("Indicator is not in review status.", 400);
     }
 
-    let finalUpdates = submissionUpdates;
-    if (!Array.isArray(finalUpdates) || finalUpdates.length === 0) {
-      finalUpdates = indicator.submissions
-        .filter((s: any) => s.reviewStatus === "Pending")
-        .map((s: any) => ({ submissionId: s._id }));
-    }
+    const newStatus = isVerified ? "Awaiting Super Admin" : "Rejected by Admin";
 
-    if (finalUpdates.length === 0) {
-      throw new AppError("At least one submission update is required.", 400);
-    }
+    await client.query(
+      `UPDATE indicators
+       SET status = $1, admin_overall_comments = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [newStatus, adminOverallComments, id]
+    );
 
-    const isVerified = decision === "Verified";
-
-    // Update Sub-documents
-    finalUpdates.forEach((update: any) => {
-      if (!update.submissionId) return;
-      const sub = (indicator.submissions as any).id(update.submissionId);
-      if (sub) {
-        sub.reviewStatus = isVerified ? "Verified" : "Rejected";
-        sub.adminComment = update.adminComment?.trim() || adminOverallComments.trim();
-        sub.isReviewed = true;
+    if (Array.isArray(submissionUpdates)) {
+      for (const update of submissionUpdates) {
+        await client.query(
+          `UPDATE submissions
+           SET review_status = $1, admin_comment = $2, is_reviewed = true
+           WHERE id = $3`,
+          [
+            isVerified ? "Verified" : "Rejected",
+            update.adminComment || adminOverallComments,
+            update.submissionId,
+          ]
+        );
       }
-    });
+    }
 
-    // Parent status and logs
-    indicator.status = isVerified ? "Awaiting Super Admin" : "Rejected by Admin";
-    indicator.adminOverallComments = adminOverallComments.trim();
-    
-    // Explicitly tell Mongoose that nested array has changed
-    indicator.markModified("submissions");
+    await client.query(
+      `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+       VALUES ($1, $2, $3, 'admin', $4)`,
+      [id, isVerified ? "Verified" : "Correction Requested", adminOverallComments, adminId]
+    );
 
-    indicator.reviewHistory.push({
-      action: isVerified ? "Verified" : "Correction Requested",
-      reason: adminOverallComments.trim(),
-      reviewerRole: "admin",
-      reviewedBy: (req as any).user?._id,
-      at: new Date(),
-    } as any);
+    await client.query("COMMIT");
 
-    await indicator.save();
-
-    // Async Notifications
-    const assignee = indicator.assignee as any;
-    const taskTitle = indicator.instructions || "Performance Indicator";
-    const year = new Date().getFullYear();
+    const taskTitle  = indicator.instructions || "Performance Indicator";
+    const year       = new Date().getFullYear();
+    const cycleInfo  = indicator.reportingCycle === "Annual" ? "Annual" : `Q${indicator.activeQuarter}`;
 
     if (isVerified) {
-      User.find({ role: "superadmin", isActive: true })
-        .select("email")
-        .then((superAdmins) => {
-          superAdmins.forEach((sa) => {
-            sendMail({
-              to: sa.email,
-              subject: "Submission Ready for Final Approval",
-              html: superAdminReviewNeededTemplate(
-                taskTitle,
-                assignee?.name || "Staff",
-                (req as any).user?.name,
-                indicator.activeQuarter,
-                year
-              ),
-            }).catch((e) => console.error("Mail Error:", e));
-          });
-        });
-    } else if (assignee?.email) {
+      const saRes = await pool.query(
+        "SELECT email FROM users WHERE role = 'superadmin' AND is_active = true"
+      );
+      saRes.rows.forEach((sa) => {
+        sendMail({
+          to: sa.email,
+          subject: `[${cycleInfo}] Submission Ready for Final Approval`,
+          html: superAdminReviewNeededTemplate(
+            taskTitle,
+            indicator.name,
+            (req as any).user.name,
+            cycleInfo,
+            year
+          ),
+        }).catch(console.error);
+      });
+    } else {
       sendMail({
-        to: assignee.email,
+        to: indicator.email,
         subject: "Submission Returned for Correction",
         html: submissionRejectedTemplate(
-          assignee.name,
+          indicator.name,
           taskTitle,
-          indicator.activeQuarter,
+          cycleInfo,
           year,
           "Admin",
-          adminOverallComments.trim()
+          adminOverallComments
         ),
-      }).catch((e) => console.error("Mail Error:", e));
+      }).catch(console.error);
     }
 
     res.status(200).json({
       success: true,
       message: isVerified ? "Verified successfully." : "Rejected for correction.",
-      data: transformIndicator(indicator),
     });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
-);
+});
+
+// ─── 4. Fetch Resubmitted Indicators ─────────────────────────────────────────
+export const fetchResubmittedIndicators = asyncHandler(async (_req: Request, res: Response) => {
+  const query = `
+    ${INDICATOR_DETAIL_QUERY}
+    WHERE i.status = 'Awaiting Admin Approval'
+    AND EXISTS (
+      SELECT 1
+      FROM submissions s
+      WHERE s.indicator_id = i.id
+        AND s.review_status = 'Pending'
+        AND s.resubmission_count > 0
+    )
+    ORDER BY i.updated_at DESC
+  `;
+
+  const { rows: indicators } = await pool.query(query);
+
+  res.status(200).json({
+    success: true,
+    count: indicators.length,
+    data: indicators,
+  });
+});

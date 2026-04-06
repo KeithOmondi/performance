@@ -1,385 +1,257 @@
 import { Request, Response } from "express";
-import mongoose from "mongoose";
+import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
-import { Team } from "../user/team.model";
-import { User } from "../user/user.model";
 import { sendMail } from "../../utils/sendMail";
 
-/* ------------------------------------------------------------------ */
-/*  Helper: sync team field on User documents                          */
-/* ------------------------------------------------------------------ */
+/* ─── SHARED SELECT FRAGMENT ──────────────────────────────────────────────────
+   Returns a camelCase-aliased team row that matches the ITeam frontend type.
+────────────────────────────────────────────────────────────────────────────── */
+const TEAM_SELECT = `
+  SELECT
+    t.id,
+    t.name,
+    t.description,
+    t.team_lead_id   AS "teamLeadId",
+    t.created_by     AS "createdBy",
+    t.is_active      AS "isActive",
+    t.created_at     AS "createdAt",
+    t.updated_at     AS "updatedAt",
+    u.name           AS "leadName",
+    u.email          AS "leadEmail",
+    cb.name          AS "creatorName",
+    (SELECT COUNT(*) FROM team_members WHERE team_id = t.id) AS "memberCount"
+  FROM teams t
+  LEFT JOIN users u  ON t.team_lead_id = u.id
+  LEFT JOIN users cb ON t.created_by = cb.id
+`;
 
-/**
- * Sets `user.team = teamId` for every userId in `add`,
- * and clears `user.team = null` for every userId in `remove`.
- * Runs in a single bulkWrite for efficiency.
- */
-// Derive the exact type Mongoose's bulkWrite() expects from its own signature.
-// This avoids the mongodb ↔ mongoose AnyBulkWriteOperation mismatch.
-type UserBulkOp = Parameters<typeof User.bulkWrite>[0][number];
+/* ─── HELPERS ─────────────────────────────────────────────────────────────── */
 
-async function syncUserTeamField(
-  teamId: mongoose.Types.ObjectId,
-  add: mongoose.Types.ObjectId[] = [],
-  remove: mongoose.Types.ObjectId[] = [],
-) {
-  const ops: UserBulkOp[] = [];
-
-  if (add.length) {
-    ops.push({
-      updateMany: {
-        filter: { _id: { $in: add } },
-        update: { $set: { team: teamId } },
-      },
-    });
+async function syncTeamMembers(client: any, teamId: string, userIds: string[]) {
+  await client.query("DELETE FROM team_members WHERE team_id = $1", [teamId]);
+  if (userIds.length > 0) {
+    const values = userIds.map((_, idx) => `($1, $${idx + 2})`).join(",");
+    await client.query(
+      `INSERT INTO team_members (team_id, user_id) VALUES ${values}`,
+      [teamId, ...userIds]
+    );
   }
-
-  if (remove.length) {
-    ops.push({
-      updateMany: {
-        filter: { _id: { $in: remove }, team: teamId },
-        update: { $set: { team: null } },
-      },
-    });
-  }
-
-  if (ops.length) await User.bulkWrite(ops);
 }
 
-/* ------------------------------------------------------------------ */
-/*  1. Create Team                                                      */
-/* ------------------------------------------------------------------ */
+async function getTeamWithMembers(teamId: string) {
+  const teamRes = await pool.query(
+    `${TEAM_SELECT} WHERE t.id = $1`,
+    [teamId]
+  );
+  const team = teamRes.rows[0];
+  if (!team) return null;
+
+  const membersRes = await pool.query(
+    `SELECT u.id, u.name, u.email, u.title, u.pj_number AS "pjNumber", u.role
+     FROM users u
+     JOIN team_members tm ON u.id = tm.user_id
+     WHERE tm.team_id = $1`,
+    [teamId]
+  );
+
+  return { ...team, members: membersRes.rows };
+}
+
+/* ─── 1. CREATE TEAM ──────────────────────────────────────────────────────── */
 export const createTeam = asyncHandler(async (req: Request, res: Response) => {
   const { name, description, teamLead, members = [] } = req.body;
+  const createdBy = (req as any).user.id;
 
-  if (!name || !teamLead) {
-    throw new AppError("Team name and team lead are required.", 400);
-  }
+  if (!name || !teamLead) throw new AppError("Team name and lead are required.", 400);
 
-  // Validate teamLead exists
-  const lead = await User.findById(teamLead).select("name email");
-  if (!lead) throw new AppError("Team lead user not found.", 404);
-
-  // Build unique member list (lead always included)
-  const memberIds: mongoose.Types.ObjectId[] = [
-    ...new Set([teamLead, ...members].map(String)),
-  ].map((id) => new mongoose.Types.ObjectId(id));
-
-  // Validate all members exist
-  const foundUsers = await User.find({ _id: { $in: memberIds } }).select(
-    "_id name email",
-  );
-  if (foundUsers.length !== memberIds.length) {
-    throw new AppError("One or more member user IDs are invalid.", 400);
-  }
-
-  const team = await Team.create({
-    name,
-    description,
-    teamLead,
-    members: memberIds,
-    createdBy: req.user!._id,
-  });
-
-  // Sync team field on every member's User document
-  await syncUserTeamField(team._id, memberIds);
-
-  // Notify all members
+  const client = await pool.connect();
   try {
-    await Promise.all(
-      foundUsers.map((u) =>
-        sendMail({
-          to: u.email,
-          subject: `You've been added to team "${team.name}"`,
-          html: teamAddedTemplate(u.name, team.name, lead.name, foundUsers),
-        }),
-      ),
+    await client.query("BEGIN");
+
+    const teamRes = await client.query(
+      `INSERT INTO teams (name, description, team_lead_id, created_by)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [name, description, teamLead, createdBy]
     );
-  } catch (err) {
-    console.error("[MAIL] Team creation notification failed:", err);
+    const teamId = teamRes.rows[0].id;
+
+    const uniqueMembers = Array.from(new Set([teamLead, ...members])) as string[];
+    await syncTeamMembers(client, teamId, uniqueMembers);
+
+    await client.query("COMMIT");
+
+    const fullTeam = await getTeamWithMembers(teamId);
+
+    // Non-blocking email notifications
+    pool.query("SELECT name, email FROM users WHERE id = ANY($1)", [uniqueMembers])
+      .then(({ rows }) => {
+        const lead = rows.find((u) => u.id === teamLead);
+        rows.forEach((u) =>
+          sendMail({
+            to: u.email,
+            subject: `Added to team: ${name}`,
+            html: teamAddedTemplate(u.name, name, lead?.name || "Team Lead", rows),
+          })
+        );
+      });
+
+    res.status(201).json({ success: true, data: fullTeam });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
   }
-
-  const populated = await Team.findById(team._id)
-    .populate("teamLead", "name email title pjNumber")
-    .populate("members", "name email title pjNumber")
-    .populate("createdBy", "name email");
-
-  res.status(201).json({ success: true, data: populated });
 });
 
-/* ------------------------------------------------------------------ */
-/*  2. Get All Teams                                                    */
-/* ------------------------------------------------------------------ */
-export const getAllTeams = asyncHandler(
-  async (_req: Request, res: Response) => {
-    const teams = await Team.find()
-      .populate("teamLead", "name email title pjNumber")
-      .populate("members", "name email title pjNumber")
-      .populate("createdBy", "name email")
-      .sort({ createdAt: -1 })
-      .lean();
+/* ─── 2. GET ALL TEAMS ────────────────────────────────────────────────────── */
+export const getAllTeams = asyncHandler(async (_req: Request, res: Response) => {
+  const { rows } = await pool.query(`${TEAM_SELECT} ORDER BY t.created_at DESC`);
+  res.status(200).json({ success: true, data: rows });
+});
 
-    res.status(200).json({ success: true, count: teams.length, data: teams });
-  },
-);
-
-/* ------------------------------------------------------------------ */
-/*  3. Get Single Team                                                  */
-/* ------------------------------------------------------------------ */
+/* ─── 3. GET SINGLE TEAM (with members) ──────────────────────────────────── */
 export const getTeamById = asyncHandler(async (req: Request, res: Response) => {
-  const team = await Team.findById(req.params.id)
-    .populate("teamLead", "name email title pjNumber")
-    .populate("members", "name email title pjNumber")
-    .populate("createdBy", "name email")
-    .lean();
-
+  const id = req.params.id as string;
+  const team = await getTeamWithMembers(id);
   if (!team) throw new AppError("Team not found.", 404);
-
   res.status(200).json({ success: true, data: team });
 });
 
-/* ------------------------------------------------------------------ */
-/*  4. Update Team (name, description, teamLead)                       */
-/* ------------------------------------------------------------------ */
+/* ─── 4. UPDATE TEAM ──────────────────────────────────────────────────────── */
 export const updateTeam = asyncHandler(async (req: Request, res: Response) => {
-  const team = await Team.findById(req.params.id);
-  if (!team) throw new AppError("Team not found.", 404);
+  const id = req.params.id as string;
+  const { name, description, teamLead, isActive } = req.body;
 
-  const { name, description, teamLead } = req.body;
-
-  if (name) team.name = name;
-  if (description !== undefined) team.description = description;
-
-  if (teamLead && teamLead.toString() !== team.teamLead.toString()) {
-    const lead = await User.findById(teamLead);
-    if (!lead) throw new AppError("New team lead user not found.", 404);
-
-    // Ensure new lead is a member
-    const isAlreadyMember = team.members.some(
-      (m) => m.toString() === teamLead.toString(),
-    );
-    if (!isAlreadyMember) team.members.push(teamLead);
-
-    team.teamLead = teamLead;
-  }
-
-  await team.save();
-
-  const populated = await Team.findById(team._id)
-    .populate("teamLead", "name email title pjNumber")
-    .populate("members", "name email title pjNumber");
-
-  res.status(200).json({ success: true, data: populated });
-});
-
-/* ------------------------------------------------------------------ */
-/*  5. Add Members to Team                                              */
-/* ------------------------------------------------------------------ */
-export const addTeamMembers = asyncHandler(
-  async (req: Request, res: Response) => {
-    const { memberIds } = req.body; // array of user IDs
-
-    if (!Array.isArray(memberIds) || memberIds.length === 0) {
-      throw new AppError("memberIds must be a non-empty array.", 400);
-    }
-
-    const team = await Team.findById(req.params.id);
-    if (!team) throw new AppError("Team not found.", 404);
-
-    // Filter out already-existing members
-    const existingStrs = team.members.map((m) => m.toString());
-    const newIds = memberIds
-      .filter((id: string) => !existingStrs.includes(id.toString()))
-      .map((id: string) => new mongoose.Types.ObjectId(id));
-
-    if (newIds.length === 0) {
-      return res
-        .status(200)
-        .json({ success: true, message: "All users are already members." });
-    }
-
-    // Validate users exist
-    const newUsers = await User.find({ _id: { $in: newIds } }).select(
-      "_id name email",
-    );
-    if (newUsers.length !== newIds.length) {
-      throw new AppError("One or more user IDs are invalid.", 400);
-    }
-
-    team.members.push(...newIds);
-    await team.save();
-
-    await syncUserTeamField(team._id, newIds);
-
-    // Notify newly added members — fetch full member list so we can include it in the email
-    const lead = await User.findById(team.teamLead).select("name");
-    const allTeamMembers = await User.find({ _id: { $in: team.members } }).select("_id name email");
-    try {
-      await Promise.all(
-        newUsers.map((u) =>
-          sendMail({
-            to: u.email,
-            subject: `You've been added to team "${team.name}"`,
-            html: teamAddedTemplate(u.name, team.name, lead?.name ?? "Your Team Lead", allTeamMembers),
-          }),
-        ),
-      );
-    } catch (err) {
-      console.error("[MAIL] Add member notification failed:", err);
-    }
-
-    const populated = await Team.findById(team._id)
-      .populate("teamLead", "name email title pjNumber")
-      .populate("members", "name email title pjNumber");
-
-    return res.status(200).json({ success: true, data: populated });
-  },
-);
-
-/* ------------------------------------------------------------------ */
-/*  6. Remove Members from Team                                         */
-/* ------------------------------------------------------------------ */
-export const removeTeamMembers = asyncHandler(
-  async (req: Request, res: Response) => {
-    const { memberIds } = req.body;
-
-    if (!Array.isArray(memberIds) || memberIds.length === 0) {
-      throw new AppError("memberIds must be a non-empty array.", 400);
-    }
-
-    const team = await Team.findById(req.params.id);
-    if (!team) throw new AppError("Team not found.", 404);
-
-    // Cannot remove the team lead
-    const leadStr = team.teamLead.toString();
-    if (memberIds.some((id: string) => id.toString() === leadStr)) {
-      throw new AppError(
-        "Cannot remove the team lead. Reassign the lead first.",
-        400,
-      );
-    }
-
-    const removeSet = new Set(memberIds.map(String));
-    const removedIds = team.members
-      .filter((m) => removeSet.has(m.toString()))
-      .map((m) => m as mongoose.Types.ObjectId);
-
-    team.members = team.members.filter(
-      (m) => !removeSet.has(m.toString()),
-    ) as mongoose.Types.DocumentArray<mongoose.Types.ObjectId>;
-
-    await team.save();
-    await syncUserTeamField(team._id, [], removedIds);
-
-    const populated = await Team.findById(team._id)
-      .populate("teamLead", "name email title pjNumber")
-      .populate("members", "name email title pjNumber");
-
-    res.status(200).json({ success: true, data: populated });
-  },
-);
-
-/* ------------------------------------------------------------------ */
-/*  7. Deactivate / Reactivate Team                                     */
-/* ------------------------------------------------------------------ */
-export const setTeamActiveStatus = asyncHandler(
-  async (req: Request, res: Response) => {
-    const { isActive } = req.body;
-    if (typeof isActive !== "boolean") {
-      throw new AppError("isActive must be a boolean.", 400);
-    }
-
-    const team = await Team.findByIdAndUpdate(
-      req.params.id,
-      { isActive },
-      { new: true },
-    )
-      .populate("teamLead", "name email")
-      .populate("members", "name email");
-
-    if (!team) throw new AppError("Team not found.", 404);
-
-    res.status(200).json({ success: true, data: team });
-  },
-);
-
-/* ------------------------------------------------------------------ */
-/*  8. Delete Team                                                      */
-/* ------------------------------------------------------------------ */
-export const deleteTeam = asyncHandler(async (req: Request, res: Response) => {
-  const team = await Team.findById(req.params.id);
-  if (!team) throw new AppError("Team not found.", 404);
-
-  // Clear team reference from all members before deleting
-  await syncUserTeamField(
-    team._id,
-    [],
-    team.members as unknown as mongoose.Types.ObjectId[],
+  await pool.query(
+    `UPDATE teams SET
+       name         = COALESCE($1, name),
+       description  = COALESCE($2, description),
+       team_lead_id = COALESCE($3, team_lead_id),
+       is_active    = COALESCE($4, is_active),
+       updated_at   = NOW()
+     WHERE id = $5`,
+    [name, description, teamLead, isActive, id]
   );
 
-  await team.deleteOne();
-
-  res.status(200).json({ success: true, message: "Team deleted." });
+  const team = await getTeamWithMembers(id);
+  if (!team) throw new AppError("Team not found.", 404);
+  res.status(200).json({ success: true, data: team });
 });
 
-/* ------------------------------------------------------------------ */
-/*  Mail template (inline for locality)                                 */
-/* ------------------------------------------------------------------ */
+/* ─── 5. DELETE TEAM ──────────────────────────────────────────────────────── */
+export const deleteTeam = asyncHandler(async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { rowCount } = await pool.query("DELETE FROM teams WHERE id = $1", [id]);
+  if (rowCount === 0) throw new AppError("Team not found.", 404);
+  res.status(200).json({ success: true, message: "Team removed." });
+});
+
+/* ─── 6. ADD MEMBERS ──────────────────────────────────────────────────────── */
+export const addTeamMembers = asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  const { memberIds } = req.body;
+
+  if (!Array.isArray(memberIds) || memberIds.length === 0) {
+    throw new AppError("memberIds must be a non-empty array.", 400);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const teamCheck = await client.query("SELECT id FROM teams WHERE id = $1", [id]);
+    if (!teamCheck.rows[0]) throw new AppError("Team not found.", 404);
+
+    const values = memberIds.map((_, idx) => `($1, $${idx + 2})`).join(",");
+    await client.query(
+      `INSERT INTO team_members (team_id, user_id) VALUES ${values}
+       ON CONFLICT (team_id, user_id) DO NOTHING`,
+      [id, ...memberIds]
+    );
+
+    await client.query("COMMIT");
+
+    const team = await getTeamWithMembers(id);
+    res.status(200).json({ success: true, message: "Members added successfully.", data: team });
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
+  }
+});
+
+/* ─── 7. REMOVE MEMBERS ───────────────────────────────────────────────────── */
+export const removeTeamMembers = asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  const { memberIds } = req.body;
+
+  const teamRes = await pool.query("SELECT team_lead_id FROM teams WHERE id = $1", [id]);
+  if (!teamRes.rows[0]) throw new AppError("Team not found.", 404);
+
+  if (memberIds.includes(teamRes.rows[0].team_lead_id)) {
+    throw new AppError("Cannot remove the Team Lead. Reassign leadership first.", 400);
+  }
+
+  await pool.query(
+    "DELETE FROM team_members WHERE team_id = $1 AND user_id = ANY($2)",
+    [id, memberIds]
+  );
+
+  const team = await getTeamWithMembers(id);
+  res.status(200).json({ success: true, message: "Members removed.", data: team });
+});
+
+/* ─── 8. SET ACTIVE STATUS ────────────────────────────────────────────────── */
+export const setTeamActiveStatus = asyncHandler(async (req: Request, res: Response) => {
+  const id = req.params.id as string;
+  const { isActive } = req.body;
+
+  if (typeof isActive !== "boolean") throw new AppError("isActive must be a boolean.", 400);
+
+  await pool.query(
+    "UPDATE teams SET is_active = $1, updated_at = NOW() WHERE id = $2",
+    [isActive, id]
+  );
+
+  const team = await getTeamWithMembers(id);
+  if (!team) throw new AppError("Team not found.", 404);
+
+  res.status(200).json({
+    success: true,
+    message: `Team ${isActive ? "activated" : "deactivated"}`,
+    data: team,
+  });
+});
+
+/* ─── MAIL TEMPLATE ───────────────────────────────────────────────────────── */
+
 function teamAddedTemplate(
   memberName: string,
   teamName: string,
   leadName: string,
-  allMembers: { name: string; email: string }[],
-): string {
-  // Build a row for every member; highlight the recipient with a subtle badge
+  allMembers: any[]
+) {
   const memberRows = allMembers
     .map(
       (m) => `
-        <tr>
-          <td style="padding: 10px 12px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #111827;">
-            ${m.name}
-            ${m.name === memberName ? '<span style="margin-left:8px;background:#dbeafe;color:#1d4ed8;font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:0.05em;">You</span>' : ""}
-            ${m.name === leadName ? '<span style="margin-left:6px;background:#fef9c3;color:#92400e;font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase;letter-spacing:0.05em;">Lead</span>' : ""}
-          </td>
-          <td style="padding: 10px 12px; border-bottom: 1px solid #f3f4f6; font-size: 13px; color: #6b7280;">${m.email}</td>
-        </tr>`,
+      <tr>
+        <td style="padding:10px;border-bottom:1px solid #eee;">${m.name}${m.name === memberName ? " (You)" : ""}</td>
+        <td style="padding:10px;border-bottom:1px solid #eee;color:#666;">${m.email}</td>
+      </tr>`
     )
     .join("");
 
   return `
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff;">
-      <div style="background: #2563EB; padding: 24px 32px;">
-        <h1 style="color: #ffffff; margin: 0; font-size: 20px;">Performance Management System</h1>
-      </div>
-      <div style="padding: 32px; border: 1px solid #e5e7eb; border-top: none;">
-        <h2 style="color: #111827; margin-top: 0;">You've been added to a team 🎉</h2>
-        <p style="color: #374151;">Hello <strong>${memberName}</strong>,</p>
-        <p style="color: #374151;">
-          You have been added to the team <strong>"${teamName}"</strong>.
-          Your team lead is <strong>${leadName}</strong>.
-        </p>
-        <p style="color: #374151;">
-          Indicators assigned to this team will appear in your dashboard. You will be
-          notified whenever a task is assigned, reviewed, or approved.
-        </p>
-
-        <h3 style="color: #111827; font-size: 14px; margin: 28px 0 12px;">Your Team Members</h3>
-        <table style="width: 100%; border-collapse: collapse; font-family: Arial, sans-serif;">
-          <thead>
-            <tr style="background: #f9fafb;">
-              <th style="padding: 10px 12px; text-align: left; font-size: 11px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #e5e7eb;">Name</th>
-              <th style="padding: 10px 12px; text-align: left; font-size: 11px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #e5e7eb;">Email</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${memberRows}
-          </tbody>
-        </table>
-      </div>
-      <div style="padding: 16px 32px; background: #f9fafb; border: 1px solid #e5e7eb; border-top: none; text-align: center;">
-        <small style="color: #6b7280;">This is an automated message. Please do not reply.</small>
-      </div>
-    </div>
-  `;
+    <div style="font-family:sans-serif;border:1px solid #e5e7eb;padding:20px;">
+      <h2 style="color:#2563eb;">Judiciary Performance Portal</h2>
+      <p>Hello <strong>${memberName}</strong>, you have been added to <strong>${teamName}</strong>.</p>
+      <p><strong>Team Lead:</strong> ${leadName}</p>
+      <table style="width:100%;border-collapse:collapse;">
+        <tr style="background:#f9fafb;"><th>Name</th><th>Email</th></tr>
+        ${memberRows}
+      </table>
+    </div>`;
 }

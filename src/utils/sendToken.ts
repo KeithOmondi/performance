@@ -1,16 +1,16 @@
 import { Response } from "express";
 import jwt, { SignOptions } from "jsonwebtoken";
 import { env } from "../config/env";
-import ms from "ms";
-import { IUser } from "../modules/user/user.model";
+import ms, { StringValue } from "ms";
+import { IUser, UserRole } from "../types/user.types"; 
 
 export interface IUserPayload {
   id: string;
-  role: "user" | "admin" | "superadmin" | "examiner";
+  role: UserRole;
 }
 
 const parseExpires = (value: string): SignOptions["expiresIn"] => {
-  return value as unknown as SignOptions["expiresIn"];
+  return value as SignOptions["expiresIn"];
 };
 
 export const generateAccessToken = (payload: IUserPayload) => {
@@ -25,7 +25,7 @@ export const generateRefreshToken = (payload: IUserPayload) => {
 
 export const sendToken = (res: Response, user: IUser, statusCode: number = 200) => {
   const payload: IUserPayload = {
-    id: user._id.toString(),
+    id: user.id, // Using 'id' from Postgres object
     role: user.role,
   };
 
@@ -37,22 +37,22 @@ export const sendToken = (res: Response, user: IUser, statusCode: number = 200) 
   res.cookie("accessToken", accessToken, {
     httpOnly: true,
     secure: isProduction,
-    sameSite: isProduction ? "none" : "lax",
-    maxAge: ms("15m"),
+    sameSite: (isProduction ? "none" : "lax") as "none" | "lax",
+    maxAge: ms(env.JWT_ACCESS_EXPIRES as StringValue), 
   });
 
   res.cookie("refreshToken", refreshToken, {
     httpOnly: true,
     secure: isProduction,
-    sameSite: isProduction ? "none" : "lax",
-    maxAge: ms("7d"),
+    sameSite: (isProduction ? "none" : "lax") as "none" | "lax",
+    maxAge: ms(env.JWT_REFRESH_EXPIRES as StringValue),
   });
 
   return res.status(statusCode).json({
     success: true,
     message: "Authentication successful",
     user: {
-      id: user._id.toString(),
+      id: user.id,
       name: user.name,
       email: user.email,
       role: user.role,

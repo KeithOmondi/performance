@@ -5,6 +5,7 @@ import { sendToken } from "../../utils/sendToken";
 import { AppError } from "../../utils/AppError";
 import jwt from "jsonwebtoken";
 import { env } from "../../config/env";
+import { UserRole } from "../../types/user.types";
 
 export const AuthController = {
   // ─── Register (SuperAdmin only) ──────────────────────────────────────────
@@ -15,13 +16,20 @@ export const AuthController = {
       throw new AppError("Name, Email, PJ Number, and Title are required.", 400);
     }
 
-    const user = await AuthService.register({ name, email, pjNumber, title, role });
+    // Role is cast to UserRole to satisfy TypeScript (matches our PG Enum)
+    const user = await AuthService.register({ 
+      name, 
+      email, 
+      pjNumber, 
+      title, 
+      role: role as UserRole 
+    });
 
     return res.status(201).json({
       success: true,
       message: "User registered successfully.",
       user: {
-        id: user._id.toString(),
+        id: user.id, // Changed from user._id.toString()
         name: user.name,
         email: user.email,
         role: user.role,
@@ -35,7 +43,7 @@ export const AuthController = {
     const { pjNumber } = req.body;
     if (!pjNumber) throw new AppError("PJ Number is required.", 400);
 
-    // maskEmail is handled inside AuthService — returns k***@gmail.com
+    // AuthService now queries Neon/Postgres using the pool
     const maskedEmail = await AuthService.requestLoginOTP(pjNumber);
 
     res.status(200).json({
@@ -53,6 +61,8 @@ export const AuthController = {
     }
 
     const user = await AuthService.verifyOTP(pjNumber, otp);
+    
+    // sendToken handles cookie setting and JWT generation
     return sendToken(res, user, 200);
   }),
 
@@ -75,7 +85,10 @@ export const AuthController = {
       throw new AppError("Invalid refresh token. Please log in again.", 401);
     }
 
+    // Ensure AuthService.getUserById uses pool.query('SELECT * FROM users WHERE id = $1')
     const user = await AuthService.getUserById(decoded.id);
+    if (!user) throw new AppError("User not found.", 404);
+
     return sendToken(res, user, 200);
   }),
 
@@ -86,6 +99,7 @@ export const AuthController = {
     const cookieOptions = {
       httpOnly: true,
       secure: isProduction,
+      // For Kenya Judiciary deployment, 'lax' is safer if not using subdomains
       sameSite: (isProduction ? "none" : "lax") as "none" | "lax",
       expires: new Date(0),
     };

@@ -1,12 +1,11 @@
 // src/server.ts
 import app from "./app";
 import { env } from "./config/env";
-import { connectDB } from "./config/db";
-import mongoose from "mongoose";
+import { connectDB, pool } from "./config/db"; // Import the pool here
 
 const startServer = async () => {
   try {
-    // Connect Database
+    // 1. Connect Database (Verifies connection to Neon)
     await connectDB();
 
     const server = app.listen(env.PORT, () => {
@@ -14,11 +13,14 @@ const startServer = async () => {
       console.log(`🌍 Environment: ${env.NODE_ENV}`);
     });
 
-    // Graceful shutdown (SIGTERM - production)
+    // 2. Graceful shutdown (SIGTERM - production/Docker)
     process.on("SIGTERM", async () => {
       console.log("🛑 SIGTERM received. Shutting down gracefully...");
+      
       server.close(async () => {
-        await mongoose.connection.close();
+        // Close the PostgreSQL pool
+        await pool.end(); 
+        console.log("🐘 PostgreSQL pool has ended.");
         process.exit(0);
       });
     });
@@ -29,10 +31,11 @@ const startServer = async () => {
   }
 };
 
-// Ctrl+C shutdown (development)
+// 3. Ctrl+C shutdown (development)
 process.on("SIGINT", async () => {
-  console.log("🛑 SIGINT received. Closing DB connection...");
-  await mongoose.connection.close();
+  console.log("\n🛑 SIGINT received. Closing DB pool...");
+  await pool.end();
+  console.log("🐘 PostgreSQL pool has ended.");
   process.exit(0);
 });
 

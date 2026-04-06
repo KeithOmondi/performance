@@ -1,253 +1,112 @@
 import { Request, Response } from "express";
+import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
-import { Indicator } from "../user/Indicator.model";
-import { User } from "../user/user.model";
 
 // ─── 1. Performance Summary (by Perspective) ──────────────────────────────────
-export const getPerformanceSummary = asyncHandler(
-  async (_req: Request, res: Response) => {
-    const summary = await Indicator.aggregate([
-      {
-        $lookup: {
-          from: "strategicplans",
-          localField: "strategicPlanId",
-          foreignField: "_id",
-          as: "plan",
-        },
-      },
-      // Fixed: was unwinding "userDetails" which doesn't exist at this stage
-      { $unwind: { path: "$plan", preserveNullAndEmptyArrays: true } },
-      {
-        $group: {
-          _id: { $ifNull: ["$plan.perspective", "Uncategorised"] },
-          totalWeight: { $sum: "$weight" },
-          totalTarget: { $sum: "$target" },
-          totalAchieved: { $sum: "$currentTotalAchieved" },
-          count: { $sum: 1 },
-        },
-      },
-      {
-        $project: {
-          _id: 0,
-          name: "$_id",
-          weight: "$totalWeight",
-          target: "$totalTarget",
-          achieved: "$totalAchieved",
-          count: 1,
-          score: {
-            $cond: [
-              { $gt: ["$totalTarget", 0] },
-              {
-                $round: [
-                  {
-                    $multiply: [
-                      { $divide: ["$totalAchieved", "$totalTarget"] },
-                      "$totalWeight",
-                    ],
-                  },
-                  2,
-                ],
-              },
-              0,
-            ],
-          },
-          status: {
-            $cond: {
-              if: { $gte: ["$totalAchieved", "$totalTarget"] },
-              then: "ON TRACK",
-              else: "IN PROGRESS",
-            },
-          },
-        },
-      },
-      { $sort: { weight: -1 } },
-    ]);
+export const getPerformanceSummary = asyncHandler(async (_req: Request, res: Response) => {
+  const query = `
+    SELECT 
+      COALESCE(sp.perspective, 'Uncategorised') as name,
+      SUM(i.weight) as weight,
+      SUM(i.target) as target,
+      SUM(i.current_total_achieved) as achieved,
+      COUNT(i.id) as count,
+      ROUND(
+        CASE 
+          WHEN SUM(i.target) > 0 THEN (SUM(i.current_total_achieved)::FLOAT / SUM(i.target)::FLOAT) * SUM(i.weight)
+          ELSE 0 
+        END::NUMERIC, 2
+      ) as score,
+      CASE 
+        WHEN SUM(i.current_total_achieved) >= SUM(i.target) THEN 'ON TRACK'
+        ELSE 'IN PROGRESS'
+      END as status
+    FROM indicators i
+    LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
+    GROUP BY sp.perspective
+    ORDER BY weight DESC
+  `;
 
-    res.status(200).json({ success: true, data: summary });
-  }
-);
+  const { rows } = await pool.query(query);
+  res.status(200).json({ success: true, data: rows });
+});
 
 // ─── 2. Review Log ────────────────────────────────────────────────────────────
-export const getReviewLog = asyncHandler(
-  async (req: Request, res: Response) => {
-    const { status } = req.query;
+export const getReviewLog = asyncHandler(async (req: Request, res: Response) => {
+  const { status } = req.query;
+  const validStatuses = ["Pending", "Verified", "Accepted", "Rejected"];
+  
+  let filterClause = "";
+  const params: any[] = [];
 
-    const validStatuses = ["Pending", "Verified", "Accepted", "Rejected"];
-    const statusFilter =
-      status && status !== "ALL" && validStatuses.includes(status as string)
-        ? { "submissions.reviewStatus": status }
-        : {};
-
-    const [logs, stats] = await Promise.all([
-      Indicator.aggregate([
-        { $unwind: "$submissions" },
-        { $match: statusFilter },
-        {
-          $lookup: {
-            from: "users",
-            localField: "assignee",
-            foreignField: "_id",
-            as: "userDetails",
-          },
-        },
-        { $unwind: { path: "$userDetails", preserveNullAndEmptyArrays: true } },
-        {
-          $project: {
-            _id: "$submissions._id",
-            indicatorTitle: {
-              $ifNull: ["$instructions", "Performance Indicator"],
-            },
-            quarter: "$submissions.quarter",
-            achievedValue: "$submissions.achievedValue",
-            reviewStatus: "$submissions.reviewStatus",
-            submittedAt: "$submissions.submittedAt",
-            notes: "$submissions.notes",
-            adminComment: "$submissions.adminComment",
-            resubmissionCount: "$submissions.resubmissionCount",
-            assigneeName: { $ifNull: ["$userDetails.name", "Unknown"] },
-            assigneeEmail: "$userDetails.email",
-            assigneePjNumber: "$userDetails.pjNumber",
-          },
-        },
-        { $sort: { submittedAt: -1 } },
-      ]),
-
-      Indicator.aggregate([
-        { $unwind: "$submissions" },
-        {
-          $group: {
-            _id: null,
-            accepted: {
-              $sum: {
-                $cond: [
-                  { $eq: ["$submissions.reviewStatus", "Accepted"] },
-                  1,
-                  0,
-                ],
-              },
-            },
-            rejected: {
-              $sum: {
-                $cond: [
-                  { $eq: ["$submissions.reviewStatus", "Rejected"] },
-                  1,
-                  0,
-                ],
-              },
-            },
-            pending: {
-              $sum: {
-                $cond: [
-                  { $eq: ["$submissions.reviewStatus", "Pending"] },
-                  1,
-                  0,
-                ],
-              },
-            },
-            verified: {
-              $sum: {
-                $cond: [
-                  { $eq: ["$submissions.reviewStatus", "Verified"] },
-                  1,
-                  0,
-                ],
-              },
-            },
-            total: { $sum: 1 },
-          },
-        },
-        { $project: { _id: 0 } },
-      ]),
-    ]);
-
-    res.status(200).json({
-      success: true,
-      data: logs,
-      stats: stats[0] || {
-        accepted: 0,
-        rejected: 0,
-        pending: 0,
-        verified: 0,
-        total: 0,
-      },
-    });
+  if (status && status !== "ALL" && validStatuses.includes(status as string)) {
+    params.push(status);
+    filterClause = `WHERE s.review_status = $1`;
   }
-);
+
+  const logsQuery = `
+    SELECT 
+      s.id as _id,
+      COALESCE(i.instructions, 'Performance Indicator') as "indicatorTitle",
+      s.quarter,
+      s.achieved_value as "achievedValue",
+      s.review_status as "reviewStatus",
+      s.submitted_at as "submittedAt",
+      s.notes,
+      s.admin_comment as "adminComment",
+      s.resubmission_count as "resubmissionCount",
+      u.name as "assigneeName",
+      u.email as "assigneeEmail",
+      u.pj_number as "assigneePjNumber"
+    FROM submissions s
+    JOIN indicators i ON s.indicator_id = i.id
+    LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+    ${filterClause}
+    ORDER BY s.submitted_at DESC
+  `;
+
+  const statsQuery = `
+    SELECT 
+      COUNT(*) as total,
+      COUNT(*) FILTER (WHERE review_status = 'Accepted') as accepted,
+      COUNT(*) FILTER (WHERE review_status = 'Rejected') as rejected,
+      COUNT(*) FILTER (WHERE review_status = 'Pending') as pending,
+      COUNT(*) FILTER (WHERE review_status = 'Verified') as verified
+    FROM submissions
+  `;
+
+  const [logsRes, statsRes] = await Promise.all([
+    pool.query(logsQuery, params),
+    pool.query(statsQuery)
+  ]);
+
+  res.status(200).json({
+    success: true,
+    data: logsRes.rows,
+    stats: statsRes.rows[0] || { accepted: 0, rejected: 0, pending: 0, verified: 0, total: 0 }
+  });
+});
 
 // ─── 3. Individual Performance ────────────────────────────────────────────────
-export const getIndividualPerformance = asyncHandler(
-  async (_req: Request, res: Response) => {
-    const performance = await User.aggregate([
-      {
-        $match: {
-          role: { $in: ["user", "examiner"] },
-          isActive: true,
-        },
-      },
-      {
-        $lookup: {
-          from: "indicators",
-          localField: "_id",
-          foreignField: "assignee",
-          as: "indicators",
-        },
-      },
-      {
-        $project: {
-          name: 1,
-          pjNumber: 1,
-          role: 1,
-          title: 1,
-          totalAssigned: { $size: "$indicators" },
-          completed: {
-            $size: {
-              $filter: {
-                input: "$indicators",
-                as: "ind",
-                cond: { $eq: ["$$ind.status", "Completed"] },
-              },
-            },
-          },
-          awaitingReview: {
-            $size: {
-              $filter: {
-                input: "$indicators",
-                as: "ind",
-                cond: {
-                  $in: [
-                    "$$ind.status",
-                    ["Awaiting Admin Approval", "Awaiting Super Admin"],
-                  ],
-                },
-              },
-            },
-          },
-          rejected: {
-            $size: {
-              $filter: {
-                input: "$indicators",
-                as: "ind",
-                cond: {
-                  $in: [
-                    "$$ind.status",
-                    ["Rejected by Admin", "Rejected by Super Admin"],
-                  ],
-                },
-              },
-            },
-          },
-          avgProgress: {
-            $cond: [
-              { $gt: [{ $size: "$indicators" }, 0] },
-              { $round: [{ $avg: "$indicators.progress" }, 1] },
-              0,
-            ],
-          },
-        },
-      },
-      { $sort: { avgProgress: -1 } },
-    ]);
+export const getIndividualPerformance = asyncHandler(async (_req: Request, res: Response) => {
+  const query = `
+    SELECT 
+      u.name,
+      u.pj_number as "pjNumber",
+      u.role,
+      u.title,
+      COUNT(i.id) as "totalAssigned",
+      COUNT(i.id) FILTER (WHERE i.status = 'Completed') as completed,
+      COUNT(i.id) FILTER (WHERE i.status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')) as "awaitingReview",
+      COUNT(i.id) FILTER (WHERE i.status IN ('Rejected by Admin', 'Rejected by Super Admin')) as rejected,
+      ROUND(COALESCE(AVG(i.progress), 0)::NUMERIC, 1) as "avgProgress"
+    FROM users u
+    LEFT JOIN indicators i ON u.id = i.assignee_id AND i.assignee_model = 'User'
+    WHERE u.role IN ('user', 'examiner') AND u.is_active = true
+    GROUP BY u.id
+    ORDER BY "avgProgress" DESC
+  `;
 
-    res.status(200).json({ success: true, data: performance });
-  }
-);
+  const { rows } = await pool.query(query);
+  res.status(200).json({ success: true, data: rows });
+});
