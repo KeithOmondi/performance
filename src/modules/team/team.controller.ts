@@ -104,9 +104,48 @@ export const createTeam = asyncHandler(async (req: Request, res: Response) => {
 });
 
 /* ─── 2. GET ALL TEAMS ────────────────────────────────────────────────────── */
+/* ─── 2. GET ALL TEAMS (with members) ────────────────────────────────────── */
 export const getAllTeams = asyncHandler(async (_req: Request, res: Response) => {
-  const { rows } = await pool.query(`${TEAM_SELECT} ORDER BY t.created_at DESC`);
-  res.status(200).json({ success: true, data: rows });
+  // Step 1: fetch all team rows
+  const { rows: teams } = await pool.query(
+    `${TEAM_SELECT} ORDER BY t.created_at DESC`
+  );
+
+  if (teams.length === 0) {
+    return res.status(200).json({ success: true, data: [] });
+  }
+
+  // Step 2: fetch ALL members for ALL teams in ONE query (no N+1)
+  const teamIds = teams.map((t) => t.id);
+  const { rows: members } = await pool.query(
+    `SELECT
+       tm.team_id   AS "teamId",
+       u.id,
+       u.name,
+       u.email,
+       u.title,
+       u.pj_number  AS "pjNumber",
+       u.role
+     FROM team_members tm
+     JOIN users u ON u.id = tm.user_id
+     WHERE tm.team_id = ANY($1)`,
+    [teamIds]
+  );
+
+  // Step 3: group members by teamId and attach
+  const membersByTeamId = members.reduce<Record<string, any[]>>((acc, m) => {
+    const { teamId, ...member } = m;
+    if (!acc[teamId]) acc[teamId] = [];
+    acc[teamId].push(member);
+    return acc;
+  }, {});
+
+  const data = teams.map((team) => ({
+    ...team,
+    members: membersByTeamId[team.id] ?? [],
+  }));
+
+  res.status(200).json({ success: true, data });
 });
 
 /* ─── 3. GET SINGLE TEAM (with members) ──────────────────────────────────── */

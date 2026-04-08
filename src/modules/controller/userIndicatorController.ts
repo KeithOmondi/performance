@@ -42,28 +42,31 @@ const USER_INDICATOR_BASE_QUERY = `
 export const UserIndicatorController = {
   // 1. Get My Assignments (Direct + Team)
   getMyIndicators: asyncHandler(async (req: Request, res: Response) => {
-    const userId = (req as any).user.id;
+  const userId = (req as any).user.id;
 
-    // Resolve user's team
-    const userRes = await pool.query("SELECT team_id FROM users WHERE id = $1", [userId]);
-    const teamId = userRes.rows[0]?.team_id;
+  // ✅ Look up ALL teams this user belongs to via the join table
+  const teamRes = await pool.query(
+    "SELECT team_id FROM team_members WHERE user_id = $1",
+    [userId]
+  );
+  const teamIds = teamRes.rows.map((r) => r.team_id);
 
-    const query = `
-      ${USER_INDICATOR_BASE_QUERY}
-      WHERE (i.assignee_id = $1 AND i.assignee_model = 'User')
-      ${teamId ? `OR (i.assignee_id = $2 AND i.assignee_model = 'Team')` : ""}
-      ORDER BY i.updated_at DESC
-    `;
+  const query = `
+    ${USER_INDICATOR_BASE_QUERY}
+    WHERE (i.assignee_id = $1 AND i.assignee_model = 'User')
+    ${teamIds.length > 0 ? `OR (i.assignee_id = ANY($2) AND i.assignee_model = 'Team')` : ""}
+    ORDER BY i.updated_at DESC
+  `;
 
-    const params = teamId ? [userId, teamId] : [userId];
-    const { rows } = await pool.query(query, params);
+  const params = teamIds.length > 0 ? [userId, teamIds] : [userId];
+  const { rows } = await pool.query(query, params);
 
-    res.status(200).json({
-      success: true,
-      results: rows.length,
-      data: rows,
-    });
-  }),
+  res.status(200).json({
+    success: true,
+    results: rows.length,
+    data: rows,
+  });
+}),
 
   // 2. Submit / Resubmit Progress
   submitProgress: asyncHandler(async (req: Request, res: Response) => {
@@ -201,36 +204,35 @@ export const UserIndicatorController = {
 
   // 1. Get Single Indicator Details (with User/Team Security)
   getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
-    const { id } = req.params;
-    const userId = (req as any).user.id;
+  const { id } = req.params;
+  const userId = (req as any).user.id;
 
-    // Resolve user's team
-    const userRes = await pool.query("SELECT team_id FROM users WHERE id = $1", [userId]);
-    const teamId = userRes.rows[0]?.team_id;
+  // ✅ Same fix — use team_members join table
+  const teamRes = await pool.query(
+    "SELECT team_id FROM team_members WHERE user_id = $1",
+    [userId]
+  );
+  const teamIds = teamRes.rows.map((r) => r.team_id);
 
-    // We use the same base query but restrict by ID and Ownership
-    const query = `
-      ${USER_INDICATOR_BASE_QUERY}
-      WHERE i.id = $1 
-      AND (
-        (i.assignee_id = $2 AND i.assignee_model = 'User')
-        ${teamId ? `OR (i.assignee_id = $3 AND i.assignee_model = 'Team')` : ""}
-      )
-      LIMIT 1
-    `;
+  const query = `
+    ${USER_INDICATOR_BASE_QUERY}
+    WHERE i.id = $1
+    AND (
+      (i.assignee_id = $2 AND i.assignee_model = 'User')
+      ${teamIds.length > 0 ? `OR (i.assignee_id = ANY($3) AND i.assignee_model = 'Team')` : ""}
+    )
+    LIMIT 1
+  `;
 
-    const params = teamId ? [id, userId, teamId] : [id, userId];
-    const { rows } = await pool.query(query, params);
+  const params = teamIds.length > 0 ? [id, userId, teamIds] : [id, userId];
+  const { rows } = await pool.query(query, params);
 
-    if (rows.length === 0) {
-      throw new AppError("Indicator not found or you do not have access.", 404);
-    }
+  if (rows.length === 0) {
+    throw new AppError("Indicator not found or you do not have access.", 404);
+  }
 
-    res.status(200).json({
-      success: true,
-      data: rows[0],
-    });
-  }),
+  res.status(200).json({ success: true, data: rows[0] });
+}),
 
   // 2. Add Documents to an existing submission
   addDocuments: asyncHandler(async (req: Request, res: Response) => {

@@ -25,7 +25,7 @@ requiredEnvVars.forEach((key) => {
 });
 
 export const env = {
-  PORT: Number(process.env.PORT) || 5000,
+  PORT: Number(process.env.PORT) || 8000,
   NODE_ENV: process.env.NODE_ENV || "production",
   DATABASE_URL: process.env.DATABASE_URL as string,
   DB_NAME: process.env.DB_NAME as string,
