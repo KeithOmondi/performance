@@ -1,11 +1,11 @@
 import { Router } from "express";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 import { UserIndicatorController } from "./userIndicatorController";
-import { upload } from "../../middleware/upload";
+import { upload, requireFiles } from "../../middleware/upload"; // Import requireFiles for better validation
 
 const router = Router();
 
-// Get all assigned indicators
+// 1. Get all assigned indicators
 router.get(
   "/my-assignments",
   protect,
@@ -13,7 +13,7 @@ router.get(
   UserIndicatorController.getMyIndicators,
 );
 
-// ✅ Stream file proxy — must be before /:id to avoid route conflict
+// 2. Stream file proxy
 router.get(
   "/stream-file",
   protect,
@@ -21,7 +21,7 @@ router.get(
   UserIndicatorController.streamFile,
 );
 
-// Get single indicator details
+// 3. Get single indicator details
 router.get(
   "/:id",
   protect,
@@ -29,21 +29,24 @@ router.get(
   UserIndicatorController.getIndicatorDetails,
 );
 
-// Submit or resubmit progress with file evidence
+// 4. Submit or resubmit progress
+// CHANGED: "evidence" -> "documents" | limit: 5 -> 50
 router.post(
   "/:id/submit",
   protect,
   restrictTo("user"),
-  upload.array("evidence", 5),
+  upload.array("documents", 50), 
   UserIndicatorController.submitProgress,
 );
 
-// Add documents to an existing submission
+// 5. Add documents to an existing submission
+// CHANGED: "evidence" -> "documents" | limit: 5 -> 50
 router.post(
   "/:id/add-documents",
   protect,
   restrictTo("user"),
-  upload.array("evidence", 5),
+  upload.array("documents", 50),
+  requireFiles, // Added this to ensure user actually sent something
   UserIndicatorController.addDocuments,
 );
 
