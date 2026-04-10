@@ -28,8 +28,8 @@ export class IndicatorService {
       );
       const { target, reporting_cycle, active_quarter } = metaRes.rows[0];
 
-      const progress = target > 0 
-        ? Math.min(Math.round((totalAchieved / target) * 100), 100) 
+      const progress = target > 0
+        ? Math.min(Math.round((totalAchieved / target) * 100), 100)
         : 0;
 
       // 2. STATE MACHINE (Based on latest review history)
@@ -68,8 +68,15 @@ export class IndicatorService {
             break;
           case "Correction Requested":
           case "Rejected":
-            nextStatus = latestReview.reviewer_role === "superadmin" ? "Rejected by Super Admin" : "Rejected by Admin";
+            nextStatus =
+              latestReview.reviewer_role === "superadmin"
+                ? "Rejected by Super Admin"
+                : "Rejected by Admin";
             break;
+          // ── Reopen feeds back into the state machine naturally.
+          //    The review_history row written by reopenIndicator carries
+          //    action = "Reopened", which lands here and sets Pending,
+          //    so no extra case is needed — the default handles it.
         }
       }
 
@@ -84,7 +91,14 @@ export class IndicatorService {
             updated_at = NOW()
         WHERE id = $6
       `;
-      await client.query(updateQuery, [totalAchieved, progress, nextStatus, nextQuarter, nextDeadlineUpdate, indicatorId]);
+      await client.query(updateQuery, [
+        totalAchieved,
+        progress,
+        nextStatus,
+        nextQuarter,
+        nextDeadlineUpdate,
+        indicatorId,
+      ]);
 
       await client.query("COMMIT");
       console.log(`✅ Indicator ${indicatorId} synced: ${progress}% - ${nextStatus}`);
@@ -97,20 +111,126 @@ export class IndicatorService {
   }
 
   /**
+   * Reopens a locked indicator (Completed / Deadline Passed / any Rejected state).
+   *
+   * Strategy:
+   *  1. Validate the indicator exists and is in a reopenable state.
+   *  2. Write a "Reopened" entry into review_history so the audit trail
+   *     is never broken.
+   *  3. Directly set status = 'Pending' and extend the deadline —
+   *     we bypass syncIndicatorState here because the latest history
+   *     row is now "Reopened" which the switch doesn't handle, so the
+   *     machine would fall through to "Pending" anyway. Doing it
+   *     explicitly is clearer and safer.
+   *
+   * @param indicatorId   - The indicator to reopen
+   * @param adminId       - The admin performing the action (for audit log)
+   * @param newDeadline   - New deadline to set (required — old one has passed)
+   * @param reason        - Optional note stored in review_history
+   */
+  static async reopenIndicator(
+    indicatorId: string,
+    adminId: string,
+    newDeadline: Date,
+    reason?: string,
+  ): Promise<IIndicator> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // 1. Fetch current indicator — must exist and be in a locked state
+      const indicatorRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",
+        [indicatorId],
+      );
+
+      if (indicatorRes.rows.length === 0) {
+        throw new Error("Indicator not found");
+      }
+
+      const indicator = indicatorRes.rows[0];
+
+      const reopenableStatuses = [
+        "Completed",
+        "Rejected by Admin",
+        "Rejected by Super Admin",
+        "Pending",   // covers deadline-passed indicators whose status never changed
+      ];
+
+      if (!reopenableStatuses.includes(indicator.status)) {
+        throw new Error(
+          `Indicator cannot be reopened from status "${indicator.status}"`,
+        );
+      }
+
+      // 2. Write audit trail entry BEFORE mutating the indicator
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reviewer_role, reviewed_by, reason, at)
+         VALUES ($1, 'Reopened', 'admin', $2, $3, NOW())`,
+        [indicatorId, adminId, reason ?? "Reopened by admin"],
+      );
+
+      // 3. Reset indicator — keep active_quarter and progress intact,
+      //    only unlock status and extend the deadline
+      await client.query(
+        `UPDATE indicators
+         SET status      = 'Pending',
+             deadline    = $1,
+             updated_at  = NOW()
+         WHERE id = $2`,
+        [newDeadline, indicatorId],
+      );
+
+      await client.query("COMMIT");
+
+      // 4. Return the full updated indicator so the controller can
+      //    send it straight back to the client
+      const updated = await IndicatorService.getFullIndicator(indicatorId);
+      if (!updated) throw new Error("Failed to retrieve updated indicator");
+
+      return updated;
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
    * Helper to fetch the "Full" Indicator (including nested submissions/history)
    */
   static async getFullIndicator(id: string): Promise<IIndicator | null> {
-    const indicatorRes = await pool.query("SELECT * FROM indicators WHERE id = $1", [id]);
+    const indicatorRes = await pool.query(
+      "SELECT * FROM indicators WHERE id = $1",
+      [id],
+    );
     if (indicatorRes.rows.length === 0) return null;
 
     const indicator = indicatorRes.rows[0];
 
-    // Fetch nested submissions
-    const subRes = await pool.query("SELECT * FROM submissions WHERE indicator_id = $1", [id]);
+    // Fetch nested submissions with their documents
+    const subRes = await pool.query(
+      `SELECT s.*, 
+              COALESCE(
+                json_agg(d.*) FILTER (WHERE d.id IS NOT NULL), 
+                '[]'
+              ) AS documents
+       FROM submissions s
+       LEFT JOIN documents d ON d.submission_id = s.id
+       WHERE s.indicator_id = $1
+       GROUP BY s.id
+       ORDER BY s.quarter ASC`,
+      [id],
+    );
     indicator.submissions = subRes.rows;
 
     // Fetch nested history
-    const histRes = await pool.query("SELECT * FROM review_history WHERE indicator_id = $1 ORDER BY at DESC", [id]);
+    const histRes = await pool.query(
+      "SELECT * FROM review_history WHERE indicator_id = $1 ORDER BY at DESC",
+      [id],
+    );
     indicator.reviewHistory = histRes.rows;
 
     return indicator;

@@ -159,13 +159,11 @@ export const createIndicator = asyncHandler(
       adminId,
     ]);
 
-    // Return the full camelCase shape using the shared fragment
     const { rows } = await pool.query(
       `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
       [inserted[0].id],
     );
 
-    // Non-blocking email notifications
     resolveRecipients(assignee, type).then(({ emails, displayName }) => {
       emails.forEach((email) =>
         sendMail({
@@ -216,11 +214,11 @@ export const getAllIndicators = asyncHandler(
   },
 );
 
+/* ─── 3. GET INDICATOR BY ID ──────────────────────────────────────────────── */
 export const getIndicatorById = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
 
-    // 1. Fetch the indicator using the shared camelCase fragment
     const { rows } = await pool.query(
       `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
       [id],
@@ -229,7 +227,6 @@ export const getIndicatorById = asyncHandler(
 
     const indicator = rows[0];
 
-    // 2. Fetch submissions with their documents aggregated
     const { rows: submissions } = await pool.query(
       `
       SELECT
@@ -245,7 +242,6 @@ export const getIndicatorById = asyncHandler(
         s.admin_comment         AS "adminComment",
         s.resubmission_count    AS "resubmissionCount",
 
-        -- ✅ Documents nested inside each submission
         COALESCE(
           json_agg(
             json_build_object(
@@ -270,7 +266,6 @@ export const getIndicatorById = asyncHandler(
       [id],
     );
 
-    // 3. Fetch review history
     const { rows: reviewHistory } = await pool.query(
       `
       SELECT
@@ -293,11 +288,7 @@ export const getIndicatorById = asyncHandler(
 
     res.status(200).json({
       success: true,
-      data: {
-        ...indicator,
-        submissions,
-        reviewHistory,
-      },
+      data: { ...indicator, submissions, reviewHistory },
     });
   },
 );
@@ -396,7 +387,6 @@ export const superAdminReviewProcess = asyncHandler(
 
       const subStatus = isApprove ? "Accepted" : "Rejected";
 
-      // Update the submission for the active quarter
       await client.query(
         `UPDATE submissions
        SET review_status = $1, is_reviewed = true, admin_comment = $2
@@ -404,7 +394,6 @@ export const superAdminReviewProcess = asyncHandler(
         [subStatus, reason || "", id, indicator.active_quarter],
       );
 
-      // Determine next indicator status
       let nextStatus: string;
       let nextQuarter = indicator.active_quarter;
       let newDeadline = indicator.deadline;
@@ -424,7 +413,6 @@ export const superAdminReviewProcess = asyncHandler(
         nextStatus = "Rejected by Super Admin";
       }
 
-      // Apply progress override if provided
       const achievedValue =
         progressOverride ?? indicator.current_total_achieved;
 
@@ -454,7 +442,6 @@ export const superAdminReviewProcess = asyncHandler(
 
       await client.query("COMMIT");
 
-      // Return the full updated indicator in camelCase shape
       const { rows } = await pool.query(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
         [id],
@@ -470,6 +457,90 @@ export const superAdminReviewProcess = asyncHandler(
   },
 );
 
+/* ─── 8. REOPEN INDICATOR ─────────────────────────────────────────────────── */
+export const reopenIndicator = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params as { id: string };
+    const { newDeadline, reason } = req.body;
+    const adminId = (req as any).user.id;
+
+    // newDeadline is required — there's no point reopening without extending it
+    if (!newDeadline) throw new AppError("A new deadline is required to reopen an indicator.", 400);
+
+    const parsedDeadline = new Date(newDeadline);
+    if (isNaN(parsedDeadline.getTime()))
+      throw new AppError("Invalid deadline date.", 400);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Lock the row to prevent concurrent reopens
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",
+        [id],
+      );
+      const indicator = indRes.rows[0];
+
+      if (!indicator) throw new AppError("Indicator not found.", 404);
+
+      // Guard: only these statuses can be reopened.
+      // "Pending" is included because deadline-passed indicators often
+      // stay as "Pending" in the DB — the lock is computed on the frontend
+      // from the date, not stored as a separate status value.
+      const reopenableStatuses = [
+        "Pending",
+        "Completed",
+        "Rejected by Admin",
+        "Rejected by Super Admin",
+      ];
+
+      if (!reopenableStatuses.includes(indicator.status)) {
+        throw new AppError(
+          `Indicator cannot be reopened from status "${indicator.status}". It may still be under active review.`,
+          400,
+        );
+      }
+
+      // Write audit trail BEFORE mutating — order matters for state machine
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by, at)
+         VALUES ($1, 'Reopened', $2, 'admin', $3, NOW())`,
+        [id, reason?.trim() || "Reopened by admin", adminId],
+      );
+
+      // Reset status to Pending and extend deadline.
+      // We deliberately do NOT reset active_quarter or progress —
+      // previously accepted quarters remain certified.
+      await client.query(
+        `UPDATE indicators
+         SET status     = 'Pending',
+             deadline   = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [parsedDeadline, id],
+      );
+
+      await client.query("COMMIT");
+
+      // Return full camelCase shape — same as every other endpoint
+      const { rows } = await pool.query(
+        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+        [id],
+      );
+
+      res.status(200).json({ success: true, data: rows[0] });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  },
+);
+
+/* ─── 9. GET ALL SUBMISSIONS ──────────────────────────────────────────────── */
 export const getAllSubmissions = asyncHandler(
   async (_req: Request, res: Response) => {
     const { rows } = await pool.query(`
@@ -493,7 +564,6 @@ export const getAllSubmissions = asyncHandler(
           ELSE t.name
         END                               AS "submittedBy",
 
-        -- ✅ Aggregate documents into a JSON array
         COALESCE(
           json_agg(
             json_build_object(
@@ -514,8 +584,6 @@ export const getAllSubmissions = asyncHandler(
       LEFT JOIN users u             ON i.assignee_id = u.id  AND i.assignee_model = 'User'
       LEFT JOIN teams t             ON i.assignee_id = t.id  AND i.assignee_model = 'Team'
       LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
-
-      -- ✅ Join documents here
       LEFT JOIN submission_documents sd ON sd.submission_id = s.id
 
       GROUP BY
@@ -530,7 +598,7 @@ export const getAllSubmissions = asyncHandler(
 
     const queue = rows.map((row) => ({
       ...row,
-      quarter:       `Q${row.quarter}`,
+      quarter: `Q${row.quarter}`,
       documentsCount: parseInt(row.documentsCount),
     }));
 
@@ -538,7 +606,7 @@ export const getAllSubmissions = asyncHandler(
   },
 );
 
-/* ─── 9. SUPER ADMIN DASHBOARD STATS ─────────────────────────────────────── */
+/* ─── 10. SUPER ADMIN DASHBOARD STATS ────────────────────────────────────── */
 export const getSuperAdminStats = asyncHandler(
   async (_req: Request, res: Response) => {
     const [totalRes, statusRes] = await Promise.all([
@@ -560,12 +628,11 @@ export const getSuperAdminStats = asyncHandler(
   },
 );
 
-/*====10. SUPER ADMIN UNASSIGN ACTIVITIES */
+/* ─── 11. UNASSIGN INDICATOR ──────────────────────────────────────────────── */
 export const unassignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
 
-    // 1. Update the indicator to nullify assignee fields
     const result = await pool.query(
       `UPDATE indicators 
        SET assignee_id = NULL, 
@@ -574,14 +641,14 @@ export const unassignIndicator = asyncHandler(
            updated_at = NOW()
        WHERE id = $1 
        RETURNING *`,
-      [id]
+      [id],
     );
 
     if (result.rowCount === 0) throw new AppError("Indicator not found.", 404);
 
-    res.status(200).json({ 
-      success: true, 
-      message: "Activity unassigned successfully." 
+    res.status(200).json({
+      success: true,
+      message: "Activity unassigned successfully.",
     });
-  }
+  },
 );
