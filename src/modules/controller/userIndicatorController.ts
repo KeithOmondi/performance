@@ -56,8 +56,7 @@ export const UserIndicatorController = {
     res.status(200).json({ success: true, results: rows.length, data: rows });
   }),
 
-  // 2. Submit / Resubmit Progress (Bulk Optimized)
-  submitProgress: asyncHandler(async (req: Request, res: Response) => {
+ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
     const { notes, achievedValue } = req.body;
     const userId = (req as any).user.id;
@@ -72,8 +71,7 @@ export const UserIndicatorController = {
       const indRes = await client.query("SELECT * FROM indicators WHERE id = $1", [id]);
       const indicator = indRes.rows[0];
       if (!indicator) throw new AppError("Indicator not found.", 404);
-      if (indicator.status === "Completed") throw new AppError("Filing period is closed.", 400);
-
+      
       const targetQuarter = indicator.reporting_cycle === "Annual" ? 1 : indicator.active_quarter;
 
       const subRes = await client.query(
@@ -82,20 +80,24 @@ export const UserIndicatorController = {
       );
       const existingSub = subRes.rows[0];
 
-      if (existingSub && !["Rejected", "Pending"].includes(existingSub.review_status)) {
-        throw new AppError(`Q${targetQuarter} submission is already under review.`, 400);
-      }
-
-      // 1. Upload 50 files using the p-limit utility
+      // 1. Upload files and ensure secure_url exists
       let newDocs: any[] = [];
       if (files?.length) {
         const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
-        newDocs = uploads.map((upload, i) => ({
-          url: upload.secure_url,
-          public_id: upload.public_id,
-          file_type: upload.resource_type === "video" ? "video" : files[i].mimetype === "application/pdf" ? "raw" : "image",
-          file_name: files[i].originalname
-        }));
+        
+        newDocs = uploads.map((upload, i) => {
+          // Safeguard: Check for the URL before proceeding
+          if (!upload.secure_url) {
+            throw new AppError(`Failed to get URL for file: ${files[i].originalname}`, 500);
+          }
+
+          return {
+            url: upload.secure_url,
+            public_id: upload.public_id,
+            file_type: upload.resource_type === "video" ? "video" : files[i].mimetype === "application/pdf" ? "raw" : "image",
+            file_name: files[i].originalname
+          };
+        });
       }
 
       // 2. Insert/Update Submission
@@ -104,20 +106,20 @@ export const UserIndicatorController = {
         submissionId = existingSub.id;
         await client.query(
           `UPDATE submissions SET notes = $1, achieved_value = $2, review_status = 'Pending', 
-           is_reviewed = false, submitted_at = NOW(), resubmission_count = resubmission_count + 1
-           WHERE id = $3`,
+            is_reviewed = false, submitted_at = NOW(), resubmission_count = resubmission_count + 1
+            WHERE id = $3`,
           [notes.trim(), achievedValue, submissionId]
         );
       } else {
         const newSub = await client.query(
           `INSERT INTO submissions (indicator_id, quarter, year, notes, achieved_value, review_status)
-           VALUES ($1, $2, $3, $4, $5, 'Pending') RETURNING id`,
+            VALUES ($1, $2, $3, $4, $5, 'Pending') RETURNING id`,
           [id, targetQuarter, new Date().getFullYear(), notes.trim(), achievedValue]
         );
         submissionId = newSub.rows[0].id;
       }
 
-      // 3. Optimized Bulk Document Insert
+      // 3. Bulk Document Insert
       if (newDocs.length > 0) {
         const docInsertPromises = newDocs.map(doc => 
           client.query(
@@ -136,6 +138,7 @@ export const UserIndicatorController = {
       );
 
       await client.query("UPDATE indicators SET status = 'Awaiting Admin Approval', updated_at = NOW() WHERE id = $1", [id]);
+      
       await client.query("COMMIT");
 
       UserIndicatorController._sendAlerts((req as any).user, indicator, targetQuarter);
