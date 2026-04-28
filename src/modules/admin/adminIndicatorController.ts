@@ -137,7 +137,8 @@ export const getIndicatorByIdAdmin = asyncHandler(async (req: Request, res: Resp
 export const adminReviewProcess = asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const { decision, adminOverallComments, submissionUpdates } = req.body;
-  const adminId = (req as any).user.id;
+  const adminId   = (req as any).user.id;
+  const adminName = (req as any).user.name;
 
   if (!["Verified", "Rejected"].includes(decision)) {
     throw new AppError('Decision must be "Verified" or "Rejected".', 400);
@@ -200,9 +201,10 @@ export const adminReviewProcess = asyncHandler(async (req: Request, res: Respons
 
     await client.query("COMMIT");
 
-    const taskTitle  = indicator.instructions || "Performance Indicator";
-    const year       = new Date().getFullYear();
-    const cycleInfo  = indicator.reportingCycle === "Annual" ? "Annual" : `Q${indicator.activeQuarter}`;
+    const taskTitle       = indicator.instructions || "Performance Indicator";
+    const year            = new Date().getFullYear();
+    const reportingCycle  = indicator.reportingCycle as string;
+    const activeQuarter   = indicator.activeQuarter  as string | number;
 
     if (isVerified) {
       const saRes = await pool.query(
@@ -210,28 +212,39 @@ export const adminReviewProcess = asyncHandler(async (req: Request, res: Respons
       );
       saRes.rows.forEach((sa) => {
         sendMail({
-          to: sa.email,
-          subject: `[${cycleInfo}] Submission Ready for Final Approval`,
+          to:      sa.email,
+          subject: `Submission Ready for Final Approval`,
+          // FIX: was passing pre-formatted cycleInfo string for both
+          // reportingCycle and quarter, causing year to be dropped entirely.
+          // Now passes reportingCycle and activeQuarter as separate arguments
+          // so the template's formatPeriod helper handles the formatting.
           html: superAdminReviewNeededTemplate(
             taskTitle,
             indicator.name,
-            (req as any).user.name,
-            cycleInfo,
-            year
+            adminName,
+            reportingCycle,
+            activeQuarter,
+            year,
           ),
         }).catch(console.error);
       });
     } else {
       sendMail({
-        to: indicator.email,
+        to:      indicator.email,
         subject: "Submission Returned for Correction",
+        // FIX: was passing cycleInfo (already formatted) in the reportingCycle
+        // slot, causing year to land in the rejectedBy slot and reason to be
+        // dropped, producing a TS2554 "Expected 7 arguments, got 6" error.
+        // Now passes reportingCycle and activeQuarter separately, plus the
+        // required rejectedBy and reason arguments in the correct positions.
         html: submissionRejectedTemplate(
           indicator.name,
           taskTitle,
-          cycleInfo,
+          reportingCycle,
+          activeQuarter,
           year,
           "Admin",
-          adminOverallComments
+          adminOverallComments,
         ),
       }).catch(console.error);
     }
