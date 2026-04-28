@@ -50,4 +50,20 @@ router.post(
   UserIndicatorController.addDocuments,
 );
 
+// 6. Delete a single rejected document
+router.delete(
+  "/documents/:docId",
+  protect,
+  restrictTo("user"),
+  UserIndicatorController.deleteDocument
+);
+
+// 7. Update/Correct a rejected submission
+router.patch(
+  "/:id/update-submission",
+  protect,
+  restrictTo("user"),
+  UserIndicatorController.updateSubmission
+);
+
 export default router;

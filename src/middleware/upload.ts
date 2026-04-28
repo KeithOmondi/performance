@@ -9,16 +9,46 @@ import { AppError } from "../utils/AppError";
 const storage = multer.memoryStorage();
 
 const allowedTypes: Record<string, string[]> = {
+  // --- Images ---
   "image/jpeg": ["jpg", "jpeg"],
   "image/png": ["png"],
   "image/webp": ["webp"],
+  "image/gif": ["gif"],
+  "image/svg+xml": ["svg"],
+  "image/heic": ["heic"], // Common for iPhone photos
+
+  // --- Documents (PDF & Microsoft Office) ---
   "application/pdf": ["pdf"],
   "application/msword": ["doc"],
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ["docx"],
+  "application/vnd.ms-excel": ["xls"],
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ["xlsx"],
+  "application/vnd.ms-powerpoint": ["ppt"],
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ["pptx"],
+
+  // --- OpenDocument Formats (LibreOffice/OpenOffice) ---
+  "application/vnd.oasis.opendocument.text": ["odt"],
+  "application/vnd.oasis.opendocument.spreadsheet": ["ods"],
+  "application/vnd.oasis.opendocument.presentation": ["odp"],
+
+  // --- Data & Text ---
+  "text/plain": ["txt"],
+  "text/csv": ["csv"],
+  "application/json": ["json"],
+  "application/rtf": ["rtf"],
+  "text/html": ["html", "htm"],
+
+  // --- Archives (If needed for multiple docs) ---
+  "application/zip": ["zip"],
+  "application/x-7z-compressed": ["7z"],
+  "application/x-rar-compressed": ["rar"],
+
+  // --- Videos ---
   "video/mp4": ["mp4"],
   "video/mpeg": ["mpeg"],
   "video/quicktime": ["mov"],
   "video/webm": ["webm"],
+  "video/x-msvideo": ["avi"],
 };
 
 const fileFilter = (

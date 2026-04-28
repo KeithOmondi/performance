@@ -59,4 +59,8 @@ export const uploadMultipleToCloudinary = async (
   return Promise.all(uploadPromises);
 };
 
+export const deleteFromCloudinary = (publicId: string): Promise<void> => {
+  return cloudinary.uploader.destroy(publicId).then(() => undefined);
+};
+
 export { cloudinary };

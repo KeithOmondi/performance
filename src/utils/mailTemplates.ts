@@ -1,5 +1,5 @@
 const brandName = "Performance Management System";
-const brandColor = "#2563EB"; 
+const brandColor = "#2563EB";
 
 const baseLayout = (content: string) => `
   <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff;">
@@ -17,9 +17,18 @@ const baseLayout = (content: string) => `
   </div>
 `;
 
-// Helper to format the period string (e.g., "Q1" or "Annual")
-const formatPeriod = (quarter: string | number) => {
-  if (typeof quarter === 'string' && (quarter.toLowerCase() === 'annual' || quarter.startsWith('Q'))) {
+/**
+ * Helper to format the period string.
+ * Logic: 
+ * 1. If cycle is 'Annual', ignore quarter and return 'Annual'.
+ * 2. If quarter is already formatted (e.g., 'Q1'), return it.
+ * 3. Otherwise, prepend 'Q'.
+ */
+const formatPeriod = (cycle: string, quarter: string | number) => {
+  if (cycle?.toLowerCase() === 'annual') {
+    return 'Annual';
+  }
+  if (typeof quarter === 'string' && quarter.startsWith('Q')) {
     return quarter;
   }
   return `Q${quarter}`;
@@ -41,7 +50,8 @@ export const otpTemplate = (name: string, otp: string) =>
 export const taskAssignedTemplate = (
   name: string,
   taskTitle: string,
-  quarter: string | number, // Updated type
+  reportingCycle: string,
+  quarter: string | number,
   year: number,
   deadline: string,
 ) =>
@@ -55,7 +65,7 @@ export const taskAssignedTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Deadline</td>
@@ -69,7 +79,8 @@ export const taskAssignedTemplate = (
 export const submissionReceivedTemplate = (
   name: string,
   taskTitle: string,
-  quarter: string | number, // Updated type
+  reportingCycle: string,
+  quarter: string | number,
   year: number,
 ) =>
   baseLayout(`
@@ -82,7 +93,7 @@ export const submissionReceivedTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Status</td>
@@ -95,7 +106,8 @@ export const submissionReceivedTemplate = (
 export const submissionRejectedTemplate = (
   name: string,
   taskTitle: string,
-  quarter: string | number, // Updated type
+  reportingCycle: string,
+  quarter: string | number,
   year: number,
   rejectedBy: "Admin" | "Super Admin",
   reason: string,
@@ -110,7 +122,7 @@ export const submissionRejectedTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
       </tr>
     </table>
     <div style="background: #fef2f2; border-left: 4px solid #dc2626; padding: 16px; margin: 20px 0; border-radius: 4px;">
@@ -123,7 +135,8 @@ export const submissionRejectedTemplate = (
 export const submissionApprovedTemplate = (
   name: string,
   taskTitle: string,
-  quarter: string | number, // Updated type
+  reportingCycle: string,
+  quarter: string | number,
   year: number,
 ) =>
   baseLayout(`
@@ -136,7 +149,7 @@ export const submissionApprovedTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
       </tr>
     </table>
   `);
@@ -146,7 +159,8 @@ export const adminReviewNeededTemplate = (
   adminName: string,
   submittedBy: string,
   taskTitle: string,
-  quarter: string | number, // Updated type
+  reportingCycle: string,
+  quarter: string | number,
   year: number,
 ) =>
   baseLayout(`
@@ -163,7 +177,7 @@ export const adminReviewNeededTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
       </tr>
     </table>
   `);
@@ -173,7 +187,8 @@ export const superAdminReviewNeededTemplate = (
   taskTitle: string,
   submittedBy: string,
   approvedByAdmin: string,
-  quarter: string | number, // Updated type
+  reportingCycle: string,
+  quarter: string | number,
   year: number,
 ) =>
   baseLayout(`
@@ -194,7 +209,7 @@ export const superAdminReviewNeededTemplate = (
       </tr>
       <tr>
         <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(quarter)} ${year}</td>
+        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
       </tr>
     </table>
   `);
