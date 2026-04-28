@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 import { UserIndicatorController } from "./userIndicatorController";
-import { upload, requireFiles } from "../../middleware/upload"; // Import requireFiles for better validation
+import { upload, requireFiles } from "../../middleware/upload";
 
 const router = Router();
 
@@ -13,7 +13,16 @@ router.get(
   UserIndicatorController.getMyIndicators,
 );
 
-// 2. Stream file proxy
+// 2. Get only indicators with rejected submissions (Archive)
+// Note: Placed above /:id to avoid route parameter collision
+router.get(
+  "/rejects",
+  protect,
+  restrictTo("user"),
+  UserIndicatorController.getRejectedSubmissions,
+);
+
+// 3. Stream file proxy
 router.get(
   "/stream-file",
   protect,
@@ -21,7 +30,7 @@ router.get(
   UserIndicatorController.streamFile,
 );
 
-// 3. Get single indicator details
+// 4. Get single indicator details
 router.get(
   "/:id",
   protect,
@@ -29,41 +38,48 @@ router.get(
   UserIndicatorController.getIndicatorDetails,
 );
 
-// 4. Submit or resubmit progress
-// CHANGED: "evidence" -> "documents" | limit: 5 -> 50
+// 5. Submit progress (first-time only)
 router.post(
   "/:id/submit",
   protect,
   restrictTo("user"),
-  upload.array("documents", 50), 
+  upload.array("documents", 50),
   UserIndicatorController.submitProgress,
 );
 
-// 5. Add documents to an existing submission
-// CHANGED: "evidence" -> "documents" | limit: 5 -> 50
+// 6. Resubmit progress (existing submission only)
+router.post(
+  "/:id/resubmit",
+  protect,
+  restrictTo("user"),
+  upload.array("documents", 50),
+  UserIndicatorController.resubmitProgress,
+);
+
+// 7. Add documents to an existing submission (append only)
 router.post(
   "/:id/add-documents",
   protect,
   restrictTo("user"),
   upload.array("documents", 50),
-  requireFiles, // Added this to ensure user actually sent something
+  requireFiles,
   UserIndicatorController.addDocuments,
 );
 
-// 6. Delete a single rejected document
+// 8. Delete a single rejected document
 router.delete(
   "/documents/:docId",
   protect,
   restrictTo("user"),
-  UserIndicatorController.deleteDocument
+  UserIndicatorController.deleteDocument,
 );
 
-// 7. Update/Correct a rejected submission
+// 9. Update/correct a rejected submission
 router.patch(
   "/:id/update-submission",
   protect,
   restrictTo("user"),
-  UserIndicatorController.updateSubmission
+  UserIndicatorController.updateSubmission,
 );
 
 export default router;

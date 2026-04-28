@@ -10,6 +10,7 @@ import {
   getSuperAdminStats,
   getRejectedByAdmin,
   reopenIndicator,
+  unassignIndicator,
 } from "./indicator.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
@@ -35,5 +36,8 @@ router.delete("/:id", deleteIndicator);
 // ─── Review ───────────────────────────────────────────────────────────────────
 router.patch("/:id/review", superAdminReviewProcess);
 router.patch("/:id/reopen", reopenIndicator);
+
+// ─── Unassign ─────────────────────────────────────────────────────────────────
+router.delete("/:id/unassign", unassignIndicator);
 
 export const IndicatorRoutes = router;

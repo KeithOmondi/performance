@@ -15,17 +15,10 @@ import { PoolClient } from "pg";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/**
- * Typed accessor for the authenticated user injected by auth middleware.
- */
 function getAuthUser(req: Request): IUser {
   return (req as Request & { user: IUser }).user;
 }
 
-/**
- * Returns all team IDs the given user belongs to.
- * Extracted so every handler doesn't repeat this query.
- */
 async function getUserTeamIds(userId: string): Promise<string[]> {
   const res = await pool.query(
     "SELECT team_id FROM team_members WHERE user_id = $1",
@@ -35,13 +28,9 @@ async function getUserTeamIds(userId: string): Promise<string[]> {
 }
 
 /**
- * Builds the ownership WHERE clause and matching parameter list,
- * handling both direct-user and team-assigned indicators uniformly.
- *
- * @param baseParams   - Already-bound params before the ownership block
- * @param userId       - Authenticated user's ID
- * @param teamIds      - User's team memberships
- * @param tableAlias   - SQL alias used for the indicators table (default "i")
+ * Builds a parameterised ownership WHERE clause.
+ * The uuid[] cast on the team array prevents type-mismatch errors when
+ * the assignee_id column is of type uuid.
  */
 function ownershipClause(
   baseParams: unknown[],
@@ -57,25 +46,14 @@ function ownershipClause(
   if (teamIds.length > 0) {
     params.push(teamIds);
     const teamIdx = params.length;
-    clause += ` OR (${tableAlias}.assignee_id = ANY($${teamIdx}) AND ${tableAlias}.assignee_model = 'Team')`;
+    // Explicit ::uuid[] cast avoids implicit-cast failures on uuid columns
+    clause += ` OR (${tableAlias}.assignee_id = ANY($${teamIdx}::uuid[]) AND ${tableAlias}.assignee_model = 'Team')`;
   }
 
   clause += ")";
   return { clause, params };
 }
 
-/**
- * Asserts that the given user owns (or is a team member of) the indicator.
- * Must be called inside an open transaction using the transaction client so
- * the indicator row is already locked before this check runs.
- *
- * Throws a 403 AppError if the user has no claim over the indicator.
- *
- * @param client     - Active transaction client (indicator already locked)
- * @param indicator  - The already-fetched indicator row
- * @param userId     - Authenticated user's ID
- * @param teamIds    - User's team memberships (pre-fetched before the tx)
- */
 async function assertIndicatorOwnership(
   client: PoolClient,
   indicator: Record<string, any>,
@@ -85,7 +63,6 @@ async function assertIndicatorOwnership(
   const { assignee_id, assignee_model } = indicator;
 
   if (assignee_model === "User") {
-    // Direct assignment — must be the exact assignee.
     if (assignee_id !== userId) {
       throw new AppError("Access denied: you are not assigned to this indicator.", 403);
     }
@@ -93,9 +70,6 @@ async function assertIndicatorOwnership(
   }
 
   if (assignee_model === "Team") {
-    // Team assignment — user must be a member of the assigned team.
-    // First check the pre-fetched list; fall back to a DB query in case
-    // the list was built before a recent team membership change.
     if (teamIds.includes(assignee_id)) return;
 
     const memberCheck = await client.query(
@@ -111,14 +85,13 @@ async function assertIndicatorOwnership(
     return;
   }
 
-  // Unknown assignee_model — deny by default.
   throw new AppError("Access denied: unrecognised assignee type.", 403);
 }
 
 // ─── Base query ─────────────────────────────────────────────────────────────
 
 const USER_INDICATOR_BASE_QUERY = `
-  SELECT
+  SELECT DISTINCT ON (i.id)
     i.*,
     u.name                                          AS "assigneeName",
     ab.name                                         AS "assignedByName",
@@ -128,27 +101,37 @@ const USER_INDICATOR_BASE_QUERY = `
     (SELECT json_build_object('description', description)
        FROM strategic_activities  WHERE id = i.activity_id)   AS activity,
     COALESCE(
-      (SELECT json_agg(json_build_object(
-          'id',            s.id,
-          'quarter',       s.quarter,
-          'notes',         s.notes,
-          'achievedValue', s.achieved_value,
-          'reviewStatus',  s.review_status,
-          'submittedAt',   s.submitted_at,
-          'documents',     (
-            SELECT json_agg(json_build_object(
-              'id',               d.id,
-              'evidenceUrl',      d.evidence_url,
-              'fileType',         d.file_type,
-              'fileName',         d.file_name,
-              'description',      d.description,
-              'status',           d.status
-            ))
-            FROM submission_documents d
-            WHERE d.submission_id = s.id
-          )
-        ))
-        FROM submissions s WHERE s.indicator_id = i.id
+      (
+        SELECT json_agg(ordered_subs)
+        FROM (
+          SELECT json_build_object(
+            'id',                s.id,
+            'quarter',           s.quarter,
+            'notes',             s.notes,
+            'achievedValue',     s.achieved_value,
+            'reviewStatus',      s.review_status,
+            'submittedAt',       s.submitted_at,
+            'resubmissionCount', s.resubmission_count,
+            'documents', (
+              SELECT COALESCE(json_agg(
+                json_build_object(
+                  'id',              d.id,
+                  'evidenceUrl',     d.evidence_url,
+                  'fileType',        d.file_type,
+                  'fileName',        d.file_name,
+                  'description',     d.description,
+                  'status',          d.status
+                )
+                ORDER BY d.uploaded_at DESC
+              ), '[]'::json)
+              FROM submission_documents d
+              WHERE d.submission_id = s.id
+            )
+          ) AS ordered_subs
+          FROM submissions s
+          WHERE s.indicator_id = i.id
+          ORDER BY s.submitted_at DESC
+        ) sub_rows
       ),
       '[]'
     ) AS submissions
@@ -171,7 +154,7 @@ export const UserIndicatorController = {
     const { clause, params } = ownershipClause([], user.id, teamIds);
 
     const { rows } = await pool.query(
-      `${USER_INDICATOR_BASE_QUERY} WHERE ${clause} ORDER BY i.updated_at DESC`,
+      `${USER_INDICATOR_BASE_QUERY} WHERE ${clause} ORDER BY i.id, i.updated_at DESC`,
       params,
     );
 
@@ -186,7 +169,7 @@ export const UserIndicatorController = {
     const { clause, params } = ownershipClause([req.params.id], user.id, teamIds);
 
     const { rows } = await pool.query(
-      `${USER_INDICATOR_BASE_QUERY} WHERE i.id = $1 AND ${clause} LIMIT 1`,
+      `${USER_INDICATOR_BASE_QUERY} WHERE i.id = $1 AND ${clause} ORDER BY i.id LIMIT 1`,
       params,
     );
 
@@ -194,161 +177,260 @@ export const UserIndicatorController = {
     res.status(200).json({ success: true, data: rows[0] });
   }),
 
-  // ── 3. Submit / resubmit progress ───────────────────────────────────────
-  // ─── 3. Submit / resubmit progress (Rewritten) ───────────────────────────
-submitProgress: asyncHandler(async (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-  const { notes, achievedValue, descriptions } = req.body;
-  const files = (req.files ?? []) as Express.Multer.File[];
+  // ── 3. Submit progress (first-time only) ────────────────────────────────
+  submitProgress: asyncHandler(async (req: Request, res: Response) => {
+    const user        = getAuthUser(req);
+    const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const { notes, achievedValue, descriptions } = req.body;
+    const files       = (req.files ?? []) as Express.Multer.File[];
 
-  if (!indicatorId) throw new AppError("Indicator ID is required.", 400);
-  if (!notes?.trim()) throw new AppError("Notes are required.", 400);
-  if (achievedValue === undefined || achievedValue === null) {
-    throw new AppError("Achieved value is required.", 400);
-  }
-
-  const teamIds = await getUserTeamIds(user.id);
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    // 1. Lock the indicator and verify ownership
-    const indRes = await client.query(
-      "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",
-      [indicatorId]
-    );
-    if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
-    const indicator = indRes.rows[0];
-
-    await assertIndicatorOwnership(client, indicator, user.id, teamIds);
-
-    // 2. Prevent submission if locked by workflow
-    const lockedStatuses = ["Awaiting Admin Approval", "Awaiting Super Admin", "Completed"];
-    if (lockedStatuses.includes(indicator.status)) {
-      throw new AppError(`Cannot submit while indicator is "${indicator.status}".`, 409);
+    if (!indicatorId)   throw new AppError("Indicator ID is required.", 400);
+    if (!notes?.trim()) throw new AppError("Notes are required.", 400);
+    if (achievedValue === undefined || achievedValue === null) {
+      throw new AppError("Achieved value is required.", 400);
     }
 
-    const targetQuarter = indicator.reporting_cycle === "Annual" ? 1 : indicator.active_quarter;
+    const teamIds = await getUserTeamIds(user.id);
+    const client  = await pool.connect();
 
-    // 3. Find existing submission for this quarter
-    const subRes = await client.query(
-      "SELECT id FROM submissions WHERE indicator_id = $1 AND quarter = $2",
-      [indicatorId, targetQuarter]
-    );
-    const existingSub = subRes.rows[0];
+    try {
+      await client.query("BEGIN");
 
-    // 4. Prepare Cloudinary uploads (if any)
-    let newDocs: any[] = [];
-    if (files.length > 0) {
-      const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
-      const descArr = Array.isArray(descriptions) ? descriptions : descriptions ? [descriptions] : [];
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",
+        [indicatorId],
+      );
+      if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
+      const indicator = indRes.rows[0];
 
-      newDocs = uploads.map((upload, i) => ({
-        url: upload.secure_url,
-        public_id: upload.public_id,
-        file_type: resolveFileType(upload.resource_type, files[i].mimetype),
-        file_name: files[i].originalname,
-        description: descArr[i] ?? "",
-      }));
-    }
+      await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
-    // 5. Upsert Submission and PURGE old documents
-    let submissionId: string;
-    let oldPublicIds: string[] = [];
+      const lockedStatuses = ["Awaiting Admin Approval", "Awaiting Super Admin", "Completed"];
+      if (lockedStatuses.includes(indicator.status)) {
+        throw new AppError(`Cannot submit while indicator is "${indicator.status}".`, 409);
+      }
 
-    if (existingSub) {
-      submissionId = existingSub.id;
+      const targetQuarter =
+        indicator.reporting_cycle === "Annual" ? 1 : indicator.active_quarter;
 
-      // Update text fields
+      const existing = await client.query(
+        "SELECT id FROM submissions WHERE indicator_id = $1 AND quarter = $2",
+        [indicatorId, targetQuarter],
+      );
+      if (existing.rows.length > 0) {
+        throw new AppError(
+          `A submission already exists for ${indicator.reporting_cycle === "Annual" ? "the annual period" : `Q${targetQuarter}`}. Use resubmit instead.`,
+          409,
+        );
+      }
+
+      let newDocs: {
+        url: string; public_id: string;
+        file_type: "image" | "video" | "raw";
+        file_name: string; description: string;
+      }[] = [];
+
+      if (files.length > 0) {
+        const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
+        const descArr = Array.isArray(descriptions)
+          ? descriptions : descriptions ? [descriptions] : [];
+
+        newDocs = uploads.map((upload, i) => ({
+          url:         upload.secure_url,
+          public_id:   upload.public_id,
+          file_type:   resolveFileType(upload.resource_type, files[i].mimetype),
+          file_name:   files[i].originalname,
+          description: descArr[i] ?? "",
+        }));
+      }
+
+      const newSub = await client.query(
+        `INSERT INTO submissions
+           (indicator_id, quarter, year, notes, achieved_value, review_status)
+         VALUES ($1, $2, $3, $4, $5, 'Pending')
+         RETURNING id`,
+        [indicatorId, targetQuarter, new Date().getFullYear(), notes.trim(), achievedValue],
+      );
+      const submissionId: string = newSub.rows[0].id;
+
+      if (newDocs.length > 0) {
+        await Promise.all(
+          newDocs.map((doc) =>
+            client.query(
+              `INSERT INTO submission_documents
+                 (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+            ),
+          ),
+        );
+      }
+
       await client.query(
-        `UPDATE submissions 
-         SET notes = $1, achieved_value = $2, review_status = 'Pending', 
-             is_reviewed = false, submitted_at = NOW(), 
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Submitted', $2, 'user', $3)`,
+        [
+          indicatorId,
+          `Filing for ${indicator.reporting_cycle === "Annual" ? "Annual" : `Q${targetQuarter}`}`,
+          user.id,
+        ],
+      );
+
+      await client.query("COMMIT");
+
+      await IndicatorService.syncIndicatorState(indicatorId);
+
+      UserIndicatorController._sendAlerts(user, indicator, targetQuarter).catch(
+        (e) => console.error("Mail Error:", e),
+      );
+
+      res.status(201).json({ success: true, message: "Filing submitted successfully." });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }),
+
+  // ── 4. Resubmit progress (existing submission only) ──────────────────────
+  resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
+    const user        = getAuthUser(req);
+    const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const { notes, achievedValue, descriptions } = req.body;
+    const files       = (req.files ?? []) as Express.Multer.File[];
+
+    if (!indicatorId)   throw new AppError("Indicator ID is required.", 400);
+    if (!notes?.trim()) throw new AppError("Notes are required.", 400);
+    if (achievedValue === undefined || achievedValue === null) {
+      throw new AppError("Achieved value is required.", 400);
+    }
+
+    const teamIds = await getUserTeamIds(user.id);
+    const client  = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",
+        [indicatorId],
+      );
+      if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
+      const indicator = indRes.rows[0];
+
+      await assertIndicatorOwnership(client, indicator, user.id, teamIds);
+
+      const lockedStatuses = ["Awaiting Admin Approval", "Awaiting Super Admin", "Completed"];
+      if (lockedStatuses.includes(indicator.status)) {
+        throw new AppError(`Cannot resubmit while indicator is "${indicator.status}".`, 409);
+      }
+
+      const targetQuarter =
+        indicator.reporting_cycle === "Annual" ? 1 : indicator.active_quarter;
+
+      const subRes = await client.query(
+        "SELECT id FROM submissions WHERE indicator_id = $1 AND quarter = $2",
+        [indicatorId, targetQuarter],
+      );
+      if (subRes.rows.length === 0) {
+        throw new AppError(
+          `No existing submission found for ${indicator.reporting_cycle === "Annual" ? "the annual period" : `Q${targetQuarter}`}. Use submit instead.`,
+          404,
+        );
+      }
+      const submissionId: string = subRes.rows[0].id;
+
+      await client.query(
+        `UPDATE submissions
+         SET notes              = $1,
+             achieved_value     = $2,
+             review_status      = 'Pending',
+             is_reviewed        = false,
+             submitted_at       = NOW(),
              resubmission_count = resubmission_count + 1
          WHERE id = $3`,
-        [notes.trim(), achievedValue, submissionId]
+        [notes.trim(), achievedValue, submissionId],
       );
 
-      // 🔥 THE FIX: Always clear old documents for this submission ID
-      // This ensures if the user uploads nothing, the registry is empty.
       const deletedDocs = await client.query(
-        `DELETE FROM submission_documents 
-         WHERE submission_id = $1 
+        `DELETE FROM submission_documents
+         WHERE submission_id = $1
          RETURNING evidence_public_id`,
-        [submissionId]
+        [submissionId],
       );
-      oldPublicIds = deletedDocs.rows.map((r) => r.evidence_public_id);
-    } else {
-      // Create new submission record
-      const newSub = await client.query(
-        `INSERT INTO submissions (indicator_id, quarter, year, notes, achieved_value, review_status)
-         VALUES ($1, $2, $3, $4, $5, 'Pending') RETURNING id`,
-        [indicatorId, targetQuarter, new Date().getFullYear(), notes.trim(), achievedValue]
+      const oldPublicIds: string[] = deletedDocs.rows.map((r) => r.evidence_public_id);
+
+      let newDocs: {
+        url: string; public_id: string;
+        file_type: "image" | "video" | "raw";
+        file_name: string; description: string;
+      }[] = [];
+
+      if (files.length > 0) {
+        const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
+        const descArr = Array.isArray(descriptions)
+          ? descriptions : descriptions ? [descriptions] : [];
+
+        newDocs = uploads.map((upload, i) => ({
+          url:         upload.secure_url,
+          public_id:   upload.public_id,
+          file_type:   resolveFileType(upload.resource_type, files[i].mimetype),
+          file_name:   files[i].originalname,
+          description: descArr[i] ?? "",
+        }));
+      }
+
+      if (newDocs.length > 0) {
+        await Promise.all(
+          newDocs.map((doc) =>
+            client.query(
+              `INSERT INTO submission_documents
+                 (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+               VALUES ($1, $2, $3, $4, $5, $6)`,
+              [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+            ),
+          ),
+        );
+      }
+
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Resubmitted', $2, 'user', $3)`,
+        [
+          indicatorId,
+          `Resubmission for ${indicator.reporting_cycle === "Annual" ? "Annual" : `Q${targetQuarter}`}`,
+          user.id,
+        ],
       );
-      submissionId = newSub.rows[0].id;
-    }
 
-    // 6. Insert new documents (if any were uploaded)
-    if (newDocs.length > 0) {
-      await Promise.all(
-        newDocs.map((doc) =>
-          client.query(
-            `INSERT INTO submission_documents 
-               (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description]
-          )
-        )
+      await client.query("COMMIT");
+
+      if (oldPublicIds.length > 0) {
+        oldPublicIds.forEach((pid) => {
+          if (pid) deleteFromCloudinary(pid).catch((e) =>
+            console.error("[resubmitProgress] Cloudinary cleanup failed:", e));
+        });
+      }
+
+      await IndicatorService.syncIndicatorState(indicatorId);
+
+      UserIndicatorController._sendAlerts(user, indicator, targetQuarter).catch(
+        (e) => console.error("Mail Error:", e),
       );
+
+      res.status(200).json({ success: true, message: "Resubmission processed successfully." });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
+  }),
 
-    // 7. Audit Trail
-    await client.query(
-      `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
-       VALUES ($1, $2, $3, 'user', $4)`,
-      [
-        indicatorId,
-        existingSub ? "Resubmitted" : "Submitted",
-        `Filing update for ${indicator.reporting_cycle === "Annual" ? "Annual" : `Q${targetQuarter}`}`,
-        user.id,
-      ]
-    );
-
-    await client.query("COMMIT");
-
-    // ── Post-Commit Side Effects ──
-
-    // Cleanup Cloudinary storage for deleted files
-    if (oldPublicIds.length > 0) {
-      oldPublicIds.forEach((pid) => {
-        if (pid) deleteFromCloudinary(pid).catch(e => console.error("Cloudinary Cleanup Error:", e));
-      });
-    }
-
-    // Sync progress score and indicator status
-    await IndicatorService.syncIndicatorState(indicatorId);
-
-    // Send alerts
-    UserIndicatorController._sendAlerts(user, indicator, targetQuarter).catch(
-      (e) => console.error("Mail Error:", e)
-    );
-
-    res.status(201).json({ 
-      success: true, 
-      message: "Registry updated successfully. Old evidence cleared." 
-    });
-
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
-}),
-
-  // ── 4. Update a rejected submission ─────────────────────────────────────
+  // ── 5. Update a rejected submission ─────────────────────────────────────
   updateSubmission: asyncHandler(async (req: Request, res: Response) => {
     const user        = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -360,13 +442,11 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     if (!quarter)       throw new AppError("Quarter is required.", 400);
 
     const teamIds = await getUserTeamIds(user.id);
+    const client  = await pool.connect();
 
-    const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      // Fetch and lock the indicator first so ownership can be verified
-      // before the submission row is touched.
       const indRes = await client.query(
         "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",
         [indicatorId],
@@ -374,7 +454,6 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
       if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
       const indicator = indRes.rows[0];
 
-      // Ownership gate — mirrors the guard in submitProgress.
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
       const result = await client.query(
@@ -398,30 +477,21 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
 
       const submissionId: string = result.rows[0].id;
 
-      // ── Upload replacement evidence ────────────────────────────────────
       let newDocs: {
-        url: string;
-        public_id: string;
-        file_type: "image" | "video" | "raw";
-        file_name: string;
+        url: string; public_id: string;
+        file_type: "image" | "video" | "raw"; file_name: string;
       }[] = [];
 
       if (files.length > 0) {
         const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
-        newDocs = uploads.map((upload, i) => {
-          if (!upload.secure_url) {
-            throw new AppError(`Failed to get URL for file: ${files[i].originalname}`, 500);
-          }
-          return {
-            url:       upload.secure_url,
-            public_id: upload.public_id,
-            file_type: resolveFileType(upload.resource_type, files[i].mimetype),
-            file_name: files[i].originalname,
-          };
-        });
+        newDocs = uploads.map((upload, i) => ({
+          url:       upload.secure_url,
+          public_id: upload.public_id,
+          file_type: resolveFileType(upload.resource_type, files[i].mimetype),
+          file_name: files[i].originalname,
+        }));
       }
 
-      // Purge old documents before inserting the replacement set.
       let oldPublicIds: string[] = [];
       if (newDocs.length > 0) {
         const deletedDocs = await client.query(
@@ -453,7 +523,6 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
 
       await client.query("COMMIT");
 
-      // Best-effort Cloudinary cleanup — after commit so it never causes a rollback.
       if (oldPublicIds.length > 0) {
         oldPublicIds.forEach((pid) =>
           deleteFromCloudinary(pid).catch((e) =>
@@ -473,7 +542,9 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     }
   }),
 
-  // ── 5. Add documents to an existing submission ───────────────────────────
+  // ── 6. Add documents to an existing submission ───────────────────────────
+  // Fixed: replaced broken clause.replace() ownership check with a proper
+  // assertIndicatorOwnership call using a dedicated client.
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user    = getAuthUser(req);
     const { id }  = req.params;
@@ -483,68 +554,75 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     if (!files.length) throw new AppError("No files provided.", 400);
 
     const teamIds = await getUserTeamIds(user.id);
-    const { clause, params } = ownershipClause([id], user.id, teamIds);
+    const client  = await pool.connect();
 
-    const indRes = await pool.query(
-      `SELECT id, active_quarter
-       FROM indicators
-       WHERE id = $1 AND ${clause.replace(/i\./g, "")}`,
-      params,
-    );
+    try {
+      // Fetch the indicator and assert ownership via the shared helper,
+      // which correctly handles both User and Team assignee models.
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1",
+        [id],
+      );
+      if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
 
-    if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
+      await assertIndicatorOwnership(client, indRes.rows[0], user.id, teamIds);
 
-    const targetQ = Number(quarter) || indRes.rows[0].active_quarter;
+      const targetQ = Number(quarter) || indRes.rows[0].active_quarter;
 
-    const subRes = await pool.query(
-      "SELECT id, review_status FROM submissions WHERE indicator_id = $1 AND quarter = $2",
-      [id, targetQ],
-    );
-    const submission = subRes.rows[0];
+      const subRes = await client.query(
+        "SELECT id, review_status FROM submissions WHERE indicator_id = $1 AND quarter = $2",
+        [id, targetQ],
+      );
+      const submission = subRes.rows[0];
 
-    if (!submission) throw new AppError("No submission found for this quarter.", 404);
-    if (submission.review_status === "Accepted") {
-      throw new AppError("Certified records are locked.", 400);
-    }
+      if (!submission) throw new AppError("No submission found for this quarter.", 404);
 
-    const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
+      if (submission.review_status === "Accepted") {
+        throw new AppError("Certified records are locked.", 400);
+      }
 
-    const results = await Promise.all(
-      uploads.map((upload, i) =>
-        pool.query(
-          `INSERT INTO submission_documents
-             (submission_id, evidence_url, evidence_public_id, file_type, file_name)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING *`,
-          [
-            submission.id,
-            upload.secure_url,
-            upload.public_id,
-            resolveFileType(upload.resource_type, files[i].mimetype),
-            files[i].originalname,
-          ],
+      const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
+
+      const results = await Promise.all(
+        uploads.map((upload, i) =>
+          client.query(
+            `INSERT INTO submission_documents
+               (submission_id, evidence_url, evidence_public_id, file_type, file_name)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING *`,
+            [
+              submission.id,
+              upload.secure_url,
+              upload.public_id,
+              resolveFileType(upload.resource_type, files[i].mimetype),
+              files[i].originalname,
+            ],
+          ),
         ),
-      ),
-    );
+      );
 
-    res.status(200).json({
-      success:   true,
-      message:   `${files.length} document(s) attached.`,
-      documents: results.map((r) => r.rows[0]),
-    });
+      res.status(200).json({
+        success:   true,
+        message:   `${files.length} document(s) attached.`,
+        documents: results.map((r) => r.rows[0]),
+      });
+    } finally {
+      client.release();
+    }
   }),
 
-  // ── 6. Delete a rejected document ───────────────────────────────────────
+  // ── 7. Delete a rejected document ───────────────────────────────────────
   deleteDocument: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const { docId } = req.params;
 
     const teamIds = await getUserTeamIds(user.id);
 
+    // uuid[] cast applied here for consistency with ownershipClause
     const ownershipFilter =
       teamIds.length > 0
         ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
-               OR i.assignee_id = ANY($3) AND i.assignee_model = 'Team')`
+               OR i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')`
         : `AND i.assignee_id = $2 AND i.assignee_model = 'User'`;
 
     const checkParams: unknown[] =
@@ -577,7 +655,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     res.status(200).json({ success: true, message: "Rejected document removed." });
   }),
 
-  // ── 7. Stream a Cloudinary file through the server ──────────────────────
+  // ── 8. Stream a Cloudinary file through the server ──────────────────────
   streamFile: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const url  = decodeURIComponent(req.query.url as string);
@@ -599,10 +677,12 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
       if (rows.length > 0) isAuthorized = true;
     } else {
       const teamIds = await getUserTeamIds(user.id);
+
+      // uuid[] cast applied here for consistency
       const ownershipFilter =
         teamIds.length > 0
           ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
-                 OR i.assignee_id = ANY($3) AND i.assignee_model = 'Team')`
+                 OR i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')`
           : `AND i.assignee_id = $2 AND i.assignee_model = 'User'`;
 
       const checkParams = teamIds.length > 0 ? [url, user.id, teamIds] : [url, user.id];
@@ -629,6 +709,36 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     response.data.pipe(res);
   }),
 
+  // ── 9. List only indicators with rejected submissions ────────────────────
+  getRejectedSubmissions: asyncHandler(async (req: Request, res: Response) => {
+    const user = getAuthUser(req);
+    const teamIds = await getUserTeamIds(user.id);
+
+    // 1. Get ownership clause
+    const { clause: ownership, params } = ownershipClause([], user.id, teamIds);
+
+    // 2. Build query to filter for indicators that have ANY rejected submission
+    // We use EXISTS to keep the query performant
+    const rejectedQuery = `
+      ${USER_INDICATOR_BASE_QUERY} 
+      WHERE ${ownership} 
+      AND EXISTS (
+        SELECT 1 FROM submissions s 
+        WHERE s.indicator_id = i.id 
+        AND s.review_status = 'Rejected'
+      )
+      ORDER BY i.id, i.updated_at DESC
+    `;
+
+    const { rows } = await pool.query(rejectedQuery, params);
+
+    res.status(200).json({ 
+      success: true, 
+      results: rows.length, 
+      data: rows 
+    });
+  }),
+
   // ── Internal: send email alerts after a submission ───────────────────────
   _sendAlerts: async (user: IUser, indicator: Record<string, any>, q: number): Promise<void> => {
     const year  = new Date().getFullYear();
@@ -638,17 +748,17 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     await sendMail({
       to:      user.email,
       subject: `Filing Confirmation: ${label}`,
-      html:    submissionReceivedTemplate(user.name, indicator.instructions ?? "Indicator", cycle, q, year),
+      html:    submissionReceivedTemplate(
+        user.name,
+        indicator.instructions ?? "Indicator",
+        cycle,
+        q,
+        year,
+      ),
     });
 
     const admins = await pool.query(
-      `SELECT u.email, u.name
-       FROM users u
-       JOIN strategic_plan_admins spa ON spa.user_id = u.id
-       WHERE spa.strategic_plan_id = $1
-         AND u.role      = 'admin'
-         AND u.is_active = true`,
-      [indicator.strategic_plan_id],
+      `SELECT email, name FROM users WHERE role = 'admin' AND is_active = true`,
     );
 
     await Promise.all(
@@ -672,9 +782,6 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
 
 // ─── Shared utility ─────────────────────────────────────────────────────────
 
-/**
- * Maps Cloudinary resource_type + browser mimetype to our FileType union.
- */
 function resolveFileType(
   resourceType: string,
   mimetype: string,

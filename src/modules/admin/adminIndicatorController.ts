@@ -136,41 +136,59 @@ export const getIndicatorByIdAdmin = asyncHandler(async (req: Request, res: Resp
 // ─── 3. Admin Review Process ──────────────────────────────────────────────────
 export const adminReviewProcess = asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { decision, adminOverallComments, submissionUpdates } = req.body;
-  const adminId   = (req as any).user.id;
+  const { 
+    decision, 
+    adminOverallComments, 
+    submissionUpdates, 
+    documentUpdates // New: [{ documentId: string, status: 'Rejected' | 'Accepted', reason?: string }]
+  } = req.body;
+
+  const adminId = (req as any).user.id;
   const adminName = (req as any).user.name;
 
   if (!["Verified", "Rejected"].includes(decision)) {
     throw new AppError('Decision must be "Verified" or "Rejected".', 400);
   }
 
-  const isVerified = decision === "Verified";
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
+    // 1. Fetch Indicator & Assignee details
     const indRes = await client.query(
-      `SELECT 
-         i.*,
-         i.active_quarter    AS "activeQuarter",
-         i.reporting_cycle   AS "reportingCycle",
-         u.name,
-         u.email
+      `SELECT i.*, i.active_quarter AS "activeQuarter", i.reporting_cycle AS "reportingCycle",
+              u.name, u.email
        FROM indicators i
        JOIN users u ON i.assignee_id = u.id
-       WHERE i.id = $1`,
+       WHERE i.id = $1 FOR UPDATE`,
       [id]
     );
     const indicator = indRes.rows[0];
-
     if (!indicator) throw new AppError("Indicator not found.", 404);
-    if (indicator.status !== "Awaiting Admin Approval") {
-      throw new AppError("Indicator is not in review status.", 400);
+
+    // 2. Handle Document-Level Rejections
+    let hasRejectedDocument = false;
+    if (Array.isArray(documentUpdates)) {
+      for (const doc of documentUpdates) {
+        if (doc.status === "Rejected") hasRejectedDocument = true;
+        
+        await client.query(
+          `UPDATE submission_documents 
+           SET status = $1, rejection_reason = $2 
+           WHERE id = $3`,
+          [doc.status, doc.reason || null, doc.documentId]
+        );
+      }
     }
 
+    // 3. Determine Final Status 
+    // Even if decision is "Verified", if a document was rejected, override to "Rejected"
+    const finalDecision = hasRejectedDocument ? "Rejected" : decision;
+    const isVerified = finalDecision === "Verified";
     const newStatus = isVerified ? "Awaiting Super Admin" : "Rejected by Admin";
 
+    // 4. Update Indicator
     await client.query(
       `UPDATE indicators
        SET status = $1, admin_overall_comments = $2, updated_at = NOW()
@@ -178,6 +196,7 @@ export const adminReviewProcess = asyncHandler(async (req: Request, res: Respons
       [newStatus, adminOverallComments, id]
     );
 
+    // 5. Update Submissions linked to this Indicator
     if (Array.isArray(submissionUpdates)) {
       for (const update of submissionUpdates) {
         await client.query(
@@ -193,6 +212,7 @@ export const adminReviewProcess = asyncHandler(async (req: Request, res: Respons
       }
     }
 
+    // 6. Log History
     await client.query(
       `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
        VALUES ($1, $2, $3, 'admin', $4)`,
@@ -201,50 +221,31 @@ export const adminReviewProcess = asyncHandler(async (req: Request, res: Respons
 
     await client.query("COMMIT");
 
-    const taskTitle       = indicator.instructions || "Performance Indicator";
-    const year            = new Date().getFullYear();
-    const reportingCycle  = indicator.reportingCycle as string;
-    const activeQuarter   = indicator.activeQuarter  as string | number;
+    // 7. Email Dispatch Logic
+    const taskTitle = indicator.instructions || "Performance Indicator";
+    const year = new Date().getFullYear();
 
     if (isVerified) {
-      const saRes = await pool.query(
-        "SELECT email FROM users WHERE role = 'superadmin' AND is_active = true"
-      );
+      const saRes = await pool.query("SELECT email FROM users WHERE role = 'superadmin' AND is_active = true");
       saRes.rows.forEach((sa) => {
         sendMail({
-          to:      sa.email,
+          to: sa.email,
           subject: `Submission Ready for Final Approval`,
-          // FIX: was passing pre-formatted cycleInfo string for both
-          // reportingCycle and quarter, causing year to be dropped entirely.
-          // Now passes reportingCycle and activeQuarter as separate arguments
-          // so the template's formatPeriod helper handles the formatting.
-          html: superAdminReviewNeededTemplate(
-            taskTitle,
-            indicator.name,
-            adminName,
-            reportingCycle,
-            activeQuarter,
-            year,
-          ),
+          html: superAdminReviewNeededTemplate(taskTitle, indicator.name, adminName, indicator.reportingCycle, indicator.activeQuarter, year),
         }).catch(console.error);
       });
     } else {
       sendMail({
-        to:      indicator.email,
+        to: indicator.email,
         subject: "Submission Returned for Correction",
-        // FIX: was passing cycleInfo (already formatted) in the reportingCycle
-        // slot, causing year to land in the rejectedBy slot and reason to be
-        // dropped, producing a TS2554 "Expected 7 arguments, got 6" error.
-        // Now passes reportingCycle and activeQuarter separately, plus the
-        // required rejectedBy and reason arguments in the correct positions.
         html: submissionRejectedTemplate(
           indicator.name,
           taskTitle,
-          reportingCycle,
-          activeQuarter,
+          indicator.reportingCycle,
+          indicator.activeQuarter,
           year,
           "Admin",
-          adminOverallComments,
+          hasRejectedDocument ? `Specific documents were rejected: ${adminOverallComments}` : adminOverallComments
         ),
       }).catch(console.error);
     }
@@ -252,7 +253,9 @@ export const adminReviewProcess = asyncHandler(async (req: Request, res: Respons
     res.status(200).json({
       success: true,
       message: isVerified ? "Verified successfully." : "Rejected for correction.",
+      autoRejectedDueToDocs: hasRejectedDocument && decision === "Verified"
     });
+
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
