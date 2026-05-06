@@ -121,9 +121,10 @@ async function assertIndicatorOwnership(
  *
  *   { "Q1_2025": [...], "Q2_2025": [...], "Annual_2025": [...] }
  *
- * Quarter normalisation mirrors INDICATOR_DETAIL_QUERY on the admin side:
- *   - "annual" (any casing) → "Annual"
- *   - everything else       → UPPER (Q1, Q2, Q3, Q4)
+ * FIX: s.quarter may be stored as an integer column in PostgreSQL.
+ * LOWER() and UPPER() are string functions — passing an integer column
+ * directly causes "function lower(integer) does not exist".
+ * All references use s.quarter::text to cast before applying string ops.
  *
  * This guarantees the frontend can use identical folder-rendering logic for
  * both the user and admin views.
@@ -142,6 +143,7 @@ const USER_INDICATOR_BASE_QUERY = `
 
     -- ── Quarterly-grouped submissions (matches admin shape) ───────────────
     -- Key: "Q1_2025" | "Q2_2025" | "Q3_2025" | "Q4_2025" | "Annual_2025"
+    -- NOTE: ::text casts are required because s.quarter is an integer column.
     COALESCE(
       (
         SELECT json_object_agg(quarter_key, quarter_submissions)
@@ -149,8 +151,8 @@ const USER_INDICATOR_BASE_QUERY = `
           SELECT
             CONCAT(
               CASE
-                WHEN LOWER(s.quarter) = 'annual' THEN 'Annual'
-                ELSE UPPER(s.quarter)
+                WHEN LOWER(s.quarter::text) = 'annual' THEN 'Annual'
+                ELSE UPPER(s.quarter::text)
               END,
               '_', s.year
             ) AS quarter_key,
@@ -192,7 +194,8 @@ const USER_INDICATOR_BASE_QUERY = `
           FROM submissions s
           WHERE s.indicator_id = i.id
           GROUP BY
-            CASE WHEN LOWER(s.quarter) = 'annual' THEN 'Annual' ELSE UPPER(s.quarter) END,
+            -- FIX: ::text cast required here too — same integer column
+            CASE WHEN LOWER(s.quarter::text) = 'annual' THEN 'Annual' ELSE UPPER(s.quarter::text) END,
             s.year
         ) grouped
       ),
@@ -270,7 +273,6 @@ export const UserIndicatorController = {
       if (lockedStatuses.includes(indicator.status))
         throw new AppError(`Cannot submit while indicator is "${indicator.status}".`, 409);
 
-      // "Annual" string instead of hardcoded 1 — consistent with quarter key scheme
       const targetQuarter = resolveTargetQuarter(indicator);
 
       const existing = await client.query(
@@ -502,7 +504,6 @@ export const UserIndicatorController = {
     if (!notes?.trim()) throw new AppError("Notes are required.", 400);
     if (!quarter)       throw new AppError("Quarter is required.", 400);
 
-    // Normalise the incoming quarter value before any DB operations
     const normalisedQuarter = normaliseQuarter(quarter);
 
     const teamIds = await getUserTeamIds(user.id);
@@ -577,7 +578,6 @@ export const UserIndicatorController = {
         );
       }
 
-      // Normalised label used in review_history — no more "Qannual"
       const quarterLabel =
         normalisedQuarter === "Annual" ? "Annual" : normalisedQuarter;
 
@@ -611,10 +611,10 @@ export const UserIndicatorController = {
 
   // ── 6. Add documents to an existing submission ────────────────────────────
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
-    const user                    = getAuthUser(req);
-    const { id }                  = req.params;
+    const user                      = getAuthUser(req);
+    const { id }                    = req.params;
     const { quarter, descriptions } = req.body;
-    const files                   = (req.files ?? []) as Express.Multer.File[];
+    const files                     = (req.files ?? []) as Express.Multer.File[];
 
     if (!files.length) throw new AppError("No files provided.", 400);
 
@@ -633,7 +633,6 @@ export const UserIndicatorController = {
 
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
-      // Fix: Number("Annual") → NaN. Use normaliseQuarter so "Annual" is handled.
       const rawQ    = quarter ?? indicator.active_quarter;
       const targetQ =
         indicator.reporting_cycle === "Annual"
@@ -692,9 +691,9 @@ export const UserIndicatorController = {
 
   // ── 7. Delete a rejected document ─────────────────────────────────────────
   deleteDocument: asyncHandler(async (req: Request, res: Response) => {
-    const user    = getAuthUser(req);
+    const user      = getAuthUser(req);
     const { docId } = req.params;
-    const teamIds = await getUserTeamIds(user.id);
+    const teamIds   = await getUserTeamIds(user.id);
 
     const ownershipFilter =
       teamIds.length > 0
@@ -787,6 +786,9 @@ export const UserIndicatorController = {
    * `rejectedQuarters` string array so the frontend can badge only the
    * affected folder tabs (mirrors admin's `pendingQuarters`).
    *
+   * FIX: ::text cast applied to s.quarter in the CONCAT so PostgreSQL does
+   * not attempt LOWER(integer) / UPPER(integer).
+   *
    * Example: { ..., rejectedQuarters: ["Q1_2025", "Annual_2025"] }
    */
   getRejectedSubmissions: asyncHandler(async (req: Request, res: Response) => {
@@ -809,14 +811,14 @@ export const UserIndicatorController = {
     if (rows.length === 0)
       return res.status(200).json({ success: true, results: 0, data: [] });
 
-    // ── Attach rejectedQuarters (mirrors fetchResubmittedIndicators on admin side) ──
     const indicatorIds = rows.map((r: any) => r.id);
 
+    // FIX: ::text cast on s.quarter — same integer-column issue as base query
     const { rows: rejectedRows } = await pool.query(
       `SELECT
          s.indicator_id,
          CONCAT(
-           CASE WHEN LOWER(s.quarter) = 'annual' THEN 'Annual' ELSE UPPER(s.quarter) END,
+           CASE WHEN LOWER(s.quarter::text) = 'annual' THEN 'Annual' ELSE UPPER(s.quarter::text) END,
            '_', s.year
          ) AS quarter_key
        FROM submissions s
@@ -844,13 +846,11 @@ export const UserIndicatorController = {
   _sendAlerts: async (
     user: IUser,
     indicator: Record<string, any>,
-    quarter: string,          // now a string: "Q1" | "Q2" | "Q3" | "Q4" | "Annual"
+    quarter: string,
   ): Promise<void> => {
-    const year  = new Date().getFullYear();
-    const cycle = (indicator.reporting_cycle as string) ?? "Quarterly";
-    const label = quarter === "Annual" ? "Annual" : quarter;   // already normalised
-
-    // Parse the numeric part for templates that still expect a number
+    const year       = new Date().getFullYear();
+    const cycle      = (indicator.reporting_cycle as string) ?? "Quarterly";
+    const label      = quarter === "Annual" ? "Annual" : quarter;
     const quarterNum = quarter === "Annual" ? 0 : parseInt(quarter.replace(/^Q/i, ""), 10);
 
     await sendMail({
