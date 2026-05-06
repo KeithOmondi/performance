@@ -11,6 +11,7 @@ import {
   getRejectedByAdmin,
   reopenIndicator,
   unassignIndicator,
+  deleteSubmission,
 } from "./indicator.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
@@ -21,19 +22,25 @@ router.use(restrictTo("superadmin"));
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 router.get("/dashboard-stats", getSuperAdminStats);
-router.get("/submissions/queue", getAllSubmissions);
 router.get("/rejected-by-admin", getRejectedByAdmin);
 
-// ─── Indicators ───────────────────────────────────────────────────────────────
+// ─── Submissions ─────────────────────────────────────────────────────────────
+// ⚠️ Must be declared BEFORE /:id routes — otherwise Express matches
+// "submissions" as the :id param and hits deleteIndicator instead.
+router.get("/submissions/queue", getAllSubmissions);
+router.delete("/submissions/:submissionId", deleteSubmission);
+
+// ─── Indicators (collection) ──────────────────────────────────────────────────
 router.get("/", getAllIndicators);
 router.post("/", createIndicator);
 
 // ─── Single Indicator ─────────────────────────────────────────────────────────
+// These must come AFTER all fixed-segment routes above
 router.get("/:id", getIndicatorById);
 router.patch("/:id", updateIndicator);
 router.delete("/:id", deleteIndicator);
 
-// ─── Review ───────────────────────────────────────────────────────────────────
+// ─── Review & Reopen ──────────────────────────────────────────────────────────
 router.patch("/:id/review", superAdminReviewProcess);
 router.patch("/:id/reopen", reopenIndicator);
 

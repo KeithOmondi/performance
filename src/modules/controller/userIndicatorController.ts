@@ -13,7 +13,7 @@ import { deleteFromCloudinary, uploadMultipleToCloudinary } from "../../config/c
 import { IndicatorService } from "../user/Indicator.model";
 import { PoolClient } from "pg";
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function getAuthUser(req: Request): IUser {
   return (req as Request & { user: IUser }).user;
@@ -25,6 +25,35 @@ async function getUserTeamIds(userId: string): Promise<string[]> {
     [userId],
   );
   return res.rows.map((r) => r.team_id);
+}
+
+/**
+ * Normalises any quarter value into a consistent string key used for
+ * grouping and display.
+ *
+ *  "annual" (any casing) → "Annual"
+ *  1 | "1" | "Q1"        → "Q1"
+ *  2 | "2" | "Q2"        → "Q2"   … etc.
+ *
+ * The returned value is what gets stored in submissions.quarter AND used
+ * as the folder-key prefix (e.g. "Q1_2025", "Annual_2025").
+ */
+function normaliseQuarter(raw: string | number): string {
+  const s = String(raw).trim();
+  if (s.toLowerCase() === "annual") return "Annual";
+  // Strip a leading "Q" so "Q1" and "1" both become "Q1"
+  const n = s.replace(/^Q/i, "");
+  return isNaN(Number(n)) ? s.toUpperCase() : `Q${n}`;
+}
+
+/**
+ * Resolves the target quarter for submit / resubmit operations.
+ * Annual indicators always use the string "Annual" rather than the
+ * integer 1, so the quarter key is consistent across the system.
+ */
+function resolveTargetQuarter(indicator: Record<string, any>): string {
+  if (indicator.reporting_cycle === "Annual") return "Annual";
+  return normaliseQuarter(indicator.active_quarter);
 }
 
 /**
@@ -46,7 +75,6 @@ function ownershipClause(
   if (teamIds.length > 0) {
     params.push(teamIds);
     const teamIdx = params.length;
-    // Explicit ::uuid[] cast avoids implicit-cast failures on uuid columns
     clause += ` OR (${tableAlias}.assignee_id = ANY($${teamIdx}::uuid[]) AND ${tableAlias}.assignee_model = 'Team')`;
   }
 
@@ -63,9 +91,8 @@ async function assertIndicatorOwnership(
   const { assignee_id, assignee_model } = indicator;
 
   if (assignee_model === "User") {
-    if (assignee_id !== userId) {
+    if (assignee_id !== userId)
       throw new AppError("Access denied: you are not assigned to this indicator.", 403);
-    }
     return;
   }
 
@@ -76,81 +103,117 @@ async function assertIndicatorOwnership(
       `SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2 LIMIT 1`,
       [assignee_id, userId],
     );
-    if (memberCheck.rowCount === 0) {
+    if (memberCheck.rowCount === 0)
       throw new AppError(
         "Access denied: you are not a member of the team assigned to this indicator.",
         403,
       );
-    }
     return;
   }
 
   throw new AppError("Access denied: unrecognised assignee type.", 403);
 }
 
-// ─── Base query ─────────────────────────────────────────────────────────────
+// ─── Base query ───────────────────────────────────────────────────────────────
 
+/**
+ * Submissions are grouped into quarterly folders matching the admin view:
+ *
+ *   { "Q1_2025": [...], "Q2_2025": [...], "Annual_2025": [...] }
+ *
+ * Quarter normalisation mirrors INDICATOR_DETAIL_QUERY on the admin side:
+ *   - "annual" (any casing) → "Annual"
+ *   - everything else       → UPPER (Q1, Q2, Q3, Q4)
+ *
+ * This guarantees the frontend can use identical folder-rendering logic for
+ * both the user and admin views.
+ */
 const USER_INDICATOR_BASE_QUERY = `
   SELECT DISTINCT ON (i.id)
     i.*,
-    u.name                                          AS "assigneeName",
-    ab.name                                         AS "assignedByName",
+    u.name                                        AS "assigneeName",
+    ab.name                                       AS "assignedByName",
     sp.perspective,
+
     (SELECT json_build_object('title', title)
-       FROM strategic_objectives WHERE id = i.objective_id)   AS objective,
+       FROM strategic_objectives WHERE id = i.objective_id) AS objective,
     (SELECT json_build_object('description', description)
-       FROM strategic_activities  WHERE id = i.activity_id)   AS activity,
+       FROM strategic_activities  WHERE id = i.activity_id) AS activity,
+
+    -- ── Quarterly-grouped submissions (matches admin shape) ───────────────
+    -- Key: "Q1_2025" | "Q2_2025" | "Q3_2025" | "Q4_2025" | "Annual_2025"
     COALESCE(
       (
-        SELECT json_agg(ordered_subs)
+        SELECT json_object_agg(quarter_key, quarter_submissions)
         FROM (
-          SELECT json_build_object(
-            'id',                s.id,
-            'quarter',           s.quarter,
-            'notes',             s.notes,
-            'achievedValue',     s.achieved_value,
-            'reviewStatus',      s.review_status,
-            'submittedAt',       s.submitted_at,
-            'resubmissionCount', s.resubmission_count,
-            'documents', (
-              SELECT COALESCE(json_agg(
-                json_build_object(
-                  'id',              d.id,
-                  'evidenceUrl',     d.evidence_url,
-                  'fileType',        d.file_type,
-                  'fileName',        d.file_name,
-                  'description',     d.description,
-                  'status',          d.status
+          SELECT
+            CONCAT(
+              CASE
+                WHEN LOWER(s.quarter) = 'annual' THEN 'Annual'
+                ELSE UPPER(s.quarter)
+              END,
+              '_', s.year
+            ) AS quarter_key,
+
+            json_agg(
+              json_build_object(
+                'id',                s.id,
+                'quarter',           s.quarter,
+                'year',              s.year,
+                'notes',             s.notes,
+                'achievedValue',     s.achieved_value,
+                'reviewStatus',      s.review_status,
+                'adminComment',      s.admin_comment,
+                'resubmissionCount', s.resubmission_count,
+                'submittedAt',       s.submitted_at,
+                'isReviewed',        s.is_reviewed,
+                'documents', (
+                  SELECT COALESCE(
+                    json_agg(
+                      json_build_object(
+                        'id',             d.id,
+                        'evidenceUrl',    d.evidence_url,
+                        'fileType',       d.file_type,
+                        'fileName',       d.file_name,
+                        'description',    d.description,
+                        'status',         d.status,
+                        'rejectionReason', d.rejection_reason
+                      )
+                      ORDER BY d.uploaded_at DESC
+                    ),
+                    '[]'::json
+                  )
+                  FROM submission_documents d
+                  WHERE d.submission_id = s.id
                 )
-                ORDER BY d.uploaded_at DESC
-              ), '[]'::json)
-              FROM submission_documents d
-              WHERE d.submission_id = s.id
-            )
-          ) AS ordered_subs
+              ) ORDER BY s.submitted_at DESC
+            ) AS quarter_submissions
+
           FROM submissions s
           WHERE s.indicator_id = i.id
-          ORDER BY s.submitted_at DESC
-        ) sub_rows
+          GROUP BY
+            CASE WHEN LOWER(s.quarter) = 'annual' THEN 'Annual' ELSE UPPER(s.quarter) END,
+            s.year
+        ) grouped
       ),
-      '[]'
+      '{}'
     ) AS submissions
+
   FROM indicators i
-  LEFT JOIN users u  ON i.assignee_id    = u.id  AND i.assignee_model = 'User'
-  LEFT JOIN teams t  ON i.assignee_id    = t.id  AND i.assignee_model = 'Team'
-  LEFT JOIN users ab ON i.assigned_by    = ab.id
+  LEFT JOIN users u    ON i.assignee_id      = u.id  AND i.assignee_model = 'User'
+  LEFT JOIN teams t    ON i.assignee_id      = t.id  AND i.assignee_model = 'Team'
+  LEFT JOIN users ab   ON i.assigned_by      = ab.id
   LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
 `;
 
-// ─── Controller ─────────────────────────────────────────────────────────────
+// ─── Controller ───────────────────────────────────────────────────────────────
 
 export const UserIndicatorController = {
 
-  // ── 1. List my indicators ────────────────────────────────────────────────
+  // ── 1. List my indicators ─────────────────────────────────────────────────
   getMyIndicators: asyncHandler(async (req: Request, res: Response) => {
     const user    = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
-
     const { clause, params } = ownershipClause([], user.id, teamIds);
 
     const { rows } = await pool.query(
@@ -161,11 +224,10 @@ export const UserIndicatorController = {
     res.status(200).json({ success: true, results: rows.length, data: rows });
   }),
 
-  // ── 2. Get single indicator (ownership-gated) ────────────────────────────
+  // ── 2. Get single indicator (ownership-gated) ─────────────────────────────
   getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
     const user    = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
-
     const { clause, params } = ownershipClause([req.params.id], user.id, teamIds);
 
     const { rows } = await pool.query(
@@ -177,7 +239,7 @@ export const UserIndicatorController = {
     res.status(200).json({ success: true, data: rows[0] });
   }),
 
-  // ── 3. Submit progress (first-time only) ────────────────────────────────
+  // ── 3. Submit progress (first-time only) ──────────────────────────────────
   submitProgress: asyncHandler(async (req: Request, res: Response) => {
     const user        = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -186,9 +248,8 @@ export const UserIndicatorController = {
 
     if (!indicatorId)   throw new AppError("Indicator ID is required.", 400);
     if (!notes?.trim()) throw new AppError("Notes are required.", 400);
-    if (achievedValue === undefined || achievedValue === null) {
+    if (achievedValue === undefined || achievedValue === null)
       throw new AppError("Achieved value is required.", 400);
-    }
 
     const teamIds = await getUserTeamIds(user.id);
     const client  = await pool.connect();
@@ -206,12 +267,11 @@ export const UserIndicatorController = {
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
       const lockedStatuses = ["Awaiting Admin Approval", "Awaiting Super Admin", "Completed"];
-      if (lockedStatuses.includes(indicator.status)) {
+      if (lockedStatuses.includes(indicator.status))
         throw new AppError(`Cannot submit while indicator is "${indicator.status}".`, 409);
-      }
 
-      const targetQuarter =
-        indicator.reporting_cycle === "Annual" ? 1 : indicator.active_quarter;
+      // "Annual" string instead of hardcoded 1 — consistent with quarter key scheme
+      const targetQuarter = resolveTargetQuarter(indicator);
 
       const existing = await client.query(
         "SELECT id FROM submissions WHERE indicator_id = $1 AND quarter = $2",
@@ -219,7 +279,7 @@ export const UserIndicatorController = {
       );
       if (existing.rows.length > 0) {
         throw new AppError(
-          `A submission already exists for ${indicator.reporting_cycle === "Annual" ? "the annual period" : `Q${targetQuarter}`}. Use resubmit instead.`,
+          `A submission already exists for ${targetQuarter === "Annual" ? "the annual period" : targetQuarter}. Use resubmit instead.`,
           409,
         );
       }
@@ -233,7 +293,8 @@ export const UserIndicatorController = {
       if (files.length > 0) {
         const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
         const descArr = Array.isArray(descriptions)
-          ? descriptions : descriptions ? [descriptions] : [];
+          ? descriptions
+          : descriptions ? [descriptions] : [];
 
         newDocs = uploads.map((upload, i) => ({
           url:         upload.secure_url,
@@ -272,7 +333,7 @@ export const UserIndicatorController = {
          VALUES ($1, 'Submitted', $2, 'user', $3)`,
         [
           indicatorId,
-          `Filing for ${indicator.reporting_cycle === "Annual" ? "Annual" : `Q${targetQuarter}`}`,
+          `Filing for ${targetQuarter === "Annual" ? "Annual" : targetQuarter}`,
           user.id,
         ],
       );
@@ -294,7 +355,7 @@ export const UserIndicatorController = {
     }
   }),
 
-  // ── 4. Resubmit progress (existing submission only) ──────────────────────
+  // ── 4. Resubmit progress (existing submission only) ───────────────────────
   resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
     const user        = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -303,9 +364,8 @@ export const UserIndicatorController = {
 
     if (!indicatorId)   throw new AppError("Indicator ID is required.", 400);
     if (!notes?.trim()) throw new AppError("Notes are required.", 400);
-    if (achievedValue === undefined || achievedValue === null) {
+    if (achievedValue === undefined || achievedValue === null)
       throw new AppError("Achieved value is required.", 400);
-    }
 
     const teamIds = await getUserTeamIds(user.id);
     const client  = await pool.connect();
@@ -323,12 +383,10 @@ export const UserIndicatorController = {
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
       const lockedStatuses = ["Awaiting Admin Approval", "Awaiting Super Admin", "Completed"];
-      if (lockedStatuses.includes(indicator.status)) {
+      if (lockedStatuses.includes(indicator.status))
         throw new AppError(`Cannot resubmit while indicator is "${indicator.status}".`, 409);
-      }
 
-      const targetQuarter =
-        indicator.reporting_cycle === "Annual" ? 1 : indicator.active_quarter;
+      const targetQuarter = resolveTargetQuarter(indicator);
 
       const subRes = await client.query(
         "SELECT id FROM submissions WHERE indicator_id = $1 AND quarter = $2",
@@ -336,7 +394,7 @@ export const UserIndicatorController = {
       );
       if (subRes.rows.length === 0) {
         throw new AppError(
-          `No existing submission found for ${indicator.reporting_cycle === "Annual" ? "the annual period" : `Q${targetQuarter}`}. Use submit instead.`,
+          `No existing submission found for ${targetQuarter === "Annual" ? "the annual period" : targetQuarter}. Use submit instead.`,
           404,
         );
       }
@@ -371,7 +429,8 @@ export const UserIndicatorController = {
       if (files.length > 0) {
         const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
         const descArr = Array.isArray(descriptions)
-          ? descriptions : descriptions ? [descriptions] : [];
+          ? descriptions
+          : descriptions ? [descriptions] : [];
 
         newDocs = uploads.map((upload, i) => ({
           url:         upload.secure_url,
@@ -401,7 +460,7 @@ export const UserIndicatorController = {
          VALUES ($1, 'Resubmitted', $2, 'user', $3)`,
         [
           indicatorId,
-          `Resubmission for ${indicator.reporting_cycle === "Annual" ? "Annual" : `Q${targetQuarter}`}`,
+          `Resubmission for ${targetQuarter === "Annual" ? "Annual" : targetQuarter}`,
           user.id,
         ],
       );
@@ -410,8 +469,10 @@ export const UserIndicatorController = {
 
       if (oldPublicIds.length > 0) {
         oldPublicIds.forEach((pid) => {
-          if (pid) deleteFromCloudinary(pid).catch((e) =>
-            console.error("[resubmitProgress] Cloudinary cleanup failed:", e));
+          if (pid)
+            deleteFromCloudinary(pid).catch((e) =>
+              console.error("[resubmitProgress] Cloudinary cleanup failed:", e),
+            );
         });
       }
 
@@ -430,7 +491,7 @@ export const UserIndicatorController = {
     }
   }),
 
-  // ── 5. Update a rejected submission ─────────────────────────────────────
+  // ── 5. Update a rejected submission ───────────────────────────────────────
   updateSubmission: asyncHandler(async (req: Request, res: Response) => {
     const user        = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
@@ -440,6 +501,9 @@ export const UserIndicatorController = {
     if (!indicatorId)   throw new AppError("Indicator ID is required.", 400);
     if (!notes?.trim()) throw new AppError("Notes are required.", 400);
     if (!quarter)       throw new AppError("Quarter is required.", 400);
+
+    // Normalise the incoming quarter value before any DB operations
+    const normalisedQuarter = normaliseQuarter(quarter);
 
     const teamIds = await getUserTeamIds(user.id);
     const client  = await pool.connect();
@@ -468,12 +532,11 @@ export const UserIndicatorController = {
            AND quarter       = $4
            AND review_status = 'Rejected'
          RETURNING id`,
-        [notes.trim(), achievedValue, indicatorId, quarter],
+        [notes.trim(), achievedValue, indicatorId, normalisedQuarter],
       );
 
-      if (result.rowCount === 0) {
+      if (result.rowCount === 0)
         throw new AppError("No rejected submission found to update for this quarter.", 404);
-      }
 
       const submissionId: string = result.rows[0].id;
 
@@ -514,11 +577,15 @@ export const UserIndicatorController = {
         );
       }
 
+      // Normalised label used in review_history — no more "Qannual"
+      const quarterLabel =
+        normalisedQuarter === "Annual" ? "Annual" : normalisedQuarter;
+
       await client.query(
         `INSERT INTO review_history
            (indicator_id, action, reason, reviewer_role, reviewed_by)
          VALUES ($1, 'Resubmitted', $2, 'user', $3)`,
-        [indicatorId, `Correction resubmitted for Q${quarter}`, user.id],
+        [indicatorId, `Correction resubmitted for ${quarterLabel}`, user.id],
       );
 
       await client.query("COMMIT");
@@ -542,14 +609,12 @@ export const UserIndicatorController = {
     }
   }),
 
-  // ── 6. Add documents to an existing submission ───────────────────────────
-  // Fixed: replaced broken clause.replace() ownership check with a proper
-  // assertIndicatorOwnership call using a dedicated client.
+  // ── 6. Add documents to an existing submission ────────────────────────────
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
-    const user    = getAuthUser(req);
-    const { id }  = req.params;
-    const { quarter } = req.body;
-    const files   = (req.files ?? []) as Express.Multer.File[];
+    const user                    = getAuthUser(req);
+    const { id }                  = req.params;
+    const { quarter, descriptions } = req.body;
+    const files                   = (req.files ?? []) as Express.Multer.File[];
 
     if (!files.length) throw new AppError("No files provided.", 400);
 
@@ -557,17 +622,23 @@ export const UserIndicatorController = {
     const client  = await pool.connect();
 
     try {
-      // Fetch the indicator and assert ownership via the shared helper,
-      // which correctly handles both User and Team assignee models.
+      await client.query("BEGIN");
+
       const indRes = await client.query(
         "SELECT * FROM indicators WHERE id = $1",
         [id],
       );
       if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
+      const indicator = indRes.rows[0];
 
-      await assertIndicatorOwnership(client, indRes.rows[0], user.id, teamIds);
+      await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
-      const targetQ = Number(quarter) || indRes.rows[0].active_quarter;
+      // Fix: Number("Annual") → NaN. Use normaliseQuarter so "Annual" is handled.
+      const rawQ    = quarter ?? indicator.active_quarter;
+      const targetQ =
+        indicator.reporting_cycle === "Annual"
+          ? "Annual"
+          : normaliseQuarter(rawQ);
 
       const subRes = await client.query(
         "SELECT id, review_status FROM submissions WHERE indicator_id = $1 AND quarter = $2",
@@ -575,20 +646,22 @@ export const UserIndicatorController = {
       );
       const submission = subRes.rows[0];
 
-      if (!submission) throw new AppError("No submission found for this quarter.", 404);
-
-      if (submission.review_status === "Accepted") {
+      if (!submission)
+        throw new AppError(`No submission found for ${targetQ}.`, 404);
+      if (submission.review_status === "Accepted")
         throw new AppError("Certified records are locked.", 400);
-      }
 
       const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
+      const descArr = Array.isArray(descriptions)
+        ? descriptions
+        : descriptions ? [descriptions] : [];
 
       const results = await Promise.all(
         uploads.map((upload, i) =>
           client.query(
             `INSERT INTO submission_documents
-               (submission_id, evidence_url, evidence_public_id, file_type, file_name)
-             VALUES ($1, $2, $3, $4, $5)
+               (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+             VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING *`,
             [
               submission.id,
@@ -596,29 +669,33 @@ export const UserIndicatorController = {
               upload.public_id,
               resolveFileType(upload.resource_type, files[i].mimetype),
               files[i].originalname,
+              descArr[i] ?? "",
             ],
           ),
         ),
       );
 
+      await client.query("COMMIT");
+
       res.status(200).json({
         success:   true,
-        message:   `${files.length} document(s) attached.`,
+        message:   `${files.length} document(s) attached successfully.`,
         documents: results.map((r) => r.rows[0]),
       });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
     } finally {
       client.release();
     }
   }),
 
-  // ── 7. Delete a rejected document ───────────────────────────────────────
+  // ── 7. Delete a rejected document ─────────────────────────────────────────
   deleteDocument: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
+    const user    = getAuthUser(req);
     const { docId } = req.params;
-
     const teamIds = await getUserTeamIds(user.id);
 
-    // uuid[] cast applied here for consistency with ownershipClause
     const ownershipFilter =
       teamIds.length > 0
         ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
@@ -631,20 +708,18 @@ export const UserIndicatorController = {
     const { rows } = await pool.query(
       `SELECT d.id, d.evidence_public_id, d.status AS doc_status, s.review_status
        FROM submission_documents d
-       JOIN submissions  s ON d.submission_id  = s.id
-       JOIN indicators   i ON s.indicator_id   = i.id
+       JOIN submissions s ON d.submission_id  = s.id
+       JOIN indicators  i ON s.indicator_id   = i.id
        WHERE d.id = $1 ${ownershipFilter}`,
       checkParams,
     );
 
-    if (rows.length === 0) {
+    if (rows.length === 0)
       throw new AppError("Document not found or access denied.", 404);
-    }
 
     const doc = rows[0];
-    if (doc.doc_status !== "Rejected") {
+    if (doc.doc_status !== "Rejected")
       throw new AppError("Only rejected documents can be deleted.", 400);
-    }
 
     await pool.query("DELETE FROM submission_documents WHERE id = $1", [docId]);
 
@@ -655,19 +730,17 @@ export const UserIndicatorController = {
     res.status(200).json({ success: true, message: "Rejected document removed." });
   }),
 
-  // ── 8. Stream a Cloudinary file through the server ──────────────────────
+  // ── 8. Stream a Cloudinary file through the server ────────────────────────
   streamFile: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const url  = decodeURIComponent(req.query.url as string);
 
-    if (!url || !url.startsWith("https://res.cloudinary.com/")) {
+    if (!url || !url.startsWith("https://res.cloudinary.com/"))
       throw new AppError("Invalid source.", 400);
-    }
 
     const privilegedRoles = ["admin", "superadmin", "examiner"];
     const hasPrivilege    = privilegedRoles.includes(user.role);
-
-    let isAuthorized = false;
+    let isAuthorized      = false;
 
     if (hasPrivilege) {
       const { rows } = await pool.query(
@@ -678,7 +751,6 @@ export const UserIndicatorController = {
     } else {
       const teamIds = await getUserTeamIds(user.id);
 
-      // uuid[] cast applied here for consistency
       const ownershipFilter =
         teamIds.length > 0
           ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
@@ -709,41 +781,77 @@ export const UserIndicatorController = {
     response.data.pipe(res);
   }),
 
-  // ── 9. List only indicators with rejected submissions ────────────────────
+  // ── 9. List only indicators with rejected submissions (with rejectedQuarters) ──
+  /**
+   * Returns indicators that have at least one rejected quarter, plus a
+   * `rejectedQuarters` string array so the frontend can badge only the
+   * affected folder tabs (mirrors admin's `pendingQuarters`).
+   *
+   * Example: { ..., rejectedQuarters: ["Q1_2025", "Annual_2025"] }
+   */
   getRejectedSubmissions: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
+    const user    = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
-
-    // 1. Get ownership clause
     const { clause: ownership, params } = ownershipClause([], user.id, teamIds);
 
-    // 2. Build query to filter for indicators that have ANY rejected submission
-    // We use EXISTS to keep the query performant
-    const rejectedQuery = `
-      ${USER_INDICATOR_BASE_QUERY} 
-      WHERE ${ownership} 
-      AND EXISTS (
-        SELECT 1 FROM submissions s 
-        WHERE s.indicator_id = i.id 
-        AND s.review_status = 'Rejected'
-      )
-      ORDER BY i.id, i.updated_at DESC
-    `;
+    const { rows } = await pool.query(
+      `${USER_INDICATOR_BASE_QUERY}
+       WHERE ${ownership}
+         AND EXISTS (
+           SELECT 1 FROM submissions s
+           WHERE  s.indicator_id = i.id
+             AND  s.review_status = 'Rejected'
+         )
+       ORDER BY i.id, i.updated_at DESC`,
+      params,
+    );
 
-    const { rows } = await pool.query(rejectedQuery, params);
+    if (rows.length === 0)
+      return res.status(200).json({ success: true, results: 0, data: [] });
 
-    res.status(200).json({ 
-      success: true, 
-      results: rows.length, 
-      data: rows 
-    });
+    // ── Attach rejectedQuarters (mirrors fetchResubmittedIndicators on admin side) ──
+    const indicatorIds = rows.map((r: any) => r.id);
+
+    const { rows: rejectedRows } = await pool.query(
+      `SELECT
+         s.indicator_id,
+         CONCAT(
+           CASE WHEN LOWER(s.quarter) = 'annual' THEN 'Annual' ELSE UPPER(s.quarter) END,
+           '_', s.year
+         ) AS quarter_key
+       FROM submissions s
+       WHERE s.indicator_id  = ANY($1)
+         AND s.review_status = 'Rejected'
+       GROUP BY s.indicator_id, quarter_key`,
+      [indicatorIds],
+    );
+
+    const rejectedMap = new Map<string, string[]>();
+    for (const { indicator_id, quarter_key } of rejectedRows) {
+      if (!rejectedMap.has(indicator_id)) rejectedMap.set(indicator_id, []);
+      rejectedMap.get(indicator_id)!.push(quarter_key);
+    }
+
+    const enriched = rows.map((row: any) => ({
+      ...row,
+      rejectedQuarters: rejectedMap.get(row.id) ?? [],
+    }));
+
+    res.status(200).json({ success: true, results: enriched.length, data: enriched });
   }),
 
-  // ── Internal: send email alerts after a submission ───────────────────────
-  _sendAlerts: async (user: IUser, indicator: Record<string, any>, q: number): Promise<void> => {
+  // ── Internal: send email alerts after a submission ────────────────────────
+  _sendAlerts: async (
+    user: IUser,
+    indicator: Record<string, any>,
+    quarter: string,          // now a string: "Q1" | "Q2" | "Q3" | "Q4" | "Annual"
+  ): Promise<void> => {
     const year  = new Date().getFullYear();
     const cycle = (indicator.reporting_cycle as string) ?? "Quarterly";
-    const label = cycle === "Annual" ? "Annual" : `Q${q}`;
+    const label = quarter === "Annual" ? "Annual" : quarter;   // already normalised
+
+    // Parse the numeric part for templates that still expect a number
+    const quarterNum = quarter === "Annual" ? 0 : parseInt(quarter.replace(/^Q/i, ""), 10);
 
     await sendMail({
       to:      user.email,
@@ -752,7 +860,7 @@ export const UserIndicatorController = {
         user.name,
         indicator.instructions ?? "Indicator",
         cycle,
-        q,
+        quarterNum,
         year,
       ),
     });
@@ -771,7 +879,7 @@ export const UserIndicatorController = {
             user.name,
             indicator.instructions ?? "Indicator",
             cycle,
-            q,
+            quarterNum,
             year,
           ),
         }),
@@ -780,7 +888,7 @@ export const UserIndicatorController = {
   },
 };
 
-// ─── Shared utility ─────────────────────────────────────────────────────────
+// ─── Shared utility ───────────────────────────────────────────────────────────
 
 function resolveFileType(
   resourceType: string,

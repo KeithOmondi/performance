@@ -639,26 +639,140 @@ export const getSuperAdminStats = asyncHandler(
 );
 
 /* ─── 11. UNASSIGN INDICATOR ──────────────────────────────────────────────── */
+/* ─── 11. UNASSIGN INDICATOR ──────────────────────────────────────────────── */
 export const unassignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
 
-    const result = await pool.query(
-      `UPDATE indicators 
-       SET assignee_id = NULL, 
-           assignee_model = NULL, 
-           status = 'Pending',
-           updated_at = NOW()
-       WHERE id = $1 
-       RETURNING *`,
-      [id],
-    );
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
 
-    if (result.rowCount === 0) throw new AppError("Indicator not found.", 404);
+      const indRes = await client.query(
+        "SELECT id FROM indicators WHERE id = $1 FOR UPDATE",
+        [id]
+      );
+      if (indRes.rowCount === 0) throw new AppError("Indicator not found.", 404);
 
-    res.status(200).json({
-      success: true,
-      message: "Activity unassigned successfully.",
-    });
+      // 1. Delete all submissions (cascade removes submission_documents via FK)
+      await client.query(
+        "DELETE FROM submissions WHERE indicator_id = $1",
+        [id]
+      );
+
+      // 2. Delete all review history
+      await client.query(
+        "DELETE FROM review_history WHERE indicator_id = $1",
+        [id]
+      );
+
+      // 3. Reset the indicator to a fully clean state
+      //    assignee_model must be set to a valid non-null default so the
+      //    INDICATOR_SELECT CASE doesn't fall to the ELSE branch and
+      //    accidentally return a stale team name as assigneeDisplayName.
+     await client.query(
+  `UPDATE indicators
+   SET assignee_id            = NULL,
+       assignee_model         = 'User',
+       status                 = 'Pending',
+       progress               = 0,
+       current_total_achieved = 0,
+       active_quarter         = 1,
+       updated_at             = NOW()
+   WHERE id = $1`,
+  [id]
+);
+
+      await client.query("COMMIT");
+
+      // ✅ Return just the id — the frontend slice calls removeIndicatorById(id)
+      //    so it doesn't need the full object. Returning the full row risks
+      //    the frontend upsertIndicator keeping a "ghost" assigned row.
+      res.status(200).json({ success: true, data: { id } });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/* ─── 12. DELETE SUBMISSION ───────────────────────────────────────────────── */
+export const deleteSubmission = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { submissionId } = req.params;
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Fetch submission and lock it
+      const subRes = await client.query(
+        `SELECT s.id, s.indicator_id, s.review_status
+         FROM submissions s
+         WHERE s.id = $1
+         FOR UPDATE`,
+        [submissionId],
+      );
+
+      if (subRes.rows.length === 0) {
+        throw new AppError("Submission not found.", 404);
+      }
+
+      const submission = subRes.rows[0];
+
+      // Guard: do not allow deleting an already-accepted submission
+      if (submission.review_status === "Accepted") {
+        throw new AppError("Cannot delete a certified submission.", 400);
+      }
+
+      // Pull all Cloudinary public_ids before deletion
+      const docsRes = await client.query(
+        `SELECT evidence_public_id
+         FROM submission_documents
+         WHERE submission_id = $1`,
+        [submissionId],
+      );
+      const publicIds: string[] = docsRes.rows
+        .map((r: { evidence_public_id: string }) => r.evidence_public_id)
+        .filter(Boolean);
+
+      // Cascade: documents deleted via FK, but we need public_ids first (done above)
+      await client.query(
+        "DELETE FROM submissions WHERE id = $1",
+        [submissionId],
+      );
+
+      // Log the deletion in review_history for audit trail
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Submission Deleted', 'Deleted by admin', 'admin', $2)`,
+        [submission.indicator_id, (req as any).user.id],
+      );
+
+      await client.query("COMMIT");
+
+      // Cloudinary cleanup outside transaction — non-fatal if it fails
+      if (publicIds.length > 0) {
+        const { deleteFromCloudinary } = await import("../../config/cloudinary");
+        publicIds.forEach((pid) =>
+          deleteFromCloudinary(pid).catch((e) =>
+            console.error("[deleteSubmission] Cloudinary cleanup failed:", e),
+          ),
+        );
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Submission and associated documents removed.",
+      });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
   },
 );
