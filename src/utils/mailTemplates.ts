@@ -213,3 +213,52 @@ export const superAdminReviewNeededTemplate = (
       </tr>
     </table>
   `);
+
+
+// Add these two to your existing mailTemplates file
+
+export const taskDueTodayTemplate = (
+  recipientName: string,
+  activityDescription: string,
+  reportingCycle: string,
+  quarter: number | string,
+  year: number,
+  target: number,
+  unit: string,
+): string => `
+  <div style="font-family: sans-serif; max-width: 600px; margin: auto;">
+    <h2 style="color: #c0392b;">⚠️ Task Due Today</h2>
+    <p>Dear <strong>${recipientName}</strong>,</p>
+    <p>Your assigned indicator is due <strong>today</strong>. Please submit your progress immediately if you haven't already.</p>
+    <table style="width:100%; border-collapse:collapse; margin: 16px 0;">
+      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Activity</td><td style="padding:8px;">${activityDescription}</td></tr>
+      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Period</td><td style="padding:8px;">${reportingCycle === "Annual" ? "Annual" : `Q${quarter}`} ${year}</td></tr>
+      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Target</td><td style="padding:8px;">${target} ${unit}</td></tr>
+    </table>
+    <p style="color:#c0392b; font-weight:bold;">Failure to submit today may result in your filing being marked as overdue.</p>
+    <p>Please log in to the system to submit your progress report.</p>
+  </div>
+`;
+
+export const taskDueSoonTemplate = (
+  recipientName: string,
+  activityDescription: string,
+  reportingCycle: string,
+  quarter: number | string,
+  year: number,
+  target: number,
+  unit: string,
+  daysLeft: number,
+): string => `
+  <div style="font-family: sans-serif; max-width: 600px; margin: auto;">
+    <h2 style="color: #e67e22;">🔔 Reminder: Task Due in ${daysLeft} Day${daysLeft > 1 ? "s" : ""}</h2>
+    <p>Dear <strong>${recipientName}</strong>,</p>
+    <p>This is a reminder that your assigned indicator is due in <strong>${daysLeft} day${daysLeft > 1 ? "s" : ""}</strong>.</p>
+    <table style="width:100%; border-collapse:collapse; margin: 16px 0;">
+      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Activity</td><td style="padding:8px;">${activityDescription}</td></tr>
+      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Period</td><td style="padding:8px;">${reportingCycle === "Annual" ? "Annual" : `Q${quarter}`} ${year}</td></tr>
+      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Target</td><td style="padding:8px;">${target} ${unit}</td></tr>
+    </table>
+    <p>Please log in to the system to prepare and submit your progress report before the deadline.</p>
+  </div>
+`;
