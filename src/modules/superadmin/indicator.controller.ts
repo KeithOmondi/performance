@@ -202,14 +202,38 @@ export const getAllIndicators = asyncHandler(
     let whereClause = "WHERE 1=1";
     const params: any[] = [];
 
+    // Filter by indicator status (e.g. "Pending", "Completed")
     if (status) {
       params.push(status);
       whereClause += ` AND i.status = $${params.length}`;
     }
+
+    // `assignee` is only safe to bind against assignee_id when it's an actual UUID.
+    // The frontend also sends intent strings like "assigned", "unassigned", "review" —
+    // these must be translated to structural WHERE conditions, never bound as UUIDs.
     if (assignee) {
-      params.push(assignee);
-      whereClause += ` AND i.assignee_id = $${params.length}`;
+      if (isUUID(assignee as string)) {
+        // Specific user/team UUID — filter to that exact assignee
+        params.push(assignee);
+        whereClause += ` AND i.assignee_id = $${params.length}`;
+      } else {
+        // Intent-based filter strings
+        switch ((assignee as string).toLowerCase()) {
+          case "assigned":
+            whereClause += ` AND i.assignee_id IS NOT NULL`;
+            break;
+          case "unassigned":
+            whereClause += ` AND i.assignee_id IS NULL`;
+            break;
+          case "review":
+            whereClause += ` AND i.status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')`;
+            break;
+          // Add further cases here as needed; unknown strings are ignored safely
+        }
+      }
     }
+
+    // Filter by assignee model type ("User" or "Team")
     if (assignmentType) {
       params.push(assignmentType);
       whereClause += ` AND i.assignee_model = $${params.length}`;
