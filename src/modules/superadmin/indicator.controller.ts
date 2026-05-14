@@ -95,6 +95,7 @@ async function resolveRecipients(assigneeId: string, type: "User" | "Team"): Pro
   };
 }
 
+
 /* ─── 1. CREATE INDICATOR ─────────────────────────────────────────────────── */
 
 export const createIndicator = asyncHandler(
@@ -165,30 +166,56 @@ export const createIndicator = asyncHandler(
       adminId,
     ]);
 
-    // This refers to your existing SELECT/JOIN constants
-    // ✅ FIXED
-const { rows: indicatorRows } = await pool.query(
-  `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
-  [inserted[0].id],
-);
+    const indicatorId = inserted[0].id;
 
-    // Typing the destructuring here solves the "implicit any" error
-    resolveRecipients(assignee, type).then(({ emails, displayName }: { emails: string[]; displayName: string }) => {
-      emails.forEach((email: string) =>
-        sendMail({
-          to: email,
-          subject: "New Task Assigned",
-          html: taskAssignedTemplate(
-            displayName,
-            instructions || "—",
-            cycle,
-            activeQuarter || 1,
-            new Date().getFullYear(),
-            parsedDeadline.toDateString(),
+    // Fetch full indicator for response
+    const { rows: indicatorRows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+      [indicatorId],
+    );
+
+    // Fetch activity description and objective title for the email
+    const { rows: activityRows } = await pool.query(
+      `SELECT 
+         sa.description  AS "activityDescription",
+         so.title        AS "objectiveTitle"
+       FROM strategic_activities sa
+       LEFT JOIN strategic_objectives so ON so.id = $2
+       WHERE sa.id = $1`,
+      [activityId, objectiveId],
+    );
+
+    const activityDescription =
+      activityRows[0]?.activityDescription ||
+      instructions ||
+      "Performance Indicator";
+
+    const objectiveTitle = activityRows[0]?.objectiveTitle || undefined;
+
+    // Fire-and-forget email — does not block the response
+    resolveRecipients(assignee, type)
+      .then(({ emails, displayName }: { emails: string[]; displayName: string }) => {
+        emails.forEach((email: string) =>
+          sendMail({
+            to: email,
+            subject: "New Performance Indicator Assigned",
+            html: taskAssignedTemplate(
+              displayName,
+              activityDescription,
+              cycle,
+              activeQuarter || 1,
+              new Date().getFullYear(),
+              parsedDeadline.toDateString(),
+              objectiveTitle,
+              target ?? 100,
+              unit || "%",
+            ),
+          }).catch((e) =>
+            console.error(`[createIndicator] Failed to send assignment email to ${email}:`, e),
           ),
-        }),
-      );
-    }).catch(err => console.error("Email dispatch failed:", err));
+        );
+      })
+      .catch((err) => console.error("[createIndicator] resolveRecipients failed:", err));
 
     res.status(201).json({ success: true, data: indicatorRows[0] });
   },

@@ -14,6 +14,7 @@ import {
  * Fetches full indicator detail with camelCase aliases and grouped submissions.
  * Handles both quarterly and annual reporting cycles appropriately.
  * Includes document descriptions and metadata.
+ * Supports both User and Team assignees via COALESCE on name.
  */
 const INDICATOR_DETAIL_QUERY = `
   SELECT
@@ -25,8 +26,8 @@ const INDICATOR_DETAIL_QUERY = `
     i.activity_id         AS "activityId",
     i.assignee_id         AS "assigneeId",
     i.updated_at          AS "updatedAt",
-    u.name                AS "assigneeName",
-    u.email               AS "assigneeEmail",
+    COALESCE(u.name, t.name)   AS "assigneeName",
+    COALESCE(u.email, t.email) AS "assigneeEmail",
     u.pj_number           AS "pjNumber",
     ab.name               AS "assignedByName",
     sp.perspective,
@@ -102,8 +103,9 @@ const INDICATOR_DETAIL_QUERY = `
     ) AS submissions
 
   FROM indicators i
-  LEFT JOIN users u        ON i.assignee_id = u.id AND i.assignee_model = 'User'
-  LEFT JOIN users ab       ON i.assigned_by = ab.id
+  LEFT JOIN users u         ON i.assignee_id = u.id  AND i.assignee_model = 'User'
+  LEFT JOIN teams t         ON i.assignee_id = t.id  AND i.assignee_model = 'Team'
+  LEFT JOIN users ab        ON i.assigned_by = ab.id
   LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
 `;
 
@@ -287,7 +289,11 @@ export const fetchIndicatorsForAdmin = asyncHandler(
 
     if (search) {
       values.push(`%${search}%`);
-      whereClause += ` AND (u.name ILIKE $${values.length} OR u.pj_number ILIKE $${values.length})`;
+      whereClause += ` AND (
+        u.name    ILIKE $${values.length} OR
+        t.name    ILIKE $${values.length} OR
+        u.pj_number ILIKE $${values.length}
+      )`;
     }
 
     const { rows } = await pool.query(
@@ -351,16 +357,17 @@ export const adminReviewProcess = asyncHandler(
     try {
       await client.query("BEGIN");
 
-      // Fetch indicator + assignee details
+      // Fetch indicator + assignee details (supports both User and Team assignees)
       const { rows: indRows } = await client.query(
         `SELECT
            i.*,
            i.active_quarter  AS "activeQuarter",
            i.reporting_cycle AS "reportingCycle",
-           u.name,
-           u.email
+           COALESCE(u.name, t.name)   AS name,
+           COALESCE(u.email, t.email) AS email
          FROM indicators i
-         JOIN users u ON i.assignee_id = u.id
+         LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+         LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
          WHERE i.id = $1
          FOR UPDATE`,
         [id]
@@ -385,10 +392,10 @@ export const adminReviewProcess = asyncHandler(
         }
       }
 
-      // A rejected document overrides an "Verified" decision
+      // A rejected document overrides a "Verified" decision
       const finalDecision = hasRejectedDocument ? "Rejected" : decision;
       const isVerified    = finalDecision === "Verified";
-      let newStatus       = isVerified ? "Awaiting Super Admin" : "Rejected by Admin";
+      const newStatus     = isVerified ? "Awaiting Super Admin" : "Rejected by Admin";
 
       // Update indicator status
       await client.query(
@@ -433,7 +440,7 @@ export const adminReviewProcess = asyncHandler(
       const year      = new Date().getFullYear();
 
       if (isVerified) {
-        const { rows: superAdmins } = await client.query(
+        const { rows: superAdmins } = await pool.query(
           `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`
         );
 

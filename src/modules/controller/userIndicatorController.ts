@@ -437,7 +437,6 @@ export const UserIndicatorController = {
   }),
 
   // ── 3. Submit progress (first-time for a given quarter) ───────────────────
- // ── 3. Submit progress (first-time for a given quarter) ───────────────────
 submitProgress: asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const { quarter, year, achievedValue, notes, descriptions } = req.body;
@@ -462,10 +461,15 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     throw new AppError("Invalid quarter or year format", 400);
   }
 
-  // Fetch indicator details
+  // Fetch indicator details — include activity description and unit for emails
   const { rows: indicatorRows } = await pool.query(
-    `SELECT i.*, i.reporting_cycle AS "reportingCycle", i.assignee_id AS "assigneeId"
+    `SELECT
+       i.*,
+       i.reporting_cycle  AS "reportingCycle",
+       i.assignee_id      AS "assigneeId",
+       sa.description     AS "activityDescription"
      FROM indicators i
+     LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
      WHERE i.id = $1`,
     [id]
   );
@@ -511,10 +515,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
 
     if (existingSubmissions.length > 0) {
       const existing = existingSubmissions[0];
-      
-      // ✅ REMOVED THE RESTRICTION - Allow resubmission regardless of status
-      // No more "Cannot resubmit while under review" error
-      
+
       isResubmission = true;
       const newResubmissionCount = existing.resubmission_count + 1;
       
@@ -535,7 +536,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
       
       submissionId = updated[0].id;
       
-      // ✅ OPTION 1: Replace all documents (clear old ones)
+      // Replace all documents (clear old ones)
       const deletedDocs = await client.query(
         `DELETE FROM submission_documents
          WHERE submission_id = $1
@@ -595,9 +596,14 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
 
     await client.query("COMMIT");
 
-    // Send alerts (fire and forget)
+    // Send alerts (fire and forget) — pass achievedValue for richer emails
     const user = getAuthUser(req);
-    UserIndicatorController._sendAlerts(user, indicator, quarterNum).catch((e) =>
+    UserIndicatorController._sendAlerts(
+      user,
+      indicator,
+      quarterNum,
+      Number(achievedValue) || 0,
+    ).catch((e) =>
       console.error("[submitIndicatorProgress] Mail Error:", e)
     );
 
@@ -962,7 +968,8 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
     }
   }),
 
-  // ── 7. Delete a rejected document ─────────────────────────────────────────
+
+    // ── 7. Delete a rejected document ─────────────────────────────────────────
   deleteDocument: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const { docId } = req.params;
@@ -1119,30 +1126,44 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── Internal: send email alerts after a submission ────────────────────────
-  _sendAlerts: async (
+ _sendAlerts: async (
     user: IUser,
     indicator: Record<string, unknown>,
     quarter: number,
+    achievedValue?: number,
   ): Promise<void> => {
     const year = new Date().getFullYear();
     const cycle = (indicator.reporting_cycle as string) ?? "Quarterly";
     const label = quarter === 0 ? "Annual" : `Q${quarter}`;
 
+    // Resolve activity description from whichever field is available
+    const activityDescription =
+      (indicator.activityDescription as string) ||
+      (indicator.activity as any)?.description ||
+      (indicator.instructions as string) ||
+      "Performance Indicator";
+
+    const unit = (indicator.unit as string) || "%";
+
+    // ── User confirmation email ──────────────────────────────────────────────
     await sendMail({
       to: user.email,
-      subject: `Filing Confirmation: ${label}`,
+      subject: `Filing Confirmation: ${label} ${year}`,
       html: submissionReceivedTemplate(
         user.name,
-        (indicator.instructions as string) ?? "Indicator",
+        activityDescription,
         cycle,
         quarter,
         year,
+        achievedValue,
+        unit,
       ),
     }).catch((e) => {
       console.error("[_sendAlerts] Failed to send user confirmation:", e);
       throw e;
     });
 
+    // ── Admin notification emails ────────────────────────────────────────────
     const admins = await pool.query(
       `SELECT email, name FROM users WHERE role = 'admin' AND is_active = true`,
     );
@@ -1152,14 +1173,16 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
         (admins.rows as Array<{ email: string; name: string }>).map((admin) =>
           sendMail({
             to: admin.email,
-            subject: "Filing Awaiting Review",
+            subject: `Filing Awaiting Review: ${label} ${year}`,
             html: adminReviewNeededTemplate(
               admin.name,
               user.name,
-              (indicator.instructions as string) ?? "Indicator",
+              activityDescription,
               cycle,
               quarter,
               year,
+              achievedValue,
+              unit,
             ),
           }).catch((e) =>
             console.error(`[_sendAlerts] Failed to notify admin ${admin.email}:`, e),

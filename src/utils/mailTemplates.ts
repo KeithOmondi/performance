@@ -1,10 +1,16 @@
+import { env } from "../config/env";
+
 const brandName = "Performance Management System";
-const brandColor = "#2563EB";
+const brandColor = "#1d3331";
+const DASHBOARD_URL = env.FRONTEND_URL || "";
 
 const baseLayout = (content: string) => `
   <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff;">
     <div style="background: ${brandColor}; padding: 24px 32px;">
-      <h1 style="color: #ffffff; margin: 0; font-size: 20px;">${brandName}</h1>
+      <h1 style="color: #ffffff; margin: 0; font-size: 20px; letter-spacing: 0.05em;">${brandName}</h1>
+      <p style="color: rgba(255,255,255,0.6); margin: 4px 0 0 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em;">
+        Office of the Registrar, High Court
+      </p>
     </div>
     <div style="padding: 32px; border: 1px solid #e5e7eb; border-top: none;">
       ${content}
@@ -17,24 +23,39 @@ const baseLayout = (content: string) => `
   </div>
 `;
 
+const ctaButton = (label: string, url: string) => `
+  <div style="text-align: center; margin: 28px 0;">
+    <a href="${url}"
+       style="background: ${brandColor}; color: #ffffff; padding: 14px 32px; border-radius: 8px;
+              text-decoration: none; font-size: 13px; font-weight: bold; letter-spacing: 0.05em;
+              display: inline-block;">
+      ${label}
+    </a>
+  </div>
+`;
+
+const infoTable = (rows: [string, string][]) => `
+  <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+    ${rows.map(([label, value]) => `
+      <tr>
+        <td style="padding: 10px 12px; background: #f3f4f6; font-weight: bold; width: 40%; font-size: 12px; text-transform: uppercase; color: #6b7280; border-bottom: 1px solid #e5e7eb;">${label}</td>
+        <td style="padding: 10px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #111827;">${value}</td>
+      </tr>
+    `).join("")}
+  </table>
+`;
+
 /**
- * Helper to format the period string.
- * Logic: 
- * 1. If cycle is 'Annual', ignore quarter and return 'Annual'.
- * 2. If quarter is already formatted (e.g., 'Q1'), return it.
- * 3. Otherwise, prepend 'Q'.
+ * Formats the reporting period into a human-readable string.
  */
-const formatPeriod = (cycle: string, quarter: string | number) => {
-  if (cycle?.toLowerCase() === 'annual') {
-    return 'Annual';
-  }
-  if (typeof quarter === 'string' && quarter.startsWith('Q')) {
-    return quarter;
-  }
+const formatPeriod = (cycle: string, quarter: string | number): string => {
+  if (cycle?.toLowerCase() === "annual") return "Annual";
+  if (typeof quarter === "string" && quarter.toUpperCase().startsWith("Q")) return quarter;
   return `Q${quarter}`;
 };
 
-// ─── OTP / Login ───────────────────────────────────────────────────────────
+// ─── OTP / Login ──────────────────────────────────────────────────────────────
+
 export const otpTemplate = (name: string, otp: string) =>
   baseLayout(`
     <h2 style="color: #111827; margin-top: 0;">Hello, ${name}</h2>
@@ -46,66 +67,73 @@ export const otpTemplate = (name: string, otp: string) =>
     <p style="color: #6b7280; font-size: 13px;">If you didn't request this code, please contact your administrator immediately.</p>
   `);
 
-// ─── Task Assignment ────────────────────────────
+// ─── Task Assignment ──────────────────────────────────────────────────────────
+
 export const taskAssignedTemplate = (
   name: string,
-  taskTitle: string,
+  activityDescription: string,
   reportingCycle: string,
   quarter: string | number,
   year: number,
   deadline: string,
+  objective?: string,
+  target?: number,
+  unit?: string,
 ) =>
   baseLayout(`
-    <h2 style="color: #111827; margin-top: 0;">New Task Assigned</h2>
-    <p style="color: #374151;">Hello <strong>${name}</strong>, you have been assigned a new performance indicator task.</p>
-    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold; width: 40%;">Task</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${taskTitle}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Deadline</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${deadline}</td>
-      </tr>
-    </table>
-    <p style="color: #374151;">Please log in to the system to view and submit your task.</p>
+    <h2 style="color: #111827; margin-top: 0;">New Performance Indicator Assigned</h2>
+    <p style="color: #374151;">Hello <strong>${name}</strong>, you have been assigned a new performance indicator. Please review the details below and submit your progress before the deadline.</p>
+
+    ${infoTable([
+      ["Objective", objective || "See dashboard"],
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Reporting Cycle", reportingCycle],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ["Target", target !== undefined ? `${target} ${unit || "%"}` : "See dashboard"],
+      ["Deadline", deadline],
+    ])}
+
+    ${ctaButton("View My Dashboard", `${DASHBOARD_URL}/user/dashboard`)}
+
+    <p style="color: #6b7280; font-size: 13px;">
+      Log in to the system to view full details and submit your progress report before the deadline.
+    </p>
   `);
 
-// ─── Submission Received ──────
+// ─── Submission Received ──────────────────────────────────────────────────────
+
 export const submissionReceivedTemplate = (
   name: string,
-  taskTitle: string,
+  activityDescription: string,
   reportingCycle: string,
   quarter: string | number,
   year: number,
+  achievedValue?: number,
+  unit?: string,
 ) =>
   baseLayout(`
-    <h2 style="color: #111827; margin-top: 0;">Submission Received ✅</h2>
-    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been received and is now pending review.</p>
-    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold; width: 40%;">Task</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${taskTitle}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Status</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb; color: #d97706;">Pending Admin Review</td>
-      </tr>
-    </table>
+    <h2 style="color: #111827; margin-top: 0;">Filing Confirmation ✅</h2>
+    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been received and is now pending admin review.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ...(achievedValue !== undefined ? [["Reported Value", `${achievedValue} ${unit || "%"}`] as [string, string]] : []),
+      ["Status", "Pending Admin Review"],
+    ])}
+
+    ${ctaButton("View My Submissions", `${DASHBOARD_URL}/user/dashboard`)}
+
+    <p style="color: #6b7280; font-size: 13px;">
+      You will be notified once an admin has reviewed your submission. No further action is required at this time.
+    </p>
   `);
 
-// ─── Submission Rejected ──────────────────
+// ─── Submission Rejected ──────────────────────────────────────────────────────
+
 export const submissionRejectedTemplate = (
   name: string,
-  taskTitle: string,
+  activityDescription: string,
   reportingCycle: string,
   quarter: string | number,
   year: number,
@@ -113,78 +141,84 @@ export const submissionRejectedTemplate = (
   reason: string,
 ) =>
   baseLayout(`
-    <h2 style="color: #dc2626; margin-top: 0;">Submission Rejected ❌</h2>
-    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been reviewed and returned for corrections.</p>
-    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold; width: 40%;">Task</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${taskTitle}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
-      </tr>
-    </table>
+    <h2 style="color: #dc2626; margin-top: 0;">Submission Returned for Correction ❌</h2>
+    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been reviewed by a ${rejectedBy} and returned for corrections. Please address the issues noted below and resubmit.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ["Reviewed By", rejectedBy],
+      ["Action Required", "Resubmission Required"],
+    ])}
+
     <div style="background: #fef2f2; border-left: 4px solid #dc2626; padding: 16px; margin: 20px 0; border-radius: 4px;">
-      <strong style="color: #dc2626;">Reason for Rejection:</strong>
-      <p style="color: #374151; margin: 8px 0 0 0;">${reason}</p>
+      <strong style="color: #dc2626; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;">Reason for Return:</strong>
+      <p style="color: #374151; margin: 8px 0 0 0; font-size: 14px;">${reason}</p>
     </div>
+
+    ${ctaButton("Resubmit Now", `${DASHBOARD_URL}/user/dashboard`)}
+
+    <p style="color: #6b7280; font-size: 13px;">
+      Please log in to review the detailed feedback, make the necessary corrections, and resubmit your progress report.
+    </p>
   `);
 
-// ─── Submission Approved ────────────────────
+// ─── Submission Approved ──────────────────────────────────────────────────────
+
 export const submissionApprovedTemplate = (
   name: string,
-  taskTitle: string,
+  activityDescription: string,
   reportingCycle: string,
   quarter: string | number,
   year: number,
+  achievedValue?: number,
+  unit?: string,
 ) =>
   baseLayout(`
     <h2 style="color: #16a34a; margin-top: 0;">Submission Approved ✅</h2>
-    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been fully approved.</p>
-    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold; width: 40%;">Task</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${taskTitle}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
-      </tr>
-    </table>
+    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been fully approved and certified.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ...(achievedValue !== undefined ? [["Certified Value", `${achievedValue} ${unit || "%"}`] as [string, string]] : []),
+      ["Status", "Approved & Certified"],
+    ])}
+
+    ${ctaButton("View Approved Submissions", `${DASHBOARD_URL}/user/dashboard`)}
   `);
 
-// ─── Admin Review Needed ────────────────
+// ─── Admin Review Needed ──────────────────────────────────────────────────────
+
 export const adminReviewNeededTemplate = (
   adminName: string,
   submittedBy: string,
-  taskTitle: string,
+  activityDescription: string,
   reportingCycle: string,
   quarter: string | number,
   year: number,
+  achievedValue?: number,
+  unit?: string,
 ) =>
   baseLayout(`
     <h2 style="color: #111827; margin-top: 0;">New Submission Awaiting Your Review</h2>
     <p style="color: #374151;">Hello <strong>${adminName}</strong>, a new submission is pending your review.</p>
-    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold; width: 40%;">Submitted By</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${submittedBy}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Task</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${taskTitle}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
-      </tr>
-    </table>
+
+    ${infoTable([
+      ["Submitted By", submittedBy],
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ...(achievedValue !== undefined ? [["Reported Value", `${achievedValue} ${unit || "%"}`] as [string, string]] : []),
+      ["Action Required", "Admin Review"],
+    ])}
+
+    ${ctaButton("Review Submission", `${DASHBOARD_URL}/admin/reviews`)}
   `);
 
-// ─── SuperAdmin Review Needed ───
+// ─── SuperAdmin Review Needed ─────────────────────────────────────────────────
+
 export const superAdminReviewNeededTemplate = (
-  taskTitle: string,
+  activityDescription: string,
   submittedBy: string,
   approvedByAdmin: string,
   reportingCycle: string,
@@ -193,29 +227,20 @@ export const superAdminReviewNeededTemplate = (
 ) =>
   baseLayout(`
     <h2 style="color: #111827; margin-top: 0;">Submission Ready for Final Approval</h2>
-    <p style="color: #374151;">A submission has been approved by an Admin and is awaiting your final approval.</p>
-    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold; width: 40%;">Task</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${taskTitle}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Submitted By</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${submittedBy}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Admin Approved By</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${approvedByAdmin}</td>
-      </tr>
-      <tr>
-        <td style="padding: 10px; background: #f3f4f6; font-weight: bold;">Period</td>
-        <td style="padding: 10px; border-bottom: 1px solid #e5e7eb;">${formatPeriod(reportingCycle, quarter)} ${year}</td>
-      </tr>
-    </table>
+    <p style="color: #374151;">A submission has been verified by an Admin and is awaiting your final approval.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Submitted By", submittedBy],
+      ["Admin Verified By", approvedByAdmin],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ["Action Required", "Super Admin Final Approval"],
+    ])}
+
+    ${ctaButton("Review & Approve", `${DASHBOARD_URL}/admin/reviews`)}
   `);
 
-
-// Add these two to your existing mailTemplates file
+// ─── Task Due Today ───────────────────────────────────────────────────────────
 
 export const taskDueTodayTemplate = (
   recipientName: string,
@@ -225,20 +250,28 @@ export const taskDueTodayTemplate = (
   year: number,
   target: number,
   unit: string,
-): string => `
-  <div style="font-family: sans-serif; max-width: 600px; margin: auto;">
-    <h2 style="color: #c0392b;">⚠️ Task Due Today</h2>
-    <p>Dear <strong>${recipientName}</strong>,</p>
-    <p>Your assigned indicator is due <strong>today</strong>. Please submit your progress immediately if you haven't already.</p>
-    <table style="width:100%; border-collapse:collapse; margin: 16px 0;">
-      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Activity</td><td style="padding:8px;">${activityDescription}</td></tr>
-      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Period</td><td style="padding:8px;">${reportingCycle === "Annual" ? "Annual" : `Q${quarter}`} ${year}</td></tr>
-      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Target</td><td style="padding:8px;">${target} ${unit}</td></tr>
-    </table>
-    <p style="color:#c0392b; font-weight:bold;">Failure to submit today may result in your filing being marked as overdue.</p>
-    <p>Please log in to the system to submit your progress report.</p>
-  </div>
-`;
+): string =>
+  baseLayout(`
+    <h2 style="color: #c0392b; margin-top: 0;">⚠️ Task Due Today</h2>
+    <p style="color: #374151;">Dear <strong>${recipientName}</strong>, your assigned indicator is due <strong>today</strong>. Please submit your progress immediately if you haven't already.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ["Target", `${target} ${unit}`],
+      ["Status", "Due Today — Action Required"],
+    ])}
+
+    <div style="background: #fef2f2; border-left: 4px solid #c0392b; padding: 16px; margin: 20px 0; border-radius: 4px;">
+      <p style="color: #c0392b; font-weight: bold; margin: 0;">
+        Failure to submit today may result in your filing being marked as overdue.
+      </p>
+    </div>
+
+    ${ctaButton("Submit Now", `${DASHBOARD_URL}/user/dashboard`)}
+  `);
+
+// ─── Task Due Soon ────────────────────────────────────────────────────────────
 
 export const taskDueSoonTemplate = (
   recipientName: string,
@@ -249,16 +282,21 @@ export const taskDueSoonTemplate = (
   target: number,
   unit: string,
   daysLeft: number,
-): string => `
-  <div style="font-family: sans-serif; max-width: 600px; margin: auto;">
-    <h2 style="color: #e67e22;">🔔 Reminder: Task Due in ${daysLeft} Day${daysLeft > 1 ? "s" : ""}</h2>
-    <p>Dear <strong>${recipientName}</strong>,</p>
-    <p>This is a reminder that your assigned indicator is due in <strong>${daysLeft} day${daysLeft > 1 ? "s" : ""}</strong>.</p>
-    <table style="width:100%; border-collapse:collapse; margin: 16px 0;">
-      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Activity</td><td style="padding:8px;">${activityDescription}</td></tr>
-      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Period</td><td style="padding:8px;">${reportingCycle === "Annual" ? "Annual" : `Q${quarter}`} ${year}</td></tr>
-      <tr><td style="padding:8px; background:#f5f5f5; font-weight:bold;">Target</td><td style="padding:8px;">${target} ${unit}</td></tr>
-    </table>
-    <p>Please log in to the system to prepare and submit your progress report before the deadline.</p>
-  </div>
-`;
+): string =>
+  baseLayout(`
+    <h2 style="color: #e67e22; margin-top: 0;">🔔 Reminder: Task Due in ${daysLeft} Day${daysLeft > 1 ? "s" : ""}</h2>
+    <p style="color: #374151;">Dear <strong>${recipientName}</strong>, this is a reminder that your assigned indicator is due in <strong>${daysLeft} day${daysLeft > 1 ? "s" : ""}</strong>.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ["Target", `${target} ${unit}`],
+      ["Deadline", `${daysLeft} day${daysLeft > 1 ? "s" : ""} remaining`],
+    ])}
+
+    ${ctaButton("Submit Progress Report", `${DASHBOARD_URL}/user/dashboard`)}
+
+    <p style="color: #6b7280; font-size: 13px;">
+      Please log in to prepare and submit your progress report before the deadline.
+    </p>
+  `);
