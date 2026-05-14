@@ -437,146 +437,184 @@ export const UserIndicatorController = {
   }),
 
   // ── 3. Submit progress (first-time for a given quarter) ───────────────────
-  //
-  // Sending `quarter` in the body lets users submit Q2 while Q1 is still
-  // pending review — the body value always takes priority over active_quarter.
-  submitProgress: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
-    const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-    const { notes, achievedValue, descriptions, idempotencyKey, quarter } = req.body;
-    const files = (req.files ?? []) as Express.Multer.File[];
+ // ── 3. Submit progress (first-time for a given quarter) ───────────────────
+submitProgress: asyncHandler(async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { quarter, year, achievedValue, notes, descriptions } = req.body;
+  const files = (req.files ?? []) as Express.Multer.File[];
+  const userId = (req as any).user?.id;
 
-    if (!indicatorId) throw new AppError("Indicator ID is required.", 400);
+  // Validate required fields
+  if (!quarter || !year) {
+    throw new AppError("Quarter and year are required", 400);
+  }
 
-    const validated = validateSubmissionInput(notes, achievedValue);
+  // Validate files if provided
+  if (files.length > 0) {
     validateFiles(files);
+  }
 
-    const teamIds = await getUserTeamIds(user.id);
-    const client = await pool.connect();
-    let submissionId: string | null = null;
+  // Parse quarter as integer
+  const quarterNum = parseInt(quarter, 10);
+  const yearNum = parseInt(year, 10);
 
-    try {
-      await client.query("BEGIN");
+  if (isNaN(quarterNum) || isNaN(yearNum)) {
+    throw new AppError("Invalid quarter or year format", 400);
+  }
 
-      const requestId = idempotencyKey || generateIdempotencyKey();
-      if (await checkIdempotency(client, requestId)) {
-        await client.query("ROLLBACK");
-        return res.status(200).json({
-          success: true,
-          message: "Duplicate request ignored",
-          idempotent: true,
-        });
-      }
+  // Fetch indicator details
+  const { rows: indicatorRows } = await pool.query(
+    `SELECT i.*, i.reporting_cycle AS "reportingCycle", i.assignee_id AS "assigneeId"
+     FROM indicators i
+     WHERE i.id = $1`,
+    [id]
+  );
 
-      const indRes = await client.query(
-        "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",
-        [indicatorId],
-      );
-      if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
-      const indicator = indRes.rows[0] as Record<string, unknown>;
+  if (!indicatorRows[0]) {
+    throw new AppError("Indicator not found", 404);
+  }
 
-      await assertIndicatorOwnership(client, indicator, user.id, teamIds);
+  const indicator = indicatorRows[0];
 
-      if (indicator.status === "Completed")
-        throw new AppError("Cannot submit: this indicator has been marked as completed.", 409);
+  // Verify user is the assignee
+  if (indicator.assigneeId !== userId) {
+    throw new AppError("You are not authorized to submit for this indicator", 403);
+  }
 
-      // Body quarter takes priority over active_quarter — allows submitting Q2
-      // independently while Q1 is still pending review.
-      const targetQuarter = resolveTargetQuarter(indicator, quarter);
-
-      // Guard only against THIS quarter being locked — other quarters are irrelevant.
-      const existingQuarterSub = await client.query(
-        `SELECT review_status FROM submissions
-         WHERE indicator_id = $1 AND quarter = $2
-         LIMIT 1`,
-        [indicatorId, targetQuarter],
-      );
-      const quarterStatus = existingQuarterSub.rows[0]?.review_status as string | undefined;
-
-      if (quarterStatus === "Pending")
-        throw new AppError(
-          `${quarterLabel(targetQuarter)} already has a submission awaiting review. Use resubmit instead.`,
-          409,
-        );
-
-      if (quarterStatus === "Accepted")
-        throw new AppError(
-          `${quarterLabel(targetQuarter)} has already been accepted and cannot be resubmitted.`,
-          409,
-        );
-
-      // Row-level lock guards against concurrent duplicate submissions.
-      await validateIndicatorSubmissionState(client, indicatorId, targetQuarter, "submit");
-
-      let newDocs: Awaited<ReturnType<typeof uploadDocumentsWithRetry>> = [];
-      if (files.length > 0)
-        newDocs = await uploadDocumentsWithRetry(files, descriptions || []);
-
-      const newSub = await client.query(
-        `INSERT INTO submissions
-           (indicator_id, quarter, year, notes, achieved_value, review_status, idempotency_key)
-         VALUES ($1, $2, $3, $4, $5, 'Pending', $6)
-         RETURNING id`,
-        [
-          indicatorId,
-          targetQuarter,
-          new Date().getFullYear(),
-          validated.notes,
-          validated.achievedValue,
-          requestId,
-        ],
-      );
-      submissionId = newSub.rows[0].id as string;
-
-      if (newDocs.length > 0) {
-        await Promise.all(
-          newDocs.map((doc) =>
-            client.query(
-              `INSERT INTO submission_documents
-                 (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
-               VALUES ($1, $2, $3, $4, $5, $6)`,
-              [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
-            ),
-          ),
-        );
-      }
-
-      await client.query(
-        `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
-         VALUES ($1, 'Submitted', $2, 'user', $3)`,
-        [indicatorId, `Filing for ${quarterLabel(targetQuarter)}`, user.id],
-      );
-
-      await storeIdempotencyKey(client, requestId);
-      await client.query("COMMIT");
-
-      // Fire-and-forget — do not block the response.
-      Promise.all([
-        IndicatorService.syncIndicatorState(indicatorId).catch((e) =>
-          console.error("[submitProgress] syncIndicatorState failed:", e),
-        ),
-        UserIndicatorController._sendAlerts(user, indicator, targetQuarter).catch((e) =>
-          console.error("[submitProgress] Mail Error:", e),
-        ),
-      ]);
-
-      res.status(201).json({
-        success: true,
-        message: "Filing submitted successfully.",
-        submissionId,
-      });
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
+  // Validate quarter based on reporting cycle
+  if (indicator.reportingCycle === "Annual") {
+    if (quarterNum !== 1) {
+      throw new AppError("Annual submissions must use quarter 1", 400);
     }
-  }),
+  } else {
+    if (quarterNum < 1 || quarterNum > 4) {
+      throw new AppError("Quarter must be between 1 and 4 for quarterly indicators", 400);
+    }
+  }
+
+  const client = await pool.connect();
+  
+  try {
+    await client.query("BEGIN");
+
+    // Check if a submission already exists for this period
+    const { rows: existingSubmissions } = await client.query(
+      `SELECT id, review_status, resubmission_count 
+       FROM submissions 
+       WHERE indicator_id = $1 AND quarter = $2 AND year = $3
+       FOR UPDATE`,
+      [id, quarterNum, yearNum]
+    );
+
+    let submissionId: string;
+    let isResubmission = false;
+
+    if (existingSubmissions.length > 0) {
+      const existing = existingSubmissions[0];
+      
+      // ✅ REMOVED THE RESTRICTION - Allow resubmission regardless of status
+      // No more "Cannot resubmit while under review" error
+      
+      isResubmission = true;
+      const newResubmissionCount = existing.resubmission_count + 1;
+      
+      // Update the existing submission
+      const { rows: updated } = await client.query(
+        `UPDATE submissions
+         SET achieved_value = $1, 
+             notes = $2, 
+             review_status = 'Pending', 
+             is_reviewed = false, 
+             resubmission_count = $3, 
+             submitted_at = NOW(),
+             admin_comment = NULL
+         WHERE id = $4
+         RETURNING id`,
+        [achievedValue || 0, notes || "-", newResubmissionCount, existing.id]
+      );
+      
+      submissionId = updated[0].id;
+      
+      // ✅ OPTION 1: Replace all documents (clear old ones)
+      const deletedDocs = await client.query(
+        `DELETE FROM submission_documents
+         WHERE submission_id = $1
+         RETURNING evidence_public_id`,
+        [submissionId]
+      );
+      
+      // Clean up old Cloudinary files
+      const oldPublicIds = (deletedDocs.rows as Array<{ evidence_public_id: string }>)
+        .map((r) => r.evidence_public_id)
+        .filter(Boolean);
+      
+      if (oldPublicIds.length > 0) {
+        cleanupOldDocuments(oldPublicIds).catch((e) =>
+          console.error("[submitIndicatorProgress] Document cleanup failed:", e)
+        );
+      }
+    } else {
+      // Insert new submission
+      const { rows: inserted } = await client.query(
+        `INSERT INTO submissions (indicator_id, quarter, year, achieved_value, notes, review_status)
+         VALUES ($1, $2, $3, $4, $5, 'Pending')
+         RETURNING id`,
+        [id, quarterNum, yearNum, achievedValue || 0, notes || "-"]
+      );
+      
+      submissionId = inserted[0].id;
+    }
+
+    // Upload and save new documents
+    if (files.length > 0) {
+      const descArr = Array.isArray(descriptions)
+        ? descriptions
+        : descriptions
+          ? [descriptions]
+          : [];
+      
+      const uploadedDocs = await uploadDocumentsWithRetry(files, descArr);
+      
+      for (const doc of uploadedDocs) {
+        await client.query(
+          `INSERT INTO submission_documents
+           (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description]
+        );
+      }
+    }
+
+    // Update indicator status
+    await client.query(
+      `UPDATE indicators 
+       SET status = 'Awaiting Admin Approval', updated_at = NOW()
+       WHERE id = $1`,
+      [id]
+    );
+
+    await client.query("COMMIT");
+
+    // Send alerts (fire and forget)
+    const user = getAuthUser(req);
+    UserIndicatorController._sendAlerts(user, indicator, quarterNum).catch((e) =>
+      console.error("[submitIndicatorProgress] Mail Error:", e)
+    );
+
+    res.status(201).json({
+      success: true,
+      message: isResubmission ? "Resubmission successful" : "Submission successful",
+      data: { submissionId, isResubmission, quarter: quarterNum, year: yearNum }
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}),
 
   // ── 4. Resubmit progress (existing submission only) ───────────────────────
-  //
-  // Sending `quarter` in the body lets users target a specific quarter
-  // for resubmission, independent of the indicator's active_quarter.
   resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;

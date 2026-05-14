@@ -11,9 +11,9 @@ import {
 // ─── Shared Query Base ────────────────────────────────────────────────────────
 
 /**
- * Fetches full indicator detail with camelCase aliases and quarterly-grouped
- * submissions. Each quarter key (e.g. "Q1_2025") maps to an array of that
- * quarter's submissions sorted newest-first (resubmissions on top).
+ * Fetches full indicator detail with camelCase aliases and grouped submissions.
+ * Handles both quarterly and annual reporting cycles appropriately.
+ * Includes document descriptions and metadata.
  */
 const INDICATOR_DETAIL_QUERY = `
   SELECT
@@ -43,13 +43,16 @@ const INDICATOR_DETAIL_QUERY = `
       WHERE id = i.activity_id
     ) AS activity,
 
-    -- Submissions grouped into quarterly folders: { "Q1_2025": [...], "Q2_2025": [...] }
+    -- Submissions grouped appropriately based on reporting cycle
     COALESCE(
       (
-        SELECT json_object_agg(quarter_key, quarter_submissions)
+        SELECT json_object_agg(period_key, period_submissions)
         FROM (
           SELECT
-            CONCAT(s.quarter, '_', s.year) AS quarter_key,
+            CASE 
+              WHEN i.reporting_cycle = 'Annual' THEN 'Annual_' || s.year
+              ELSE CONCAT('Q', s.quarter, '_', s.year)
+            END AS period_key,
             json_agg(
               json_build_object(
                 'id',                s.id,
@@ -64,35 +67,212 @@ const INDICATOR_DETAIL_QUERY = `
                 'submittedAt',       s.submitted_at,
                 'isReviewed',        s.is_reviewed,
                 'documents', (
-                  SELECT json_agg(json_build_object(
-                    'id',               d.id,
-                    'submissionId',     d.submission_id,
-                    'evidenceUrl',      d.evidence_url,
-                    'evidencePublicId', d.evidence_public_id,
-                    'fileType',         d.file_type,
-                    'fileName',         d.file_name,
-                    'uploadedAt',       d.uploaded_at
-                  ))
+                  SELECT COALESCE(
+                    json_agg(
+                      json_build_object(
+                        'id',               d.id,
+                        'submissionId',     d.submission_id,
+                        'evidenceUrl',      d.evidence_url,
+                        'evidencePublicId', d.evidence_public_id,
+                        'fileType',         d.file_type,
+                        'fileName',         d.file_name,
+                        'description',      d.description,
+                        'status',           d.status,
+                        'rejectionReason',  d.rejection_reason,
+                        'uploadedAt',       d.uploaded_at
+                      ) ORDER BY d.uploaded_at DESC
+                    ),
+                    '[]'::json
+                  )
                   FROM submission_documents d
                   WHERE d.submission_id = s.id
                 )
               ) ORDER BY s.submitted_at DESC
-            ) AS quarter_submissions
+            ) AS period_submissions
           FROM submissions s
           WHERE s.indicator_id = i.id
-          GROUP BY s.quarter, s.year
+          GROUP BY 
+            CASE 
+              WHEN i.reporting_cycle = 'Annual' THEN 'Annual_' || s.year
+              ELSE CONCAT('Q', s.quarter, '_', s.year)
+            END
         ) grouped
       ),
-      '{}'
+      '{}'::json
     ) AS submissions
 
   FROM indicators i
-  LEFT JOIN users u        ON i.assignee_id  = u.id
-  LEFT JOIN users ab       ON i.assigned_by  = ab.id
+  LEFT JOIN users u        ON i.assignee_id = u.id AND i.assignee_model = 'User'
+  LEFT JOIN users ab       ON i.assigned_by = ab.id
   LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
 `;
 
-// ─── 1. Fetch All Indicators ──────────────────────────────────────────────────
+// ─── Helper Functions ─────────────────────────────────────────────────────────
+
+/**
+ * Validates submission quarter based on reporting cycle
+ */
+const validateSubmissionPeriod = (reportingCycle: string, quarter: number, year: number): void => {
+  if (reportingCycle === "Annual") {
+    if (quarter !== 1) {
+      throw new AppError("Annual submissions must use quarter 1", 400);
+    }
+  } else if (reportingCycle === "Quarterly") {
+    if (quarter < 1 || quarter > 4) {
+      throw new AppError("Quarter must be between 1 and 4 for quarterly indicators", 400);
+    }
+  }
+};
+
+/**
+ * Determines the next period for an indicator based on its reporting cycle
+ */
+const getNextPeriod = (currentQuarter: number, reportingCycle: string): number => {
+  if (reportingCycle === "Annual") {
+    return 1;
+  }
+  return currentQuarter + 1;
+};
+
+/**
+ * Checks if an indicator has reached its final period
+ */
+const isFinalPeriod = (currentQuarter: number, reportingCycle: string): boolean => {
+  if (reportingCycle === "Annual") {
+    return true;
+  }
+  return currentQuarter >= 4;
+};
+
+// ─── 1. Create Submission (for users) ─────────────────────────────────────────
+
+export const createSubmission = asyncHandler(async (req: Request, res: Response) => {
+  const {
+    indicatorId,
+    achievedValue,
+    notes,
+    quarter,
+    year,
+  } = req.body;
+
+  const userId = (req as any).user?.id;
+
+  if (!indicatorId || achievedValue === undefined || !year) {
+    throw new AppError("Missing required fields: indicatorId, achievedValue, year", 400);
+  }
+
+  const { rows: indicatorRows } = await pool.query(
+    `SELECT id, status, reporting_cycle, active_quarter, assignee_id 
+     FROM indicators 
+     WHERE id = $1`,
+    [indicatorId]
+  );
+
+  if (!indicatorRows[0]) {
+    throw new AppError("Indicator not found", 404);
+  }
+
+  const indicator = indicatorRows[0];
+
+  if (indicator.assignee_id !== userId) {
+    throw new AppError("You are not authorized to submit for this indicator", 403);
+  }
+
+  if (indicator.status !== "Pending") {
+    throw new AppError(`Cannot submit for indicator with status: ${indicator.status}`, 400);
+  }
+
+  let submissionQuarter = quarter;
+  if (indicator.reporting_cycle === "Annual") {
+    submissionQuarter = 1;
+  }
+
+  validateSubmissionPeriod(indicator.reporting_cycle, submissionQuarter, year);
+
+  let existingSubmissionQuery = `
+    SELECT id, review_status, resubmission_count
+    FROM submissions
+    WHERE indicator_id = $1 AND year = $2
+  `;
+  
+  const queryParams: any[] = [indicatorId, year];
+  
+  if (indicator.reporting_cycle === "Quarterly") {
+    existingSubmissionQuery += ` AND quarter = $3`;
+    queryParams.push(submissionQuarter);
+  }
+  
+  const { rows: existingSubmissions } = await pool.query(existingSubmissionQuery, queryParams);
+  
+  let submissionId: string;
+  let resubmissionCount = 0;
+  let isResubmission = false;
+
+  if (existingSubmissions.length > 0) {
+    const existing = existingSubmissions[0];
+    
+    if (existing.review_status === "Pending" || existing.review_status === "Verified") {
+      throw new AppError("Cannot resubmit while current submission is under review", 400);
+    }
+    
+    isResubmission = true;
+    resubmissionCount = existing.resubmission_count + 1;
+    
+    await pool.query(
+      `UPDATE submissions
+       SET achieved_value = $1,
+           notes = $2,
+           review_status = 'Pending',
+           is_reviewed = false,
+           resubmission_count = $3,
+           submitted_at = NOW(),
+           admin_comment = NULL
+       WHERE id = $4`,
+      [achievedValue, notes, resubmissionCount, existing.id]
+    );
+    
+    submissionId = existing.id;
+  } else {
+    const insertQuery = `
+      INSERT INTO submissions (
+        indicator_id, quarter, year, achieved_value, notes, 
+        submitted_at, review_status, resubmission_count
+      ) VALUES ($1, $2, $3, $4, $5, NOW(), 'Pending', 0)
+      RETURNING id
+    `;
+    
+    const { rows: inserted } = await pool.query(insertQuery, [
+      indicatorId,
+      submissionQuarter,
+      year,
+      achievedValue,
+      notes,
+    ]);
+    
+    submissionId = inserted[0].id;
+  }
+
+  await pool.query(
+    `UPDATE indicators
+     SET status = 'Awaiting Admin Approval', updated_at = NOW()
+     WHERE id = $1`,
+    [indicatorId]
+  );
+
+  res.status(201).json({
+    success: true,
+    message: isResubmission ? "Resubmission successful" : "Submission successful",
+    data: {
+      submissionId,
+      isResubmission,
+      resubmissionCount,
+      quarter: submissionQuarter,
+      year,
+    },
+  });
+});
+
+// ─── 2. Fetch All Indicators for Admin ────────────────────────────────────────
 
 export const fetchIndicatorsForAdmin = asyncHandler(
   async (req: Request, res: Response) => {
@@ -119,7 +299,7 @@ export const fetchIndicatorsForAdmin = asyncHandler(
   }
 );
 
-// ─── 2. Get Indicator By ID ───────────────────────────────────────────────────
+// ─── 3. Get Indicator By ID (Admin) ───────────────────────────────────────────
 
 export const getIndicatorByIdAdmin = asyncHandler(
   async (req: Request, res: Response) => {
@@ -151,7 +331,7 @@ export const getIndicatorByIdAdmin = asyncHandler(
   }
 );
 
-// ─── 3. Admin Review Process ──────────────────────────────────────────────────
+// ─── 4. Admin Review Process ──────────────────────────────────────────────────
 
 export const adminReviewProcess = asyncHandler(
   async (req: Request, res: Response) => {
@@ -208,7 +388,7 @@ export const adminReviewProcess = asyncHandler(
       // A rejected document overrides an "Verified" decision
       const finalDecision = hasRejectedDocument ? "Rejected" : decision;
       const isVerified    = finalDecision === "Verified";
-      const newStatus     = isVerified ? "Awaiting Super Admin" : "Rejected by Admin";
+      let newStatus       = isVerified ? "Awaiting Super Admin" : "Rejected by Admin";
 
       // Update indicator status
       await client.query(
@@ -253,7 +433,7 @@ export const adminReviewProcess = asyncHandler(
       const year      = new Date().getFullYear();
 
       if (isVerified) {
-        const { rows: superAdmins } = await pool.query(
+        const { rows: superAdmins } = await client.query(
           `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`
         );
 
@@ -265,8 +445,8 @@ export const adminReviewProcess = asyncHandler(
               taskTitle,
               indicator.name,
               adminName,
-              indicator.reportingCycle,
-              indicator.activeQuarter,
+              indicator.reporting_cycle,
+              indicator.active_quarter,
               year
             ),
           }).catch(console.error);
@@ -282,8 +462,8 @@ export const adminReviewProcess = asyncHandler(
           html: submissionRejectedTemplate(
             indicator.name,
             taskTitle,
-            indicator.reportingCycle,
-            indicator.activeQuarter,
+            indicator.reporting_cycle,
+            indicator.active_quarter,
             year,
             "Admin",
             comment
@@ -305,7 +485,7 @@ export const adminReviewProcess = asyncHandler(
   }
 );
 
-// ─── 4. Fetch Resubmitted Indicators ─────────────────────────────────────────
+// ─── 5. Fetch Resubmitted Indicators ─────────────────────────────────────────
 
 export const fetchResubmittedIndicators = asyncHandler(
   async (_req: Request, res: Response) => {
@@ -323,5 +503,57 @@ export const fetchResubmittedIndicators = asyncHandler(
     `);
 
     res.status(200).json({ success: true, count: rows.length, data: rows });
+  }
+);
+
+// ─── 6. Get Submissions for an Indicator ──────────────────────────────────────
+
+export const getIndicatorSubmissions = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+
+    const { rows } = await pool.query(
+      `
+      SELECT 
+        s.id,
+        s.indicator_id AS "indicatorId",
+        s.quarter,
+        s.year,
+        s.achieved_value AS "achievedValue",
+        s.notes,
+        s.review_status AS "reviewStatus",
+        s.admin_comment AS "adminComment",
+        s.resubmission_count AS "resubmissionCount",
+        s.submitted_at AS "submittedAt",
+        s.is_reviewed AS "isReviewed",
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'id',               d.id,
+                'submissionId',     d.submission_id,
+                'evidenceUrl',      d.evidence_url,
+                'evidencePublicId', d.evidence_public_id,
+                'fileType',         d.file_type,
+                'fileName',         d.file_name,
+                'description',      d.description,
+                'status',           d.status,
+                'rejectionReason',  d.rejection_reason,
+                'uploadedAt',       d.uploaded_at
+              ) ORDER BY d.uploaded_at DESC
+            )
+            FROM submission_documents d
+            WHERE d.submission_id = s.id
+          ),
+          '[]'::json
+        ) AS documents
+      FROM submissions s
+      WHERE s.indicator_id = $1
+      ORDER BY s.year DESC, s.quarter DESC
+      `,
+      [id]
+    );
+
+    res.status(200).json({ success: true, data: rows });
   }
 );

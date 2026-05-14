@@ -202,38 +202,30 @@ export const getAllIndicators = asyncHandler(
     let whereClause = "WHERE 1=1";
     const params: any[] = [];
 
-    // Filter by indicator status (e.g. "Pending", "Completed")
     if (status) {
       params.push(status);
       whereClause += ` AND i.status = $${params.length}`;
     }
 
-    // `assignee` is only safe to bind against assignee_id when it's an actual UUID.
-    // The frontend also sends intent strings like "assigned", "unassigned", "review" —
-    // these must be translated to structural WHERE conditions, never bound as UUIDs.
     if (assignee) {
       if (isUUID(assignee as string)) {
-        // Specific user/team UUID — filter to that exact assignee
         params.push(assignee);
         whereClause += ` AND i.assignee_id = $${params.length}`;
       } else {
-        // Intent-based filter strings
         switch ((assignee as string).toLowerCase()) {
           case "assigned":
-            whereClause += ` AND i.assignee_id IS NOT NULL`;
+            whereClause += ` AND i.assignee_id IS NOT NULL AND i.status != 'Unassigned'`;
             break;
           case "unassigned":
-            whereClause += ` AND i.assignee_id IS NULL`;
+            whereClause += ` AND (i.assignee_id IS NULL OR i.status = 'Unassigned')`;
             break;
           case "review":
             whereClause += ` AND i.status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')`;
             break;
-          // Add further cases here as needed; unknown strings are ignored safely
         }
       }
     }
 
-    // Filter by assignee model type ("User" or "Team")
     if (assignmentType) {
       params.push(assignmentType);
       whereClause += ` AND i.assignee_model = $${params.length}`;
@@ -662,8 +654,7 @@ export const getSuperAdminStats = asyncHandler(
   },
 );
 
-/* ─── 11. UNASSIGN INDICATOR ──────────────────────────────────────────────── */
-/* ─── 11. UNASSIGN INDICATOR ──────────────────────────────────────────────── */
+/* ─── 11. SUPER ADMIN UNASSIGN INDICATORS ────────────────────────────────────── */
 export const unassignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
@@ -691,28 +682,28 @@ export const unassignIndicator = asyncHandler(
       );
 
       // 3. Reset the indicator to a fully clean state
-      //    assignee_model must be set to a valid non-null default so the
-      //    INDICATOR_SELECT CASE doesn't fall to the ELSE branch and
-      //    accidentally return a stale team name as assigneeDisplayName.
-     await client.query(
-  `UPDATE indicators
-   SET assignee_id            = NULL,
-       assignee_model         = 'User',
-       status                 = 'Pending',
-       progress               = 0,
-       current_total_achieved = 0,
-       active_quarter         = 1,
-       updated_at             = NOW()
-   WHERE id = $1`,
-  [id]
-);
+      await client.query(
+        `UPDATE indicators
+         SET assignee_id            = NULL,
+             assignee_model         = 'User',
+             status                 = 'Pending',
+             progress               = 0,
+             current_total_achieved = 0,
+             active_quarter         = 1,
+             updated_at             = NOW()
+         WHERE id = $1`,
+        [id]
+      );
 
       await client.query("COMMIT");
 
-      // ✅ Return just the id — the frontend slice calls removeIndicatorById(id)
-      //    so it doesn't need the full object. Returning the full row risks
-      //    the frontend upsertIndicator keeping a "ghost" assigned row.
-      res.status(200).json({ success: true, data: { id } });
+      // Return the full indicator object
+      const { rows } = await pool.query(
+        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+        [id]
+      );
+      
+      res.status(200).json({ success: true, data: rows[0] });
     } catch (e) {
       await client.query("ROLLBACK");
       throw e;
@@ -798,5 +789,89 @@ export const deleteSubmission = asyncHandler(
     } finally {
       client.release();
     }
+  },
+);
+
+/* ─── GET ASSIGNED INDICATORS ───────────────────────────────────────────────── */
+export const getAssignedIndicators = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { rows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS}
+       WHERE i.assignee_id IS NOT NULL 
+         AND i.status NOT IN ('Awaiting Admin Approval', 'Awaiting Super Admin', 'Rejected by Admin', 'Rejected by Super Admin')
+         AND i.status != 'Completed'
+       ORDER BY i.created_at DESC`,
+    );
+    
+    // Add computed fields for frontend
+    const enrichedRows = rows.map(row => ({
+      ...row,
+      needsAction: false, // Assigned indicators don't need action by default
+      isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
+      completionPercentage: row.progress || 0,
+    }));
+    
+    res.status(200).json({ success: true, count: rows.length, data: enrichedRows });
+  },
+);
+
+/* ─── GET UNASSIGNED INDICATORS ─────────────────────────────────────────────── */
+export const getUnassignedIndicators = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { rows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS}
+       WHERE i.assignee_id IS NULL 
+         AND i.status = 'Pending'
+       ORDER BY i.created_at DESC`,
+    );
+    
+    const enrichedRows = rows.map(row => ({
+      ...row,
+      status: 'Unassigned', // Override status for unassigned indicators
+      needsAction: false,
+      isOverdue: false,
+      completionPercentage: 0,
+    }));
+    
+    res.status(200).json({ success: true, count: rows.length, data: enrichedRows });
+  },
+);
+
+/* ─── GET REVIEW INDICATORS ─────────────────────────────────────────────────── */
+export const getReviewIndicators = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { rows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS}
+       WHERE i.status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')
+          OR EXISTS (
+            SELECT 1 FROM submissions s 
+            WHERE s.indicator_id = i.id 
+              AND s.review_status = 'Pending'
+              AND s.is_reviewed = false
+          )
+       ORDER BY i.updated_at DESC`,
+    );
+    
+    // Check each indicator for pending submissions
+    const enrichedRows = await Promise.all(rows.map(async (row) => {
+      const { rows: pendingSubs } = await pool.query(
+        `SELECT COUNT(*) as count FROM submissions 
+         WHERE indicator_id = $1 
+           AND review_status = 'Pending' 
+           AND is_reviewed = false`,
+        [row.id]
+      );
+      
+      return {
+        ...row,
+        needsAction: pendingSubs[0]?.count > 0 || 
+                     row.status === 'Awaiting Admin Approval' || 
+                     row.status === 'Awaiting Super Admin',
+        isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
+        completionPercentage: row.progress || 0,
+      };
+    }));
+    
+    res.status(200).json({ success: true, count: rows.length, data: enrichedRows });
   },
 );
