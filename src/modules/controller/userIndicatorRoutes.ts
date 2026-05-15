@@ -82,4 +82,20 @@ router.patch(
   UserIndicatorController.updateSubmission,
 );
 
+// 10. Update multiple document descriptions for a submission
+router.patch(
+  "/submissions/:submissionId/documents/descriptions",
+  protect,
+  restrictTo("user"),
+  UserIndicatorController.updateDocumentDescriptions,
+);
+
+// 11. Update single document description
+router.patch(
+  "/documents/:docId/description",
+  protect,
+  restrictTo("user"),
+  UserIndicatorController.updateDocumentDescription,
+);
+
 export default router;

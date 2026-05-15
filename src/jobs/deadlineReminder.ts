@@ -195,7 +195,7 @@ export function registerDeadlineReminderJob(): void {
         console.error("[DeadlineReminder] Unhandled error:", e),
       );
     },
-    { timezone: "Africa/Nairobi" },
+    { timezone: "Africa/Nairobi" }, 
   );
 
   console.log("[DeadlineReminder] Scheduled — runs daily at 08:00 EAT.");

@@ -406,7 +406,7 @@ const USER_INDICATOR_BASE_QUERY = `
 export const UserIndicatorController = {
 
   // ── 1. List my indicators ─────────────────────────────────────────────────
-  getMyIndicators: asyncHandler(async (req: Request, res: Response) => {
+getMyIndicators: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
     const { clause, params } = ownershipClause([], user.id, teamIds);
@@ -420,7 +420,7 @@ export const UserIndicatorController = {
   }),
 
   // ── 2. Get single indicator (ownership-gated) ─────────────────────────────
-  getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
+getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
     const { clause, params } = ownershipClause([req.params.id], user.id, teamIds);
@@ -621,7 +621,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
 }),
 
   // ── 4. Resubmit progress (existing submission only) ───────────────────────
-  resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
+resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const { notes, achievedValue, descriptions, idempotencyKey, quarter } = req.body;
@@ -768,7 +768,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 5. Update a rejected submission ───────────────────────────────────────
-  updateSubmission: asyncHandler(async (req: Request, res: Response) => {
+updateSubmission: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const { notes, achievedValue, quarter, descriptions, idempotencyKey } = req.body;
@@ -886,7 +886,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 6. Add documents to an existing submission ────────────────────────────
-  addDocuments: asyncHandler(async (req: Request, res: Response) => {
+addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const { id } = req.params;
     const { quarter, descriptions, idempotencyKey } = req.body;
@@ -970,7 +970,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
 
 
     // ── 7. Delete a rejected document ─────────────────────────────────────────
-  deleteDocument: asyncHandler(async (req: Request, res: Response) => {
+deleteDocument: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const { docId } = req.params;
     const teamIds = await getUserTeamIds(user.id);
@@ -1011,7 +1011,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 8. Stream a Cloudinary file through the server ────────────────────────
-  streamFile: asyncHandler(async (req: Request, res: Response) => {
+streamFile: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const url = decodeURIComponent(req.query.url as string);
 
@@ -1074,7 +1074,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 9. List indicators with rejected submissions ───────────────────────────
-  getRejectedSubmissions: asyncHandler(async (req: Request, res: Response) => {
+getRejectedSubmissions: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
     const { clause: ownership, params } = ownershipClause([], user.id, teamIds);
@@ -1124,6 +1124,254 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
 
     res.status(200).json({ success: true, results: enriched.length, data: enriched });
   }),
+
+    // ── 10. Update document descriptions for a submission ─────────────────────────
+updateDocumentDescriptions: asyncHandler(async (req: Request, res: Response) => {
+  const user = getAuthUser(req);
+  const { id } = req.params; // submission id
+  const { documents } = req.body; // Array of { documentId: string, description: string }
+  const { idempotencyKey } = req.body;
+
+  if (!documents || !Array.isArray(documents) || documents.length === 0) {
+    throw new AppError("Documents array is required with at least one document.", 400);
+  }
+
+  // Validate each document entry
+  for (const doc of documents) {
+    if (!doc.documentId || typeof doc.documentId !== 'string') {
+      throw new AppError("Each document must have a valid documentId.", 400);
+    }
+    if (doc.description !== undefined && typeof doc.description !== 'string') {
+      throw new AppError("Description must be a string.", 400);
+    }
+    if (doc.description && doc.description.length > MAX_DESCRIPTION_LENGTH) {
+      throw new AppError(`Description cannot exceed ${MAX_DESCRIPTION_LENGTH} characters.`, 400);
+    }
+  }
+
+  const teamIds = await getUserTeamIds(user.id);
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const requestId = idempotencyKey || generateIdempotencyKey();
+    if (await checkIdempotency(client, requestId)) {
+      await client.query("ROLLBACK");
+      return res.status(200).json({
+        success: true,
+        message: "Duplicate request ignored",
+        idempotent: true,
+      });
+    }
+
+    // Verify submission exists and user has access
+    const subResult = await client.query(
+      `SELECT s.id, s.review_status, s.indicator_id
+       FROM submissions s
+       JOIN indicators i ON s.indicator_id = i.id
+       WHERE s.id = $1
+       FOR UPDATE`,
+      [id]
+    );
+
+    if (subResult.rows.length === 0) {
+      throw new AppError("Submission not found.", 404);
+    }
+
+    const submission = subResult.rows[0] as {
+      id: string;
+      review_status: string;
+      indicator_id: string;
+    };
+
+    // Check ownership via indicator
+    const indResult = await client.query(
+      "SELECT * FROM indicators WHERE id = $1",
+      [submission.indicator_id]
+    );
+    
+    if (indResult.rows.length === 0) {
+      throw new AppError("Indicator not found.", 404);
+    }
+    
+    const indicator = indResult.rows[0] as Record<string, unknown>;
+    await assertIndicatorOwnership(client, indicator, user.id, teamIds);
+
+    // Don't allow editing descriptions for accepted submissions
+    if (submission.review_status === "Accepted") {
+      throw new AppError("Cannot modify documents for an accepted submission.", 400);
+    }
+
+    // Update each document's description
+    const updatedDocuments = [];
+    const documentIds = documents.map((d: { documentId: string }) => d.documentId);
+    
+    // First verify all documents belong to this submission
+    const docCheck = await client.query(
+      `SELECT id FROM submission_documents 
+       WHERE id = ANY($1::uuid[]) AND submission_id = $2`,
+      [documentIds, submission.id]
+    );
+    
+    if (docCheck.rows.length !== documents.length) {
+      throw new AppError("One or more documents do not belong to this submission.", 400);
+    }
+
+    // Update descriptions
+    for (const doc of documents) {
+      const updateResult = await client.query(
+        `UPDATE submission_documents
+         SET description = $1,
+             updated_at = NOW()
+         WHERE id = $2
+         RETURNING id, evidence_url, file_name, description, status`,
+        [doc.description || "", doc.documentId]
+      );
+      
+      if (updateResult.rows.length > 0) {
+        updatedDocuments.push(updateResult.rows[0]);
+      }
+    }
+
+    // Add to review history
+    await client.query(
+      `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+       VALUES ($1, 'Documents Updated', $2, 'user', $3)`,
+      [submission.indicator_id, `Updated descriptions for ${updatedDocuments.length} document(s)`, user.id]
+    );
+
+    await storeIdempotencyKey(client, requestId);
+    await client.query("COMMIT");
+
+    res.status(200).json({
+      success: true,
+      message: `${updatedDocuments.length} document(s) updated successfully.`,
+      data: {
+        submissionId: submission.id,
+        updatedDocuments,
+      },
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}),
+
+// ── 11. Update single document description (simpler alternative) ────────────
+updateDocumentDescription: asyncHandler(async (req: Request, res: Response) => {
+  const user = getAuthUser(req);
+  const { docId } = req.params;
+  const { description, idempotencyKey } = req.body;
+
+  if (description === undefined) {
+    throw new AppError("Description is required.", 400);
+  }
+
+  if (typeof description !== 'string') {
+    throw new AppError("Description must be a string.", 400);
+  }
+
+  if (description.length > MAX_DESCRIPTION_LENGTH) {
+    throw new AppError(`Description cannot exceed ${MAX_DESCRIPTION_LENGTH} characters.`, 400);
+  }
+
+  const teamIds = await getUserTeamIds(user.id);
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const requestId = idempotencyKey || generateIdempotencyKey();
+    if (await checkIdempotency(client, requestId)) {
+      await client.query("ROLLBACK");
+      return res.status(200).json({
+        success: true,
+        message: "Duplicate request ignored",
+        idempotent: true,
+      });
+    }
+
+    // Get document with submission and indicator access check
+    const docResult = await client.query(
+      `SELECT d.id, d.submission_id, d.evidence_url, d.file_name, d.description as old_description,
+              s.review_status, s.indicator_id
+       FROM submission_documents d
+       JOIN submissions s ON d.submission_id = s.id
+       WHERE d.id = $1
+       FOR UPDATE`,
+      [docId]
+    );
+
+    if (docResult.rows.length === 0) {
+      throw new AppError("Document not found.", 404);
+    }
+
+    const document = docResult.rows[0] as {
+      id: string;
+      submission_id: string;
+      evidence_url: string;
+      file_name: string;
+      old_description: string;
+      review_status: string;
+      indicator_id: string;
+    };
+
+    // Check ownership via indicator
+    const indResult = await client.query(
+      "SELECT * FROM indicators WHERE id = $1",
+      [document.indicator_id]
+    );
+    
+    if (indResult.rows.length === 0) {
+      throw new AppError("Indicator not found.", 404);
+    }
+    
+    const indicator = indResult.rows[0] as Record<string, unknown>;
+    await assertIndicatorOwnership(client, indicator, user.id, teamIds);
+
+    // Don't allow editing descriptions for accepted submissions
+    if (document.review_status === "Accepted") {
+      throw new AppError("Cannot modify documents for an accepted submission.", 400);
+    }
+
+    // Update the description
+    const updateResult = await client.query(
+      `UPDATE submission_documents
+       SET description = $1,
+           updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, evidence_url, file_name, description, status, uploaded_at`,
+      [description, docId]
+    );
+
+    // Add to review history
+    await client.query(
+      `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+       VALUES ($1, 'Document Description Updated', $2, 'user', $3)`,
+      [document.indicator_id, `Updated description for document: ${document.file_name}`, user.id]
+    );
+
+    await storeIdempotencyKey(client, requestId);
+    await client.query("COMMIT");
+
+    res.status(200).json({
+      success: true,
+      message: "Document description updated successfully.",
+      data: {
+        document: updateResult.rows[0],
+        previousDescription: document.old_description,
+      },
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}),
 
   // ── Internal: send email alerts after a submission ────────────────────────
  _sendAlerts: async (
@@ -1191,4 +1439,7 @@ submitProgress: asyncHandler(async (req: Request, res: Response) => {
       );
     }
   },
+
+
+
 };
