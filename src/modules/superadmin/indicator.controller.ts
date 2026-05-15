@@ -596,12 +596,8 @@ export const reopenIndicator = asyncHandler(
 );
 
 /* ─── 9. GET ALL SUBMISSIONS ──────────────────────────────────────────────── */
-
 export const getAllSubmissions = asyncHandler(
   async (_req: Request, res: Response) => {
-    // Verified columns: id, indicator_id, quarter, year, achieved_value, notes,
-    // admin_description_edit, admin_comment, submitted_at, is_reviewed,
-    // review_status, resubmission_count
     const { rows } = await pool.query(`
       SELECT
         i.id,
@@ -609,6 +605,7 @@ export const getAllSubmissions = asyncHandler(
         i.assignee_model             AS "assigneeType",
         i.active_quarter             AS "quarter",
         s.id                         AS "submissionId",
+        s.year,                       -- ADD THIS LINE - missing year!
         s.submitted_at               AS "submittedOn",
         s.achieved_value             AS "achievedValue",
         s.notes,
@@ -647,7 +644,7 @@ export const getAllSubmissions = asyncHandler(
 
       GROUP BY
         i.id, i.status, i.assignee_model, i.active_quarter,
-        s.id, s.submitted_at, s.achieved_value, s.notes,
+        s.id, s.year, s.submitted_at, s.achieved_value, s.notes,  -- Add s.year here too
         s.admin_description_edit, s.is_reviewed, s.review_status,
         s.admin_comment, s.resubmission_count,
         sa.description, u.name, t.name
@@ -657,7 +654,7 @@ export const getAllSubmissions = asyncHandler(
 
     const queue = rows.map((row) => ({
       ...row,
-      quarter: `Q${row.quarter}`,
+      quarter: row.quarter, // Keep as number, don't convert to string
       documentsCount: parseInt(row.documentsCount, 10),
     }));
 

@@ -300,3 +300,4 @@ export const taskDueSoonTemplate = (
       Please log in to prepare and submit your progress report before the deadline.
     </p>
   `);
+  
