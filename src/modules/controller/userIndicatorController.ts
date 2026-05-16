@@ -437,188 +437,219 @@ getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 3. Submit progress (first-time for a given quarter) ───────────────────
-submitProgress: asyncHandler(async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { quarter, year, achievedValue, notes, descriptions } = req.body;
-  const files = (req.files ?? []) as Express.Multer.File[];
-  const userId = (req as any).user?.id;
+// ── 3. Submit progress (first-time for a given quarter) ───────────────────
+  submitProgress: asyncHandler(async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { quarter, year, achievedValue, notes, descriptions } = req.body;
+    const files = (req.files ?? []) as Express.Multer.File[];
+    const user = getAuthUser(req);
 
-  // Validate required fields
-  if (!quarter || !year) {
-    throw new AppError("Quarter and year are required", 400);
-  }
-
-  // Validate files if provided
-  if (files.length > 0) {
-    validateFiles(files);
-  }
-
-  // Parse quarter as integer
-  const quarterNum = parseInt(quarter, 10);
-  const yearNum = parseInt(year, 10);
-
-  if (isNaN(quarterNum) || isNaN(yearNum)) {
-    throw new AppError("Invalid quarter or year format", 400);
-  }
-
-  // Fetch indicator details — include activity description and unit for emails
-  const { rows: indicatorRows } = await pool.query(
-    `SELECT
-       i.*,
-       i.reporting_cycle  AS "reportingCycle",
-       i.assignee_id      AS "assigneeId",
-       sa.description     AS "activityDescription"
-     FROM indicators i
-     LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
-     WHERE i.id = $1`,
-    [id]
-  );
-
-  if (!indicatorRows[0]) {
-    throw new AppError("Indicator not found", 404);
-  }
-
-  const indicator = indicatorRows[0];
-
-  // Verify user is the assignee
-  if (indicator.assigneeId !== userId) {
-    throw new AppError("You are not authorized to submit for this indicator", 403);
-  }
-
-  // Validate quarter based on reporting cycle
-  if (indicator.reportingCycle === "Annual") {
-    if (quarterNum !== 1) {
-      throw new AppError("Annual submissions must use quarter 1", 400);
-    }
-  } else {
-    if (quarterNum < 1 || quarterNum > 4) {
-      throw new AppError("Quarter must be between 1 and 4 for quarterly indicators", 400);
-    }
-  }
-
-  const client = await pool.connect();
-  
-  try {
-    await client.query("BEGIN");
-
-    // Check if a submission already exists for this period
-    const { rows: existingSubmissions } = await client.query(
-      `SELECT id, review_status, resubmission_count 
-       FROM submissions 
-       WHERE indicator_id = $1 AND quarter = $2 AND year = $3
-       FOR UPDATE`,
-      [id, quarterNum, yearNum]
-    );
-
-    let submissionId: string;
-    let isResubmission = false;
-
-    if (existingSubmissions.length > 0) {
-      const existing = existingSubmissions[0];
-
-      isResubmission = true;
-      const newResubmissionCount = existing.resubmission_count + 1;
-      
-      // Update the existing submission
-      const { rows: updated } = await client.query(
-        `UPDATE submissions
-         SET achieved_value = $1, 
-             notes = $2, 
-             review_status = 'Pending', 
-             is_reviewed = false, 
-             resubmission_count = $3, 
-             submitted_at = NOW(),
-             admin_comment = NULL
-         WHERE id = $4
-         RETURNING id`,
-        [achievedValue || 0, notes || "-", newResubmissionCount, existing.id]
-      );
-      
-      submissionId = updated[0].id;
-      
-      // Replace all documents (clear old ones)
-      const deletedDocs = await client.query(
-        `DELETE FROM submission_documents
-         WHERE submission_id = $1
-         RETURNING evidence_public_id`,
-        [submissionId]
-      );
-      
-      // Clean up old Cloudinary files
-      const oldPublicIds = (deletedDocs.rows as Array<{ evidence_public_id: string }>)
-        .map((r) => r.evidence_public_id)
-        .filter(Boolean);
-      
-      if (oldPublicIds.length > 0) {
-        cleanupOldDocuments(oldPublicIds).catch((e) =>
-          console.error("[submitIndicatorProgress] Document cleanup failed:", e)
-        );
-      }
-    } else {
-      // Insert new submission
-      const { rows: inserted } = await client.query(
-        `INSERT INTO submissions (indicator_id, quarter, year, achieved_value, notes, review_status)
-         VALUES ($1, $2, $3, $4, $5, 'Pending')
-         RETURNING id`,
-        [id, quarterNum, yearNum, achievedValue || 0, notes || "-"]
-      );
-      
-      submissionId = inserted[0].id;
+    // Validate required fields
+    if (!quarter || !year) {
+      throw new AppError("Quarter and year are required", 400);
     }
 
-    // Upload and save new documents
+    // Validate files if provided
     if (files.length > 0) {
-      const descArr = Array.isArray(descriptions)
-        ? descriptions
-        : descriptions
-          ? [descriptions]
-          : [];
-      
-      const uploadedDocs = await uploadDocumentsWithRetry(files, descArr);
-      
-      for (const doc of uploadedDocs) {
-        await client.query(
-          `INSERT INTO submission_documents
-           (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description]
-        );
-      }
+      validateFiles(files);
     }
 
-    // Update indicator status
-    await client.query(
-      `UPDATE indicators 
-       SET status = 'Awaiting Admin Approval', updated_at = NOW()
-       WHERE id = $1`,
+    // Parse quarter and year as integers
+    const quarterNum = parseInt(String(quarter), 10);
+    const yearNum = parseInt(String(year), 10);
+
+    if (isNaN(quarterNum) || isNaN(yearNum)) {
+      throw new AppError("Invalid quarter or year format", 400);
+    }
+
+    // Fetch indicator details
+    const { rows: indicatorRows } = await pool.query(
+      `SELECT
+         i.*,
+         sa.description AS "activityDescription"
+       FROM indicators i
+       LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+       WHERE i.id = $1`,
       [id]
     );
 
-    await client.query("COMMIT");
+    if (!indicatorRows[0]) {
+      throw new AppError("Indicator not found", 404);
+    }
 
-    // Send alerts (fire and forget) — pass achievedValue for richer emails
-    const user = getAuthUser(req);
-    UserIndicatorController._sendAlerts(
-      user,
-      indicator,
-      quarterNum,
-      Number(achievedValue) || 0,
-    ).catch((e) =>
-      console.error("[submitIndicatorProgress] Mail Error:", e)
-    );
+    const indicator = indicatorRows[0] as Record<string, unknown>;
 
-    res.status(201).json({
-      success: true,
-      message: isResubmission ? "Resubmission successful" : "Submission successful",
-      data: { submissionId, isResubmission, quarter: quarterNum, year: yearNum }
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
-}),
+    // ✅ FIX 1: Use assertIndicatorOwnership instead of a direct assignee_id
+    //    comparison. The old check used indicator.assigneeId which is undefined
+    //    when i.* expands the raw column as assignee_id (snake_case). It also
+    //    failed for Team assignments where the user is a team member, not the
+    //    direct assignee_id.
+    const teamIds = await getUserTeamIds(user.id);
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      // Ownership check — handles both User and Team assignments correctly
+      await assertIndicatorOwnership(client, indicator, user.id, teamIds);
+
+      // Validate quarter based on reporting cycle
+      const reportingCycle = indicator.reporting_cycle as string;
+      if (reportingCycle === "Annual") {
+        if (quarterNum !== 1) {
+          throw new AppError("Annual submissions must use quarter 1", 400);
+        }
+      } else {
+        if (quarterNum < 1 || quarterNum > 4) {
+          throw new AppError("Quarter must be between 1 and 4 for quarterly indicators", 400);
+        }
+      }
+
+      // Check if a submission already exists for this period
+      const { rows: existingSubmissions } = await client.query(
+        `SELECT id, review_status, resubmission_count
+         FROM submissions
+         WHERE indicator_id = $1 AND quarter = $2 AND year = $3
+         FOR UPDATE`,
+        [id, quarterNum, yearNum]
+      );
+
+      let submissionId: string;
+      let isResubmission = false;
+
+      if (existingSubmissions.length > 0) {
+        const existing = existingSubmissions[0] as {
+          id: string;
+          review_status: string;
+          resubmission_count: number;
+        };
+
+        // ✅ FIX 2: Don't allow re-submission of an already accepted quarter
+        if (existing.review_status === "Accepted") {
+          throw new AppError(
+            `${quarterLabel(quarterNum)} has already been accepted and cannot be resubmitted.`,
+            409
+          );
+        }
+
+        isResubmission = true;
+        const newResubmissionCount = existing.resubmission_count + 1;
+
+        const { rows: updated } = await client.query(
+          `UPDATE submissions
+           SET achieved_value      = $1,
+               notes               = $2,
+               review_status       = 'Pending',
+               is_reviewed         = false,
+               resubmission_count  = $3,
+               submitted_at        = NOW(),
+               admin_comment       = NULL
+           WHERE id = $4
+           RETURNING id`,
+          [achievedValue ?? 0, notes ?? "-", newResubmissionCount, existing.id]
+        );
+
+        submissionId = (updated[0] as { id: string }).id;
+
+        // Replace all documents — clear old ones first
+        const deletedDocs = await client.query(
+          `DELETE FROM submission_documents
+           WHERE submission_id = $1
+           RETURNING evidence_public_id`,
+          [submissionId]
+        );
+
+        const oldPublicIds = (
+          deletedDocs.rows as Array<{ evidence_public_id: string }>
+        )
+          .map((r) => r.evidence_public_id)
+          .filter(Boolean);
+
+        if (oldPublicIds.length > 0) {
+          cleanupOldDocuments(oldPublicIds).catch((e) =>
+            console.error("[submitProgress] Document cleanup failed:", e)
+          );
+        }
+      } else {
+        // Insert new submission
+        const { rows: inserted } = await client.query(
+          `INSERT INTO submissions
+             (indicator_id, quarter, year, achieved_value, notes, review_status)
+           VALUES ($1, $2, $3, $4, $5, 'Pending')
+           RETURNING id`,
+          [id, quarterNum, yearNum, achievedValue ?? 0, notes ?? "-"]
+        );
+
+        submissionId = (inserted[0] as { id: string }).id;
+      }
+
+      // Upload and save new documents
+      if (files.length > 0) {
+        const descArr = Array.isArray(descriptions)
+          ? descriptions
+          : descriptions
+            ? [descriptions]
+            : [];
+
+        const uploadedDocs = await uploadDocumentsWithRetry(files, descArr);
+
+        for (const doc of uploadedDocs) {
+          await client.query(
+            `INSERT INTO submission_documents
+               (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [
+              submissionId,
+              doc.url,
+              doc.public_id,
+              doc.file_type,
+              doc.file_name,
+              doc.description,
+            ]
+          );
+        }
+      }
+
+      // Update indicator status to awaiting review
+      await client.query(
+        `UPDATE indicators
+         SET status     = 'Awaiting Admin Approval',
+             updated_at = NOW()
+         WHERE id = $1`,
+        [id]
+      );
+
+      await client.query("COMMIT");
+
+      // Send alerts fire-and-forget — do not block the response
+      UserIndicatorController._sendAlerts(
+        user,
+        indicator,
+        quarterNum,
+        Number(achievedValue) || 0
+      ).catch((e) =>
+        console.error("[submitProgress] Mail Error:", e)
+      );
+
+      res.status(201).json({
+        success: true,
+        message: isResubmission
+          ? "Resubmission successful"
+          : "Submission successful",
+        data: {
+          submissionId,
+          isResubmission,
+          quarter: quarterNum,
+          year: yearNum,
+        },
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }),
 
   // ── 4. Resubmit progress (existing submission only) ───────────────────────
 resubmitProgress: asyncHandler(async (req: Request, res: Response) => {

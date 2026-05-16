@@ -8,6 +8,7 @@ import adminIndicatorRoutes from "../modules/admin/adminIndicatorRoutes";
 import reportsRoutes from "../modules/superadmin/report.routes";
 import registryRoute from "../modules/registry/registryRoute";
 import teamRoutes from "../modules/team/team.routes"
+import dashboardRoutes from "../modules/controllers/dashboardRoutes"
 
 const router = Router();
 
@@ -42,5 +43,9 @@ router.use("/registry", registryRoute);
 
 // ---------------- Team ----------------
 router.use("/teams", teamRoutes);
+
+router.use("/dashboard", dashboardRoutes);
+
+
 
 export default router;

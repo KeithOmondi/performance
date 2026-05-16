@@ -167,13 +167,11 @@ export const createIndicator = asyncHandler(
 
     const indicatorId = inserted[0].id;
 
-    // Fetch full indicator for response
     const { rows: indicatorRows } = await pool.query(
       `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
       [indicatorId]
     );
 
-    // Fetch activity description and objective title for the email
     const { rows: activityRows } = await pool.query(
       `SELECT
          sa.description AS "activityDescription",
@@ -188,7 +186,6 @@ export const createIndicator = asyncHandler(
       activityRows[0]?.activityDescription || instructions || "Performance Indicator";
     const objectiveTitle = activityRows[0]?.objectiveTitle || undefined;
 
-    // Fire-and-forget email — does not block the response
     resolveRecipients(assignee, type)
       .then(({ emails, displayName }) => {
         emails.forEach((email) =>
@@ -283,10 +280,6 @@ export const getIndicatorById = asyncHandler(
 
     const indicator = rows[0];
 
-    // Verified columns against submissions schema:
-    // id, indicator_id, quarter, year, achieved_value, notes,
-    // admin_description_edit, admin_comment, submitted_at,
-    // is_reviewed, review_status, resubmission_count
     const { rows: submissions } = await pool.query(
       `SELECT
          s.id,
@@ -325,8 +318,6 @@ export const getIndicatorById = asyncHandler(
       [id]
     );
 
-    // Verified columns against review_history schema:
-    // id, indicator_id, action, reason, reviewer_role, reviewed_by, at, next_deadline
     const { rows: reviewHistory } = await pool.query(
       `SELECT
          rh.id,
@@ -558,7 +549,6 @@ export const reopenIndicator = asyncHandler(
         );
       }
 
-      // Audit trail before mutation
       await client.query(
         `INSERT INTO review_history
            (indicator_id, action, reason, reviewer_role, reviewed_by, at)
@@ -566,9 +556,6 @@ export const reopenIndicator = asyncHandler(
         [id, reason?.trim() || "Reopened by admin", adminId]
       );
 
-      // Reset status and extend deadline.
-      // active_quarter and progress are intentionally preserved —
-      // previously accepted quarters remain certified.
       await client.query(
         `UPDATE indicators
          SET status     = 'Pending',
@@ -596,6 +583,7 @@ export const reopenIndicator = asyncHandler(
 );
 
 /* ─── 9. GET ALL SUBMISSIONS ──────────────────────────────────────────────── */
+
 export const getAllSubmissions = asyncHandler(
   async (_req: Request, res: Response) => {
     const { rows } = await pool.query(`
@@ -605,7 +593,7 @@ export const getAllSubmissions = asyncHandler(
         i.assignee_model             AS "assigneeType",
         i.active_quarter             AS "quarter",
         s.id                         AS "submissionId",
-        s.year,                       -- ADD THIS LINE - missing year!
+        s.year,
         s.submitted_at               AS "submittedOn",
         s.achieved_value             AS "achievedValue",
         s.notes,
@@ -644,7 +632,7 @@ export const getAllSubmissions = asyncHandler(
 
       GROUP BY
         i.id, i.status, i.assignee_model, i.active_quarter,
-        s.id, s.year, s.submitted_at, s.achieved_value, s.notes,  -- Add s.year here too
+        s.id, s.year, s.submitted_at, s.achieved_value, s.notes,
         s.admin_description_edit, s.is_reviewed, s.review_status,
         s.admin_comment, s.resubmission_count,
         sa.description, u.name, t.name
@@ -654,7 +642,7 @@ export const getAllSubmissions = asyncHandler(
 
     const queue = rows.map((row) => ({
       ...row,
-      quarter: row.quarter, // Keep as number, don't convert to string
+      quarter: row.quarter,
       documentsCount: parseInt(row.documentsCount, 10),
     }));
 
@@ -666,21 +654,47 @@ export const getAllSubmissions = asyncHandler(
 
 export const getSuperAdminStats = asyncHandler(
   async (_req: Request, res: Response) => {
-    const [totalRes, statusRes] = await Promise.all([
-      pool.query("SELECT COUNT(*) AS total FROM indicators"),
-      pool.query(
-        "SELECT status, COUNT(*) AS count FROM indicators GROUP BY status"
-      ),
-    ]);
+    const query = `
+      SELECT
+        COUNT(*)                                                        AS total_indicators,
+        COUNT(*) FILTER (WHERE assignee_id IS NOT NULL)                 AS assigned,
+        COUNT(*) FILTER (WHERE assignee_id IS NULL)                     AS unassigned,
+        COUNT(*) FILTER (
+          WHERE deadline < NOW()
+            AND status NOT IN ('Completed', 'Awaiting Admin Approval', 'Awaiting Super Admin')
+        )                                                               AS overdue,
+        COUNT(*) FILTER (
+          WHERE status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')
+        )                                                               AS awaiting_review,
+        COUNT(*) FILTER (WHERE status = 'Completed')                    AS approved,
+        COUNT(*) FILTER (
+          WHERE status IN ('Rejected by Admin', 'Rejected by Super Admin')
+        )                                                               AS rejected,
+        COUNT(DISTINCT CASE WHEN assignee_model = 'User' THEN assignee_id END) AS users
+      FROM indicators
+    `;
 
-    const stats = statusRes.rows.reduce((acc: any, curr: any) => {
-      acc[curr.status] = parseInt(curr.count, 10);
-      return acc;
-    }, {});
+    const result = await pool.query(query);
+    const s = result.rows[0];
 
+    // ✅ FIX: wrap in `general` so the frontend dashboardSlice can read
+    //    stats.general.assigned, stats.general.approved, etc.
+    //    Previously the response was flat and stats?.general?.X was always
+    //    undefined, causing all KPI cards to show 0.
     res.status(200).json({
       success: true,
-      data: { total: parseInt(totalRes.rows[0].total, 10), stats },
+      data: {
+        general: {
+          total:         parseInt(s.total_indicators, 10),
+          assigned:      parseInt(s.assigned, 10),
+          unassigned:    parseInt(s.unassigned, 10),
+          overdue:       parseInt(s.overdue, 10),
+          awaitingReview: parseInt(s.awaiting_review, 10),
+          approved:      parseInt(s.approved, 10),
+          rejected:      parseInt(s.rejected, 10),
+          users:         parseInt(s.users, 10),
+        },
+      },
     });
   }
 );
@@ -701,7 +715,6 @@ export const unassignIndicator = asyncHandler(
       );
       if (indRes.rowCount === 0) throw new AppError("Indicator not found.", 404);
 
-      // Cascade: submission_documents removed via FK when submissions are deleted
       await client.query("DELETE FROM submissions WHERE indicator_id = $1", [id]);
       await client.query("DELETE FROM review_history WHERE indicator_id = $1", [id]);
 
@@ -763,7 +776,6 @@ export const deleteSubmission = asyncHandler(
         throw new AppError("Cannot delete a certified submission.", 400);
       }
 
-      // Pull Cloudinary public_ids before deletion
       const docsRes = await client.query(
         `SELECT evidence_public_id
          FROM submission_documents
@@ -774,7 +786,6 @@ export const deleteSubmission = asyncHandler(
         .map((r: { evidence_public_id: string }) => r.evidence_public_id)
         .filter(Boolean);
 
-      // FK cascade removes submission_documents when submission is deleted
       await client.query("DELETE FROM submissions WHERE id = $1", [submissionId]);
 
       await client.query(
@@ -786,7 +797,6 @@ export const deleteSubmission = asyncHandler(
 
       await client.query("COMMIT");
 
-      // Cloudinary cleanup outside transaction — non-fatal if it fails
       if (publicIds.length > 0) {
         const { deleteFromCloudinary } = await import("../../config/cloudinary");
         publicIds.forEach((pid) =>
@@ -813,22 +823,21 @@ export const deleteSubmission = asyncHandler(
 
 export const getAssignedIndicators = asyncHandler(
   async (_req: Request, res: Response) => {
+    // ✅ FIX: Assignment is purely whether assignee_id is set — we no longer
+    //    exclude indicators that are under review or rejected. Those are still
+    //    assigned to someone; excluding them caused the assigned count to be
+    //    far lower than reality (e.g. showing 0 when 65 were truly assigned).
     const { rows } = await pool.query(
       `${INDICATOR_SELECT} ${INDICATOR_JOINS}
        WHERE i.assignee_id IS NOT NULL
-         AND i.status NOT IN (
-           'Awaiting Admin Approval',
-           'Awaiting Super Admin',
-           'Rejected by Admin',
-           'Rejected by Super Admin',
-           'Completed'
-         )
        ORDER BY i.created_at DESC`
     );
 
     const enrichedRows = rows.map((row) => ({
       ...row,
-      needsAction: false,
+      needsAction:
+        row.status === "Awaiting Admin Approval" ||
+        row.status === "Awaiting Super Admin",
       isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
       completionPercentage: row.progress || 0,
     }));
@@ -870,21 +879,14 @@ export const getUnassignedIndicators = asyncHandler(
 
 /* ─── 15. GET REVIEW INDICATORS ──────────────────────────────────────────── */
 
-/**
- * Previously this ran an extra COUNT query per indicator (N+1).
- * Now needsAction is computed entirely in SQL using a LEFT JOIN
- * with a pre-aggregated subquery — one round-trip regardless of row count.
- */
 export const getReviewIndicators = asyncHandler(
   async (_req: Request, res: Response) => {
     const { rows } = await pool.query(
       `${INDICATOR_SELECT},
-         -- Pending submission count resolved in a single join, not per-row queries
          COALESCE(ps.pending_count, 0) AS "pendingSubmissionCount"
 
        ${INDICATOR_JOINS}
 
-       -- Pre-aggregate pending submissions for all relevant indicators
        LEFT JOIN (
          SELECT indicator_id, COUNT(*) AS pending_count
          FROM submissions
@@ -913,6 +915,90 @@ export const getReviewIndicators = asyncHandler(
       success: true,
       count: enrichedRows.length,
       data: enrichedRows,
+    });
+  }
+);
+
+
+/* ─── 16. GET INDICATOR COUNTS ───────────────────────────────────────────────
+   Add this function to indicator.controller.ts.
+   Returns accurate server-side counts for every filter tab on the
+   SuperAdminIndicators page — no frontend array.length() derivation.
+
+   Also returns per-perspective activity totals so the tab badges are
+   computed from the DB, not from iterating Redux state.
+────────────────────────────────────────────────────────────────────────────── */
+
+export const getIndicatorCounts = asyncHandler(
+  async (_req: Request, res: Response) => {
+
+    /* ── Core status counts ── */
+    const countsQuery = `
+      SELECT
+        COUNT(*)::int                                                     AS total,
+
+        COUNT(*) FILTER (WHERE assignee_id IS NOT NULL)::int              AS assigned,
+
+        COUNT(*) FILTER (
+          WHERE assignee_id IS NULL AND status = 'Pending'
+        )::int                                                            AS unassigned,
+
+        COUNT(*) FILTER (
+          WHERE status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')
+        )::int                                                            AS review,
+
+        COUNT(*) FILTER (
+          WHERE deadline < NOW()
+            AND status NOT IN (
+              'Completed',
+              'Awaiting Admin Approval',
+              'Awaiting Super Admin'
+            )
+        )::int                                                            AS overdue
+
+      FROM indicators
+    `;
+
+    /* ── Per-perspective activity totals ──
+       Counts how many strategic_activities exist under each perspective.
+       Used for the perspective filter tab badges.
+    ── */
+    const perspectiveQuery = `
+      SELECT
+        sp.perspective,
+        COUNT(DISTINCT sa.id)::int AS "activityCount"
+      FROM strategic_plans sp
+      LEFT JOIN strategic_objectives so ON so.plan_id           = sp.id
+      LEFT JOIN strategic_activities sa ON sa.objective_id      = so.id
+      GROUP BY sp.perspective
+    `;
+
+    const [countsResult, perspectiveResult] = await Promise.all([
+      pool.query(countsQuery),
+      pool.query(perspectiveQuery),
+    ]);
+
+    const counts = countsResult.rows[0];
+
+    /* Turn the perspective rows into a lookup map:
+       { "CORE BUSINESS / MANDATE": 12, "CUSTOMER PERSPECTIVE": 8, ... } */
+    const perspectives: Record<string, number> = {};
+    perspectiveResult.rows.forEach((row) => {
+      if (row.perspective) {
+        perspectives[row.perspective.toUpperCase()] = row.activityCount;
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        total:    counts.total,
+        assigned: counts.assigned,
+        unassigned: counts.unassigned,
+        review:   counts.review,
+        overdue:  counts.overdue,
+        perspectives,
+      },
     });
   }
 );
