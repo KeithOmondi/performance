@@ -8,6 +8,6 @@ const router = Router();
  * GET /api/superadmin/dashboard
  * Superadmin only — returns stats, perspectives, and recent submissions.
  */
-router.get("/stats", protect, restrictTo("superadmin"), getDashboardStats);
+router.get("/stats", protect, restrictTo("superadmin", "admin"), getDashboardStats);
 
 export default router;

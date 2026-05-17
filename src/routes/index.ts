@@ -9,6 +9,8 @@ import reportsRoutes from "../modules/superadmin/report.routes";
 import registryRoute from "../modules/registry/registryRoute";
 import teamRoutes from "../modules/team/team.routes"
 import dashboardRoutes from "../modules/controllers/dashboardRoutes"
+import ExaminerAssignmentRoutes from "../modules/examiner/examinerAssignment.routes"
+import ArchiveRoutes from "../modules/archive/archiveroutes"
 
 const router = Router();
 
@@ -45,6 +47,9 @@ router.use("/registry", registryRoute);
 router.use("/teams", teamRoutes);
 
 router.use("/dashboard", dashboardRoutes);
+router.use("/examiner", ExaminerAssignmentRoutes)
+router.use("/archive", ArchiveRoutes)
+
 
 
 
