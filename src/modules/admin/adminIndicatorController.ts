@@ -390,19 +390,19 @@ export const adminReviewProcess = asyncHandler(
 
       // ── Fetch indicator + assignee (User or Team) ────────────────────────
       const { rows: indRows } = await client.query(
-        `SELECT
-           i.*,
-           i.active_quarter  AS "activeQuarter",
-           i.reporting_cycle AS "reportingCycle",
-           COALESCE(u.name,  t.name)  AS name,
-           COALESCE(u.email, t.email) AS email
-         FROM indicators i
-         LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
-         LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
-         WHERE i.id = $1
-         FOR UPDATE`,
-        [id]
-      );
+  `SELECT
+     i.*,
+     i.active_quarter  AS "activeQuarter",
+     i.reporting_cycle AS "reportingCycle",
+     COALESCE(u.name,  t.name)  AS name,
+     COALESCE(u.email, t.email) AS email
+   FROM indicators i
+   LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+   LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+   WHERE i.id = $1
+   FOR UPDATE OF i`,  // ✅ lock only the indicators row
+  [id]
+);
 
       const indicator = indRows[0];
       if (!indicator) throw new AppError("Indicator not found.", 404);
