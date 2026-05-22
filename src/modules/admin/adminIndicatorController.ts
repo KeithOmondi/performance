@@ -10,16 +10,6 @@ import {
 
 // ─── Shared Query Base ────────────────────────────────────────────────────────
 
-/**
- * Fetches full indicator detail with camelCase aliases and grouped submissions.
- * Handles both quarterly and annual reporting cycles appropriately.
- * Includes document descriptions and metadata.
- * Supports both User and Team assignees via COALESCE on name and email.
- *
- * NOTE: teams.email exists as a varchar column — COALESCE(u.email, t.email)
- * is valid. If you ever see "column t.email does not exist" it means the
- * migration has not been applied to that environment yet.
- */
 const INDICATOR_DETAIL_QUERY = `
   SELECT
     i.*,
@@ -48,7 +38,6 @@ const INDICATOR_DETAIL_QUERY = `
       WHERE id = i.activity_id
     ) AS activity,
 
-    -- Submissions grouped by period key, respecting reporting cycle
     COALESCE(
       (
         SELECT json_object_agg(period_key, period_submissions)
@@ -72,6 +61,8 @@ const INDICATOR_DETAIL_QUERY = `
                 'notes',             s.notes,
                 'submittedAt',       s.submitted_at,
                 'isReviewed',        s.is_reviewed,
+                'submittedById',     s.submitted_by,
+                'submittedByName',   su.name,
                 'documents', (
                   SELECT COALESCE(
                     json_agg(
@@ -96,6 +87,7 @@ const INDICATOR_DETAIL_QUERY = `
               ) ORDER BY s.submitted_at DESC
             ) AS period_submissions
           FROM submissions s
+          LEFT JOIN users su ON su.id = s.submitted_by
           WHERE s.indicator_id = i.id
           GROUP BY
             CASE
@@ -117,9 +109,6 @@ const INDICATOR_DETAIL_QUERY = `
 
 // ─── Helper Functions ─────────────────────────────────────────────────────────
 
-/**
- * Validates submission quarter based on reporting cycle.
- */
 const validateSubmissionPeriod = (
   reportingCycle: string,
   quarter: number,
@@ -144,18 +133,8 @@ const validateSubmissionPeriod = (
 };
 
 /**
- * Determines the next active quarter for an indicator.
- */
-const getNextPeriod = (
-  currentQuarter: number,
-  reportingCycle: string
-): number => {
-  if (reportingCycle === "Annual") return 1;
-  return currentQuarter + 1;
-};
-
-/**
  * Returns true when the indicator has no further periods to submit.
+ * (kept for potential future use)
  */
 const isFinalPeriod = (
   currentQuarter: number,
@@ -172,6 +151,10 @@ export const createSubmission = asyncHandler(
     const { indicatorId, achievedValue, notes, quarter, year } = req.body;
     const userId = (req as any).user?.id;
 
+    if (!userId) {
+      throw new AppError("Authenticated user required to submit", 401);
+    }
+
     if (!indicatorId || achievedValue === undefined || !year) {
       throw new AppError(
         "Missing required fields: indicatorId, achievedValue, year",
@@ -179,7 +162,16 @@ export const createSubmission = asyncHandler(
       );
     }
 
-    // ── Fetch indicator ──────────────────────────────────────────────────────
+    // Verify user exists and is active
+    const { rows: userRows } = await pool.query(
+      `SELECT id FROM users WHERE id = $1 AND is_active = true`,
+      [userId]
+    );
+    if (!userRows[0]) {
+      throw new AppError("Submitter user not found or inactive", 400);
+    }
+
+    // Fetch indicator
     const { rows: indicatorRows } = await pool.query(
       `SELECT id, status, reporting_cycle, active_quarter, assignee_id
        FROM indicators
@@ -193,7 +185,6 @@ export const createSubmission = asyncHandler(
 
     const indicator = indicatorRows[0];
 
-    // ── Authorisation ────────────────────────────────────────────────────────
     if (indicator.assignee_id !== userId) {
       throw new AppError(
         "You are not authorized to submit for this indicator",
@@ -208,19 +199,17 @@ export const createSubmission = asyncHandler(
       );
     }
 
-    // ── Normalise quarter for Annual cycle ───────────────────────────────────
     const submissionQuarter =
       indicator.reporting_cycle === "Annual" ? 1 : quarter;
 
     validateSubmissionPeriod(indicator.reporting_cycle, submissionQuarter, year);
 
-    // ── Check for an existing submission in this period ──────────────────────
     let existingQuery = `
       SELECT id, review_status, resubmission_count
       FROM submissions
       WHERE indicator_id = $1 AND year = $2
     `;
-    const queryParams: any[] = [indicatorId, year];
+    const queryParams: (string | number)[] = [indicatorId, year];
 
     if (indicator.reporting_cycle === "Quarterly") {
       existingQuery += ` AND quarter = $3`;
@@ -252,34 +241,38 @@ export const createSubmission = asyncHandler(
       isResubmission = true;
       resubmissionCount = existing.resubmission_count + 1;
 
-      await pool.query(
-        `UPDATE submissions
-         SET achieved_value     = $1,
-             notes              = $2,
-             review_status      = 'Pending',
-             is_reviewed        = false,
-             resubmission_count = $3,
-             submitted_at       = NOW(),
-             admin_comment      = NULL
-         WHERE id = $4`,
-        [achievedValue, notes, resubmissionCount, existing.id]
+      const { rows: inserted } = await pool.query(
+        `INSERT INTO submissions (
+           indicator_id, quarter, year, achieved_value, notes,
+           submitted_at, review_status, resubmission_count, is_reviewed,
+           submitted_by
+         ) VALUES ($1, $2, $3, $4, $5, NOW(), 'Pending', $6, false, $7)
+         RETURNING id`,
+        [
+          indicatorId,
+          submissionQuarter,
+          year,
+          achievedValue,
+          notes,
+          resubmissionCount,
+          userId,
+        ]
       );
 
-      submissionId = existing.id;
+      submissionId = inserted[0].id;
     } else {
       const { rows: inserted } = await pool.query(
         `INSERT INTO submissions (
            indicator_id, quarter, year, achieved_value, notes,
-           submitted_at, review_status, resubmission_count
-         ) VALUES ($1, $2, $3, $4, $5, NOW(), 'Pending', 0)
+           submitted_at, review_status, resubmission_count, submitted_by
+         ) VALUES ($1, $2, $3, $4, $5, NOW(), 'Pending', 0, $6)
          RETURNING id`,
-        [indicatorId, submissionQuarter, year, achievedValue, notes]
+        [indicatorId, submissionQuarter, year, achievedValue, notes, userId]
       );
 
       submissionId = inserted[0].id;
     }
 
-    // ── Update indicator status ──────────────────────────────────────────────
     await pool.query(
       `UPDATE indicators
        SET status = 'Awaiting Admin Approval', updated_at = NOW()
@@ -306,11 +299,11 @@ export const createSubmission = asyncHandler(
 export const fetchIndicatorsForAdmin = asyncHandler(
   async (req: Request, res: Response) => {
     const { status, search } = req.query;
-    const values: any[] = [];
+    const values: (string | number)[] = [];
     let whereClause = "WHERE 1=1";
 
     if (status && status !== "all") {
-      values.push(status);
+      values.push(status as string);
       whereClause += ` AND i.status = $${values.length}`;
     }
 
@@ -388,26 +381,24 @@ export const adminReviewProcess = asyncHandler(
     try {
       await client.query("BEGIN");
 
-      // ── Fetch indicator + assignee (User or Team) ────────────────────────
       const { rows: indRows } = await client.query(
-  `SELECT
-     i.*,
-     i.active_quarter  AS "activeQuarter",
-     i.reporting_cycle AS "reportingCycle",
-     COALESCE(u.name,  t.name)  AS name,
-     COALESCE(u.email, t.email) AS email
-   FROM indicators i
-   LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
-   LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
-   WHERE i.id = $1
-   FOR UPDATE OF i`,  // ✅ lock only the indicators row
-  [id]
-);
+        `SELECT
+           i.*,
+           i.active_quarter  AS "activeQuarter",
+           i.reporting_cycle AS "reportingCycle",
+           COALESCE(u.name,  t.name)  AS name,
+           COALESCE(u.email, t.email) AS email
+         FROM indicators i
+         LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+         LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+         WHERE i.id = $1
+         FOR UPDATE OF i`,
+        [id]
+      );
 
       const indicator = indRows[0];
       if (!indicator) throw new AppError("Indicator not found.", 404);
 
-      // ── Apply document-level status updates ──────────────────────────────
       let hasRejectedDocument = false;
 
       if (Array.isArray(documentUpdates) && documentUpdates.length > 0) {
@@ -423,14 +414,12 @@ export const adminReviewProcess = asyncHandler(
         }
       }
 
-      // A rejected document overrides a "Verified" decision
-      const finalDecision   = hasRejectedDocument ? "Rejected" : decision;
-      const isVerified      = finalDecision === "Verified";
+      const finalDecision      = hasRejectedDocument ? "Rejected" : decision;
+      const isVerified         = finalDecision === "Verified";
       const newIndicatorStatus = isVerified
         ? "Awaiting Super Admin"
         : "Rejected by Admin";
 
-      // ── Update indicator status ──────────────────────────────────────────
       await client.query(
         `UPDATE indicators
          SET status = $1, admin_overall_comments = $2, updated_at = NOW()
@@ -438,7 +427,6 @@ export const adminReviewProcess = asyncHandler(
         [newIndicatorStatus, adminOverallComments, id]
       );
 
-      // ── Update individual submission review statuses ──────────────────────
       if (Array.isArray(submissionUpdates) && submissionUpdates.length > 0) {
         for (const update of submissionUpdates) {
           await client.query(
@@ -456,7 +444,6 @@ export const adminReviewProcess = asyncHandler(
         }
       }
 
-      // ── Log to review history ─────────────────────────────────────────────
       await client.query(
         `INSERT INTO review_history
            (indicator_id, action, reason, reviewer_role, reviewed_by)
@@ -471,7 +458,6 @@ export const adminReviewProcess = asyncHandler(
 
       await client.query("COMMIT");
 
-      // ── Fire-and-forget email notifications ───────────────────────────────
       const taskTitle = indicator.instructions || "Performance Indicator";
       const year      = new Date().getFullYear();
 
@@ -480,7 +466,7 @@ export const adminReviewProcess = asyncHandler(
           `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`
         );
 
-        superAdmins.forEach(({ email }) => {
+        superAdmins.forEach(({ email }: { email: string }) => {
           sendMail({
             to: email,
             subject: "Submission Ready for Final Approval",
@@ -570,6 +556,8 @@ export const getIndicatorSubmissions = asyncHandler(
          s.resubmission_count AS "resubmissionCount",
          s.submitted_at       AS "submittedAt",
          s.is_reviewed        AS "isReviewed",
+         s.submitted_by       AS "submittedById",
+         su.name              AS "submittedByName",
          COALESCE(
            (
              SELECT json_agg(
@@ -592,6 +580,7 @@ export const getIndicatorSubmissions = asyncHandler(
            '[]'::json
          ) AS documents
        FROM submissions s
+       LEFT JOIN users su ON su.id = s.submitted_by
        WHERE s.indicator_id = $1
        ORDER BY s.year DESC, s.quarter DESC`,
       [id]
