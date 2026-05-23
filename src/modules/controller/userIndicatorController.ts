@@ -327,6 +327,9 @@ function resolveFileType(
  *   { "Q1_2025": [...], "Q2_2025": [...], "Annual_2025": [...] }
  *
  * The `quarter` column is an INTEGER: 0 = Annual, 1–4 = Q1–Q4.
+ *
+ * NOTE: ALL submissions for a quarter are returned (including rejected ones)
+ * so the frontend can display the full accountability trail.
  */
 const USER_INDICATOR_BASE_QUERY = `
   SELECT DISTINCT ON (i.id)
@@ -361,6 +364,7 @@ const USER_INDICATOR_BASE_QUERY = `
                 'adminComment',      s.admin_comment,
                 'resubmissionCount', s.resubmission_count,
                 'submittedAt',       s.submitted_at,
+                'submittedBy',       s.submitted_by,
                 'isReviewed',        s.is_reviewed,
                 'documents', (
                   SELECT COALESCE(
@@ -406,7 +410,7 @@ const USER_INDICATOR_BASE_QUERY = `
 export const UserIndicatorController = {
 
   // ── 1. List my indicators ─────────────────────────────────────────────────
-getMyIndicators: asyncHandler(async (req: Request, res: Response) => {
+  getMyIndicators: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
     const { clause, params } = ownershipClause([], user.id, teamIds);
@@ -420,7 +424,7 @@ getMyIndicators: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 2. Get single indicator (ownership-gated) ─────────────────────────────
-getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
+  getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
     const { clause, params } = ownershipClause([req.params.id], user.id, teamIds);
@@ -436,33 +440,33 @@ getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
     res.status(200).json({ success: true, data: rows[0] });
   }),
 
-  // ── 3. Submit progress (first-time for a given quarter) ───────────────────
-// ── 3. Submit progress (first-time for a given quarter) ───────────────────
+  // ── 3. Submit progress ────────────────────────────────────────────────────
+  //
+  // Design: a quarter can have multiple submission rows — one active (Pending /
+  // Accepted) and any number of historical Rejected rows retained for
+  // accountability. We NEVER delete or overwrite a Rejected row; instead we
+  // INSERT a fresh Pending row alongside it so the full trail is preserved.
   submitProgress: asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
     const { quarter, year, achievedValue, notes, descriptions } = req.body;
     const files = (req.files ?? []) as Express.Multer.File[];
-    const user = getAuthUser(req);
+    const user  = getAuthUser(req);
 
-    // Validate required fields
     if (!quarter || !year) {
       throw new AppError("Quarter and year are required", 400);
     }
 
-    // Validate files if provided
     if (files.length > 0) {
       validateFiles(files);
     }
 
-    // Parse quarter and year as integers
     const quarterNum = parseInt(String(quarter), 10);
-    const yearNum = parseInt(String(year), 10);
+    const yearNum    = parseInt(String(year), 10);
 
     if (isNaN(quarterNum) || isNaN(yearNum)) {
       throw new AppError("Invalid quarter or year format", 400);
     }
 
-    // Fetch indicator details
     const { rows: indicatorRows } = await pool.query(
       `SELECT
          i.*,
@@ -470,120 +474,87 @@ getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
        FROM indicators i
        LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
        WHERE i.id = $1`,
-      [id]
+      [id],
     );
 
-    if (!indicatorRows[0]) {
-      throw new AppError("Indicator not found", 404);
-    }
+    if (!indicatorRows[0]) throw new AppError("Indicator not found", 404);
 
     const indicator = indicatorRows[0] as Record<string, unknown>;
-
-    // ✅ FIX 1: Use assertIndicatorOwnership instead of a direct assignee_id
-    //    comparison. The old check used indicator.assigneeId which is undefined
-    //    when i.* expands the raw column as assignee_id (snake_case). It also
-    //    failed for Team assignments where the user is a team member, not the
-    //    direct assignee_id.
-    const teamIds = await getUserTeamIds(user.id);
-    const client = await pool.connect();
+    const teamIds   = await getUserTeamIds(user.id);
+    const client    = await pool.connect();
 
     try {
       await client.query("BEGIN");
 
-      // Ownership check — handles both User and Team assignments correctly
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
-      // Validate quarter based on reporting cycle
       const reportingCycle = indicator.reporting_cycle as string;
       if (reportingCycle === "Annual") {
-        if (quarterNum !== 1) {
+        if (quarterNum !== 1)
           throw new AppError("Annual submissions must use quarter 1", 400);
-        }
       } else {
-        if (quarterNum < 1 || quarterNum > 4) {
+        if (quarterNum < 1 || quarterNum > 4)
           throw new AppError("Quarter must be between 1 and 4 for quarterly indicators", 400);
-        }
       }
 
-      // Check if a submission already exists for this period
-      const { rows: existingSubmissions } = await client.query(
+      // Look for any existing submission for this quarter+year.
+      // We lock all matching rows so concurrent requests can't race.
+      const { rows: existingRows } = await client.query(
         `SELECT id, review_status, resubmission_count
          FROM submissions
          WHERE indicator_id = $1 AND quarter = $2 AND year = $3
+         ORDER BY submitted_at DESC
          FOR UPDATE`,
-        [id, quarterNum, yearNum]
+        [id, quarterNum, yearNum],
       );
 
-      let submissionId: string;
-      let isResubmission = false;
-
-      if (existingSubmissions.length > 0) {
-        const existing = existingSubmissions[0] as {
-          id: string;
-          review_status: string;
-          resubmission_count: number;
-        };
-
-        // ✅ FIX 2: Don't allow re-submission of an already accepted quarter
-        if (existing.review_status === "Accepted") {
-          throw new AppError(
-            `${quarterLabel(quarterNum)} has already been accepted and cannot be resubmitted.`,
-            409
-          );
-        }
-
-        isResubmission = true;
-        const newResubmissionCount = existing.resubmission_count + 1;
-
-        const { rows: updated } = await client.query(
-          `UPDATE submissions
-           SET achieved_value      = $1,
-               notes               = $2,
-               review_status       = 'Pending',
-               is_reviewed         = false,
-               resubmission_count  = $3,
-               submitted_at        = NOW(),
-               admin_comment       = NULL
-           WHERE id = $4
-           RETURNING id`,
-          [achievedValue ?? 0, notes ?? "-", newResubmissionCount, existing.id]
+      // Accepted quarters are immutable — block regardless of how many rows exist.
+      const hasAccepted = existingRows.some(
+        (r: { review_status: string }) => r.review_status === "Accepted",
+      );
+      if (hasAccepted) {
+        throw new AppError(
+          `${quarterLabel(quarterNum)} has already been accepted and cannot be resubmitted.`,
+          409,
         );
-
-        submissionId = (updated[0] as { id: string }).id;
-
-        // Replace all documents — clear old ones first
-        const deletedDocs = await client.query(
-          `DELETE FROM submission_documents
-           WHERE submission_id = $1
-           RETURNING evidence_public_id`,
-          [submissionId]
-        );
-
-        const oldPublicIds = (
-          deletedDocs.rows as Array<{ evidence_public_id: string }>
-        )
-          .map((r) => r.evidence_public_id)
-          .filter(Boolean);
-
-        if (oldPublicIds.length > 0) {
-          cleanupOldDocuments(oldPublicIds).catch((e) =>
-            console.error("[submitProgress] Document cleanup failed:", e)
-          );
-        }
-      } else {
-        // Insert new submission
-        const { rows: inserted } = await client.query(
-          `INSERT INTO submissions
-             (indicator_id, quarter, year, achieved_value, notes, review_status)
-           VALUES ($1, $2, $3, $4, $5, 'Pending')
-           RETURNING id`,
-          [id, quarterNum, yearNum, achievedValue ?? 0, notes ?? "-"]
-        );
-
-        submissionId = (inserted[0] as { id: string }).id;
       }
 
-      // Upload and save new documents
+      // Determine the current resubmission count for sequencing.
+      const latestRow = existingRows[0] as
+        | { id: string; review_status: string; resubmission_count: number }
+        | undefined;
+
+      const newResubmissionCount = latestRow
+        ? latestRow.resubmission_count + 1
+        : 0;
+
+      const isResubmission = !!latestRow;
+
+      // ── Key accountability rule ───────────────────────────────────────────
+      // We always INSERT a brand-new submission row. Rejected rows are NEVER
+      // overwritten or deleted — they stay in the DB as the audit trail.
+      // The frontend should display the full list ordered by submitted_at DESC
+      // and treat the first Pending/Accepted row as the "active" one.
+      const { rows: inserted } = await client.query(
+        `INSERT INTO submissions
+           (indicator_id, quarter, year, achieved_value, notes,
+            review_status, submitted_by, resubmission_count)
+         VALUES ($1, $2, $3, $4, $5, 'Pending', $6, $7)
+         RETURNING id`,
+        [
+          id,
+          quarterNum,
+          yearNum,
+          achievedValue ?? 0,
+          notes ?? "-",
+          user.id,
+          newResubmissionCount,
+        ],
+      );
+
+      const submissionId = (inserted[0] as { id: string }).id;
+
+      // Upload and attach new documents to the fresh submission row.
       if (files.length > 0) {
         const descArr = Array.isArray(descriptions)
           ? descriptions
@@ -596,7 +567,8 @@ getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
         for (const doc of uploadedDocs) {
           await client.query(
             `INSERT INTO submission_documents
-               (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+               (submission_id, evidence_url, evidence_public_id,
+                file_type, file_name, description)
              VALUES ($1, $2, $3, $4, $5, $6)`,
             [
               submissionId,
@@ -605,43 +577,32 @@ getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
               doc.file_type,
               doc.file_name,
               doc.description,
-            ]
+            ],
           );
         }
       }
 
-      // Update indicator status to awaiting review
       await client.query(
         `UPDATE indicators
          SET status     = 'Awaiting Admin Approval',
              updated_at = NOW()
          WHERE id = $1`,
-        [id]
+        [id],
       );
 
       await client.query("COMMIT");
 
-      // Send alerts fire-and-forget — do not block the response
       UserIndicatorController._sendAlerts(
         user,
         indicator,
         quarterNum,
-        Number(achievedValue) || 0
-      ).catch((e) =>
-        console.error("[submitProgress] Mail Error:", e)
-      );
+        Number(achievedValue) || 0,
+      ).catch((e) => console.error("[submitProgress] Mail Error:", e));
 
       res.status(201).json({
         success: true,
-        message: isResubmission
-          ? "Resubmission successful"
-          : "Submission successful",
-        data: {
-          submissionId,
-          isResubmission,
-          quarter: quarterNum,
-          year: yearNum,
-        },
+        message: isResubmission ? "Resubmission successful" : "Submission successful",
+        data: { submissionId, isResubmission, quarter: quarterNum, year: yearNum },
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -651,9 +612,12 @@ getIndicatorDetails: asyncHandler(async (req: Request, res: Response) => {
     }
   }),
 
-  // ── 4. Resubmit progress (existing submission only) ───────────────────────
-resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
+  // ── 4. Resubmit progress ──────────────────────────────────────────────────
+  //
+  // Same accountability rule applies: we INSERT a new Pending row rather than
+  // mutating the existing Rejected row, so the rejection is permanently visible.
+  resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
+    const user        = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const { notes, achievedValue, descriptions, idempotencyKey, quarter } = req.body;
     const files = (req.files ?? []) as Express.Multer.File[];
@@ -664,9 +628,7 @@ resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
     validateFiles(files);
 
     const teamIds = await getUserTeamIds(user.id);
-    const client = await pool.connect();
-    let submissionId: string | null = null;
-    let oldPublicIds: string[] = [];
+    const client  = await pool.connect();
 
     try {
       await client.query("BEGIN");
@@ -693,56 +655,64 @@ resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
       if (indicator.status === "Completed")
         throw new AppError("Cannot resubmit: this indicator has been marked as completed.", 409);
 
-      // Body quarter takes priority — allows targeting a specific quarter.
       const targetQuarter = resolveTargetQuarter(indicator, quarter);
 
-      // Guard against resubmitting an accepted quarter.
-      const existingQuarterSub = await client.query(
-        `SELECT review_status FROM submissions
-         WHERE indicator_id = $1 AND quarter = $2
+      // Block if this quarter already has an accepted submission.
+      const acceptedCheck = await client.query(
+        `SELECT 1 FROM submissions
+         WHERE indicator_id = $1 AND quarter = $2 AND review_status = 'Accepted'
          LIMIT 1`,
         [indicatorId, targetQuarter],
       );
-      const quarterStatus = existingQuarterSub.rows[0]?.review_status as string | undefined;
-
-      if (quarterStatus === "Accepted")
+      if ((acceptedCheck.rowCount ?? 0) > 0)
         throw new AppError(
           `${quarterLabel(targetQuarter)} has already been accepted and cannot be resubmitted.`,
           409,
         );
 
-      // Row-level lock — confirms the submission exists and locks the row.
-      const { submissionId: existingId } = await validateIndicatorSubmissionState(
-        client,
-        indicatorId,
-        targetQuarter,
-        "resubmit",
+      // Confirm at least one submission exists for this quarter (so "resubmit"
+      // is meaningful) and determine current resubmission count.
+      const existingRes = await client.query(
+        `SELECT resubmission_count
+         FROM submissions
+         WHERE indicator_id = $1 AND quarter = $2
+         ORDER BY submitted_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [indicatorId, targetQuarter],
       );
-      submissionId = existingId!;
+      if (existingRes.rows.length === 0)
+        throw new AppError(
+          `No existing submission found for ${quarterLabel(targetQuarter)}. Use submit instead.`,
+          404,
+        );
 
-      await client.query(
-        `UPDATE submissions
-         SET notes              = $1,
-             achieved_value     = $2,
-             review_status      = 'Pending',
-             is_reviewed        = false,
-             submitted_at       = NOW(),
-             resubmission_count = resubmission_count + 1,
-             idempotency_key    = $3
-         WHERE id = $4`,
-        [validated.notes, validated.achievedValue, requestId, submissionId],
+      const latestCount = (
+        existingRes.rows[0] as { resubmission_count: number }
+      ).resubmission_count;
+
+      // INSERT a fresh Pending row — the rejected row is intentionally kept.
+      const { rows: inserted } = await client.query(
+        `INSERT INTO submissions
+           (indicator_id, quarter, year, achieved_value, notes,
+            review_status, submitted_by, resubmission_count, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, 'Pending', $6, $7, $8)
+         RETURNING id`,
+        [
+          indicatorId,
+          targetQuarter,
+          new Date().getFullYear(),
+          validated.achievedValue,
+          validated.notes,
+          user.id,
+          latestCount + 1,
+          requestId,
+        ],
       );
 
-      const deletedDocs = await client.query(
-        `DELETE FROM submission_documents
-         WHERE submission_id = $1
-         RETURNING evidence_public_id`,
-        [submissionId],
-      );
-      oldPublicIds = (deletedDocs.rows as Array<{ evidence_public_id: string }>)
-        .map((r) => r.evidence_public_id)
-        .filter(Boolean);
+      const newSubmissionId = (inserted[0] as { id: string }).id;
 
+      // Upload and attach documents to the new submission row.
       let newDocs: Awaited<ReturnType<typeof uploadDocumentsWithRetry>> = [];
       if (files.length > 0)
         newDocs = await uploadDocumentsWithRetry(files, descriptions || []);
@@ -752,16 +722,25 @@ resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
           newDocs.map((doc) =>
             client.query(
               `INSERT INTO submission_documents
-                 (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+                 (submission_id, evidence_url, evidence_public_id,
+                  file_type, file_name, description)
                VALUES ($1, $2, $3, $4, $5, $6)`,
-              [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+              [
+                newSubmissionId,
+                doc.url,
+                doc.public_id,
+                doc.file_type,
+                doc.file_name,
+                doc.description,
+              ],
             ),
           ),
         );
       }
 
       await client.query(
-        `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
          VALUES ($1, 'Resubmitted', $2, 'user', $3)`,
         [indicatorId, `Resubmission for ${quarterLabel(targetQuarter)}`, user.id],
       );
@@ -769,13 +748,6 @@ resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
 
-      // Cleanup old Cloudinary assets after a successful commit.
-      if (oldPublicIds.length > 0)
-        cleanupOldDocuments(oldPublicIds).catch((e) =>
-          console.error("[resubmitProgress] Document cleanup failed:", e),
-        );
-
-      // Fire-and-forget — do not block the response.
       Promise.all([
         IndicatorService.syncIndicatorState(indicatorId).catch((e) =>
           console.error("[resubmitProgress] syncIndicatorState failed:", e),
@@ -788,7 +760,7 @@ resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
       res.status(200).json({
         success: true,
         message: "Resubmission processed successfully.",
-        submissionId,
+        submissionId: newSubmissionId,
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -799,23 +771,23 @@ resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 5. Update a rejected submission ───────────────────────────────────────
-updateSubmission: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
+  //
+  // Same rule: INSERT a new Pending row, keep the Rejected row intact.
+  updateSubmission: asyncHandler(async (req: Request, res: Response) => {
+    const user        = getAuthUser(req);
     const indicatorId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const { notes, achievedValue, quarter, descriptions, idempotencyKey } = req.body;
     const files = (req.files ?? []) as Express.Multer.File[];
 
     if (!indicatorId) throw new AppError("Indicator ID is required.", 400);
-    if (!quarter) throw new AppError("Quarter is required.", 400);
+    if (!quarter)     throw new AppError("Quarter is required.", 400);
 
-    const validated = validateSubmissionInput(notes, achievedValue);
+    const validated     = validateSubmissionInput(notes, achievedValue);
     validateFiles(files);
 
     const targetQuarter = quarterToInt(quarter);
-    const teamIds = await getUserTeamIds(user.id);
-    const client = await pool.connect();
-    let submissionId: string | null = null;
-    let oldPublicIds: string[] = [];
+    const teamIds       = await getUserTeamIds(user.id);
+    const client        = await pool.connect();
 
     try {
       await client.query("BEGIN");
@@ -839,65 +811,84 @@ updateSubmission: asyncHandler(async (req: Request, res: Response) => {
 
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
-      // Only update submissions that are currently Rejected.
-      const result = await client.query(
-        `UPDATE submissions
-         SET notes              = $1,
-             achieved_value     = $2,
-             review_status      = 'Pending',
-             is_reviewed        = false,
-             submitted_at       = NOW(),
-             resubmission_count = resubmission_count + 1,
-             idempotency_key    = $3
-         WHERE indicator_id = $4
-           AND quarter       = $5
-           AND review_status = 'Rejected'
-         RETURNING id`,
-        [validated.notes, validated.achievedValue, requestId, indicatorId, targetQuarter],
+      // Ensure there is at least one Rejected submission for this quarter
+      // (otherwise "update rejected submission" makes no sense).
+      const rejectedRes = await client.query(
+        `SELECT resubmission_count
+         FROM submissions
+         WHERE indicator_id = $1 AND quarter = $2 AND review_status = 'Rejected'
+         ORDER BY submitted_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [indicatorId, targetQuarter],
       );
 
-      if (result.rowCount === 0)
-        throw new AppError("No rejected submission found to update for this quarter.", 404);
+      if (rejectedRes.rows.length === 0)
+        throw new AppError(
+          "No rejected submission found to update for this quarter.",
+          404,
+        );
 
-      submissionId = (result.rows[0] as { id: string }).id;
+      const latestCount = (
+        rejectedRes.rows[0] as { resubmission_count: number }
+      ).resubmission_count;
+
+      // INSERT a fresh Pending row alongside the existing Rejected one.
+      const { rows: inserted } = await client.query(
+        `INSERT INTO submissions
+           (indicator_id, quarter, year, achieved_value, notes,
+            review_status, submitted_by, resubmission_count, idempotency_key)
+         VALUES ($1, $2, $3, $4, $5, 'Pending', $6, $7, $8)
+         RETURNING id`,
+        [
+          indicatorId,
+          targetQuarter,
+          new Date().getFullYear(),
+          validated.achievedValue,
+          validated.notes,
+          user.id,
+          latestCount + 1,
+          requestId,
+        ],
+      );
+
+      const newSubmissionId = (inserted[0] as { id: string }).id;
 
       if (files.length > 0) {
-        const deletedDocs = await client.query(
-          `DELETE FROM submission_documents
-           WHERE submission_id = $1
-           RETURNING evidence_public_id`,
-          [submissionId],
-        );
-        oldPublicIds = (deletedDocs.rows as Array<{ evidence_public_id: string }>)
-          .map((r) => r.evidence_public_id)
-          .filter(Boolean);
-
         const newDocs = await uploadDocumentsWithRetry(files, descriptions || []);
         await Promise.all(
           newDocs.map((doc) =>
             client.query(
               `INSERT INTO submission_documents
-                 (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+                 (submission_id, evidence_url, evidence_public_id,
+                  file_type, file_name, description)
                VALUES ($1, $2, $3, $4, $5, $6)`,
-              [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+              [
+                newSubmissionId,
+                doc.url,
+                doc.public_id,
+                doc.file_type,
+                doc.file_name,
+                doc.description,
+              ],
             ),
           ),
         );
       }
 
       await client.query(
-        `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
          VALUES ($1, 'Resubmitted', $2, 'user', $3)`,
-        [indicatorId, `Correction resubmitted for ${quarterLabel(targetQuarter)}`, user.id],
+        [
+          indicatorId,
+          `Correction resubmitted for ${quarterLabel(targetQuarter)}`,
+          user.id,
+        ],
       );
 
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
-
-      if (oldPublicIds.length > 0)
-        cleanupOldDocuments(oldPublicIds).catch((e) =>
-          console.error("[updateSubmission] Document cleanup failed:", e),
-        );
 
       IndicatorService.syncIndicatorState(indicatorId).catch((e) =>
         console.error("[updateSubmission] syncIndicatorState failed:", e),
@@ -906,7 +897,7 @@ updateSubmission: asyncHandler(async (req: Request, res: Response) => {
       res.status(200).json({
         success: true,
         message: "Submission updated and resent for review.",
-        submissionId,
+        submissionId: newSubmissionId,
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -917,7 +908,7 @@ updateSubmission: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 6. Add documents to an existing submission ────────────────────────────
-addDocuments: asyncHandler(async (req: Request, res: Response) => {
+  addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const { id } = req.params;
     const { quarter, descriptions, idempotencyKey } = req.body;
@@ -927,7 +918,7 @@ addDocuments: asyncHandler(async (req: Request, res: Response) => {
     validateFiles(files);
 
     const teamIds = await getUserTeamIds(user.id);
-    const client = await pool.connect();
+    const client  = await pool.connect();
 
     try {
       await client.query("BEGIN");
@@ -956,16 +947,22 @@ addDocuments: asyncHandler(async (req: Request, res: Response) => {
           ? 0
           : quarterToInt(quarter ?? (indicator.active_quarter as string | number));
 
+      // Target the most recent non-rejected submission for this quarter.
       const subRes = await client.query(
         `SELECT id, review_status FROM submissions
          WHERE indicator_id = $1 AND quarter = $2
+           AND review_status != 'Rejected'
+         ORDER BY submitted_at DESC
+         LIMIT 1
          FOR UPDATE`,
         [id, targetQ],
       );
-      const submission = subRes.rows[0] as { id: string; review_status: string } | undefined;
+      const submission = subRes.rows[0] as
+        | { id: string; review_status: string }
+        | undefined;
 
       if (!submission)
-        throw new AppError(`No submission found for ${quarterLabel(targetQ)}.`, 404);
+        throw new AppError(`No active submission found for ${quarterLabel(targetQ)}.`, 404);
 
       if (submission.review_status === "Accepted")
         throw new AppError("Certified records are locked and cannot be modified.", 400);
@@ -975,10 +972,18 @@ addDocuments: asyncHandler(async (req: Request, res: Response) => {
         newDocs.map((doc) =>
           client.query(
             `INSERT INTO submission_documents
-               (submission_id, evidence_url, evidence_public_id, file_type, file_name, description)
+               (submission_id, evidence_url, evidence_public_id,
+                file_type, file_name, description)
              VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING *`,
-            [submission.id, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+            [
+              submission.id,
+              doc.url,
+              doc.public_id,
+              doc.file_type,
+              doc.file_name,
+              doc.description,
+            ],
           ),
         ),
       );
@@ -999,10 +1004,9 @@ addDocuments: asyncHandler(async (req: Request, res: Response) => {
     }
   }),
 
-
-    // ── 7. Delete a rejected document ─────────────────────────────────────────
-deleteDocument: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
+  // ── 7. Delete a rejected document ─────────────────────────────────────────
+  deleteDocument: asyncHandler(async (req: Request, res: Response) => {
+    const user    = getAuthUser(req);
     const { docId } = req.params;
     const teamIds = await getUserTeamIds(user.id);
 
@@ -1042,9 +1046,9 @@ deleteDocument: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 8. Stream a Cloudinary file through the server ────────────────────────
-streamFile: asyncHandler(async (req: Request, res: Response) => {
+  streamFile: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
-    const url = decodeURIComponent(req.query.url as string);
+    const url  = decodeURIComponent(req.query.url as string);
 
     if (!url || !url.startsWith("https://res.cloudinary.com/"))
       throw new AppError("Invalid source URL.", 400);
@@ -1105,8 +1109,8 @@ streamFile: asyncHandler(async (req: Request, res: Response) => {
   }),
 
   // ── 9. List indicators with rejected submissions ───────────────────────────
-getRejectedSubmissions: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
+  getRejectedSubmissions: asyncHandler(async (req: Request, res: Response) => {
+    const user    = getAuthUser(req);
     const teamIds = await getUserTeamIds(user.id);
     const { clause: ownership, params } = ownershipClause([], user.id, teamIds);
 
@@ -1156,275 +1160,248 @@ getRejectedSubmissions: asyncHandler(async (req: Request, res: Response) => {
     res.status(200).json({ success: true, results: enriched.length, data: enriched });
   }),
 
-    // ── 10. Update document descriptions for a submission ─────────────────────────
-updateDocumentDescriptions: asyncHandler(async (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const { id } = req.params; // submission id
-  const { documents } = req.body; // Array of { documentId: string, description: string }
-  const { idempotencyKey } = req.body;
+  // ── 10. Update document descriptions for a submission ─────────────────────
+  updateDocumentDescriptions: asyncHandler(async (req: Request, res: Response) => {
+    const user = getAuthUser(req);
+    const { id } = req.params; // submission id
+    const { documents, idempotencyKey } = req.body;
 
-  if (!documents || !Array.isArray(documents) || documents.length === 0) {
-    throw new AppError("Documents array is required with at least one document.", 400);
-  }
+    if (!documents || !Array.isArray(documents) || documents.length === 0)
+      throw new AppError("Documents array is required with at least one document.", 400);
 
-  // Validate each document entry
-  for (const doc of documents) {
-    if (!doc.documentId || typeof doc.documentId !== 'string') {
-      throw new AppError("Each document must have a valid documentId.", 400);
-    }
-    if (doc.description !== undefined && typeof doc.description !== 'string') {
-      throw new AppError("Description must be a string.", 400);
-    }
-    if (doc.description && doc.description.length > MAX_DESCRIPTION_LENGTH) {
-      throw new AppError(`Description cannot exceed ${MAX_DESCRIPTION_LENGTH} characters.`, 400);
-    }
-  }
-
-  const teamIds = await getUserTeamIds(user.id);
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    const requestId = idempotencyKey || generateIdempotencyKey();
-    if (await checkIdempotency(client, requestId)) {
-      await client.query("ROLLBACK");
-      return res.status(200).json({
-        success: true,
-        message: "Duplicate request ignored",
-        idempotent: true,
-      });
-    }
-
-    // Verify submission exists and user has access
-    const subResult = await client.query(
-      `SELECT s.id, s.review_status, s.indicator_id
-       FROM submissions s
-       JOIN indicators i ON s.indicator_id = i.id
-       WHERE s.id = $1
-       FOR UPDATE`,
-      [id]
-    );
-
-    if (subResult.rows.length === 0) {
-      throw new AppError("Submission not found.", 404);
-    }
-
-    const submission = subResult.rows[0] as {
-      id: string;
-      review_status: string;
-      indicator_id: string;
-    };
-
-    // Check ownership via indicator
-    const indResult = await client.query(
-      "SELECT * FROM indicators WHERE id = $1",
-      [submission.indicator_id]
-    );
-    
-    if (indResult.rows.length === 0) {
-      throw new AppError("Indicator not found.", 404);
-    }
-    
-    const indicator = indResult.rows[0] as Record<string, unknown>;
-    await assertIndicatorOwnership(client, indicator, user.id, teamIds);
-
-    // Don't allow editing descriptions for accepted submissions
-    if (submission.review_status === "Accepted") {
-      throw new AppError("Cannot modify documents for an accepted submission.", 400);
-    }
-
-    // Update each document's description
-    const updatedDocuments = [];
-    const documentIds = documents.map((d: { documentId: string }) => d.documentId);
-    
-    // First verify all documents belong to this submission
-    const docCheck = await client.query(
-      `SELECT id FROM submission_documents 
-       WHERE id = ANY($1::uuid[]) AND submission_id = $2`,
-      [documentIds, submission.id]
-    );
-    
-    if (docCheck.rows.length !== documents.length) {
-      throw new AppError("One or more documents do not belong to this submission.", 400);
-    }
-
-    // Update descriptions
     for (const doc of documents) {
+      if (!doc.documentId || typeof doc.documentId !== "string")
+        throw new AppError("Each document must have a valid documentId.", 400);
+      if (doc.description !== undefined && typeof doc.description !== "string")
+        throw new AppError("Description must be a string.", 400);
+      if (doc.description && doc.description.length > MAX_DESCRIPTION_LENGTH)
+        throw new AppError(`Description cannot exceed ${MAX_DESCRIPTION_LENGTH} characters.`, 400);
+    }
+
+    const teamIds = await getUserTeamIds(user.id);
+    const client  = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const requestId = idempotencyKey || generateIdempotencyKey();
+      if (await checkIdempotency(client, requestId)) {
+        await client.query("ROLLBACK");
+        return res.status(200).json({
+          success: true,
+          message: "Duplicate request ignored",
+          idempotent: true,
+        });
+      }
+
+      const subResult = await client.query(
+        `SELECT s.id, s.review_status, s.indicator_id
+         FROM submissions s
+         JOIN indicators i ON s.indicator_id = i.id
+         WHERE s.id = $1
+         FOR UPDATE`,
+        [id],
+      );
+
+      if (subResult.rows.length === 0) throw new AppError("Submission not found.", 404);
+
+      const submission = subResult.rows[0] as {
+        id: string;
+        review_status: string;
+        indicator_id: string;
+      };
+
+      const indResult = await client.query(
+        "SELECT * FROM indicators WHERE id = $1",
+        [submission.indicator_id],
+      );
+      if (indResult.rows.length === 0) throw new AppError("Indicator not found.", 404);
+
+      await assertIndicatorOwnership(
+        client,
+        indResult.rows[0] as Record<string, unknown>,
+        user.id,
+        teamIds,
+      );
+
+      if (submission.review_status === "Accepted")
+        throw new AppError("Cannot modify documents for an accepted submission.", 400);
+
+      const documentIds = documents.map((d: { documentId: string }) => d.documentId);
+      const docCheck = await client.query(
+        `SELECT id FROM submission_documents
+         WHERE id = ANY($1::uuid[]) AND submission_id = $2`,
+        [documentIds, submission.id],
+      );
+
+      if (docCheck.rows.length !== documents.length)
+        throw new AppError("One or more documents do not belong to this submission.", 400);
+
+      const updatedDocuments = [];
+      for (const doc of documents) {
+        const updateResult = await client.query(
+          `UPDATE submission_documents
+           SET description = $1,
+               updated_at  = NOW()
+           WHERE id = $2
+           RETURNING id, evidence_url, file_name, description, status`,
+          [doc.description || "", doc.documentId],
+        );
+        if (updateResult.rows.length > 0)
+          updatedDocuments.push(updateResult.rows[0]);
+      }
+
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Documents Updated', $2, 'user', $3)`,
+        [
+          submission.indicator_id,
+          `Updated descriptions for ${updatedDocuments.length} document(s)`,
+          user.id,
+        ],
+      );
+
+      await storeIdempotencyKey(client, requestId);
+      await client.query("COMMIT");
+
+      res.status(200).json({
+        success: true,
+        message: `${updatedDocuments.length} document(s) updated successfully.`,
+        data: { submissionId: submission.id, updatedDocuments },
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }),
+
+  // ── 11. Update single document description ────────────────────────────────
+  updateDocumentDescription: asyncHandler(async (req: Request, res: Response) => {
+    const user = getAuthUser(req);
+    const { docId } = req.params;
+    const { description, idempotencyKey } = req.body;
+
+    if (description === undefined) throw new AppError("Description is required.", 400);
+    if (typeof description !== "string") throw new AppError("Description must be a string.", 400);
+    if (description.length > MAX_DESCRIPTION_LENGTH)
+      throw new AppError(`Description cannot exceed ${MAX_DESCRIPTION_LENGTH} characters.`, 400);
+
+    const teamIds = await getUserTeamIds(user.id);
+    const client  = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const requestId = idempotencyKey || generateIdempotencyKey();
+      if (await checkIdempotency(client, requestId)) {
+        await client.query("ROLLBACK");
+        return res.status(200).json({
+          success: true,
+          message: "Duplicate request ignored",
+          idempotent: true,
+        });
+      }
+
+      const docResult = await client.query(
+        `SELECT d.id, d.submission_id, d.evidence_url, d.file_name,
+                d.description AS old_description,
+                s.review_status, s.indicator_id
+         FROM submission_documents d
+         JOIN submissions s ON d.submission_id = s.id
+         WHERE d.id = $1
+         FOR UPDATE`,
+        [docId],
+      );
+
+      if (docResult.rows.length === 0) throw new AppError("Document not found.", 404);
+
+      const document = docResult.rows[0] as {
+        id: string;
+        submission_id: string;
+        evidence_url: string;
+        file_name: string;
+        old_description: string;
+        review_status: string;
+        indicator_id: string;
+      };
+
+      const indResult = await client.query(
+        "SELECT * FROM indicators WHERE id = $1",
+        [document.indicator_id],
+      );
+      if (indResult.rows.length === 0) throw new AppError("Indicator not found.", 404);
+
+      await assertIndicatorOwnership(
+        client,
+        indResult.rows[0] as Record<string, unknown>,
+        user.id,
+        teamIds,
+      );
+
+      if (document.review_status === "Accepted")
+        throw new AppError("Cannot modify documents for an accepted submission.", 400);
+
       const updateResult = await client.query(
         `UPDATE submission_documents
          SET description = $1,
-             updated_at = NOW()
+             updated_at  = NOW()
          WHERE id = $2
-         RETURNING id, evidence_url, file_name, description, status`,
-        [doc.description || "", doc.documentId]
+         RETURNING id, evidence_url, file_name, description, status, uploaded_at`,
+        [description, docId],
       );
-      
-      if (updateResult.rows.length > 0) {
-        updatedDocuments.push(updateResult.rows[0]);
-      }
-    }
 
-    // Add to review history
-    await client.query(
-      `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
-       VALUES ($1, 'Documents Updated', $2, 'user', $3)`,
-      [submission.indicator_id, `Updated descriptions for ${updatedDocuments.length} document(s)`, user.id]
-    );
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Document Description Updated', $2, 'user', $3)`,
+        [
+          document.indicator_id,
+          `Updated description for document: ${document.file_name}`,
+          user.id,
+        ],
+      );
 
-    await storeIdempotencyKey(client, requestId);
-    await client.query("COMMIT");
+      await storeIdempotencyKey(client, requestId);
+      await client.query("COMMIT");
 
-    res.status(200).json({
-      success: true,
-      message: `${updatedDocuments.length} document(s) updated successfully.`,
-      data: {
-        submissionId: submission.id,
-        updatedDocuments,
-      },
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
-}),
-
-// ── 11. Update single document description (simpler alternative) ────────────
-updateDocumentDescription: asyncHandler(async (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const { docId } = req.params;
-  const { description, idempotencyKey } = req.body;
-
-  if (description === undefined) {
-    throw new AppError("Description is required.", 400);
-  }
-
-  if (typeof description !== 'string') {
-    throw new AppError("Description must be a string.", 400);
-  }
-
-  if (description.length > MAX_DESCRIPTION_LENGTH) {
-    throw new AppError(`Description cannot exceed ${MAX_DESCRIPTION_LENGTH} characters.`, 400);
-  }
-
-  const teamIds = await getUserTeamIds(user.id);
-  const client = await pool.connect();
-
-  try {
-    await client.query("BEGIN");
-
-    const requestId = idempotencyKey || generateIdempotencyKey();
-    if (await checkIdempotency(client, requestId)) {
-      await client.query("ROLLBACK");
-      return res.status(200).json({
+      res.status(200).json({
         success: true,
-        message: "Duplicate request ignored",
-        idempotent: true,
+        message: "Document description updated successfully.",
+        data: {
+          document: updateResult.rows[0],
+          previousDescription: document.old_description,
+        },
       });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
     }
-
-    // Get document with submission and indicator access check
-    const docResult = await client.query(
-      `SELECT d.id, d.submission_id, d.evidence_url, d.file_name, d.description as old_description,
-              s.review_status, s.indicator_id
-       FROM submission_documents d
-       JOIN submissions s ON d.submission_id = s.id
-       WHERE d.id = $1
-       FOR UPDATE`,
-      [docId]
-    );
-
-    if (docResult.rows.length === 0) {
-      throw new AppError("Document not found.", 404);
-    }
-
-    const document = docResult.rows[0] as {
-      id: string;
-      submission_id: string;
-      evidence_url: string;
-      file_name: string;
-      old_description: string;
-      review_status: string;
-      indicator_id: string;
-    };
-
-    // Check ownership via indicator
-    const indResult = await client.query(
-      "SELECT * FROM indicators WHERE id = $1",
-      [document.indicator_id]
-    );
-    
-    if (indResult.rows.length === 0) {
-      throw new AppError("Indicator not found.", 404);
-    }
-    
-    const indicator = indResult.rows[0] as Record<string, unknown>;
-    await assertIndicatorOwnership(client, indicator, user.id, teamIds);
-
-    // Don't allow editing descriptions for accepted submissions
-    if (document.review_status === "Accepted") {
-      throw new AppError("Cannot modify documents for an accepted submission.", 400);
-    }
-
-    // Update the description
-    const updateResult = await client.query(
-      `UPDATE submission_documents
-       SET description = $1,
-           updated_at = NOW()
-       WHERE id = $2
-       RETURNING id, evidence_url, file_name, description, status, uploaded_at`,
-      [description, docId]
-    );
-
-    // Add to review history
-    await client.query(
-      `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
-       VALUES ($1, 'Document Description Updated', $2, 'user', $3)`,
-      [document.indicator_id, `Updated description for document: ${document.file_name}`, user.id]
-    );
-
-    await storeIdempotencyKey(client, requestId);
-    await client.query("COMMIT");
-
-    res.status(200).json({
-      success: true,
-      message: "Document description updated successfully.",
-      data: {
-        document: updateResult.rows[0],
-        previousDescription: document.old_description,
-      },
-    });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  } finally {
-    client.release();
-  }
-}),
+  }),
 
   // ── Internal: send email alerts after a submission ────────────────────────
- _sendAlerts: async (
+  _sendAlerts: async (
     user: IUser,
     indicator: Record<string, unknown>,
     quarter: number,
     achievedValue?: number,
   ): Promise<void> => {
-    const year = new Date().getFullYear();
+    const year  = new Date().getFullYear();
     const cycle = (indicator.reporting_cycle as string) ?? "Quarterly";
     const label = quarter === 0 ? "Annual" : `Q${quarter}`;
 
-    // Resolve activity description from whichever field is available
     const activityDescription =
       (indicator.activityDescription as string) ||
-      (indicator.activity as any)?.description ||
+      (indicator.activity as { description?: string } | undefined)?.description ||
       (indicator.instructions as string) ||
       "Performance Indicator";
 
     const unit = (indicator.unit as string) || "%";
 
-    // ── User confirmation email ──────────────────────────────────────────────
     await sendMail({
       to: user.email,
       subject: `Filing Confirmation: ${label} ${year}`,
@@ -1442,7 +1419,6 @@ updateDocumentDescription: asyncHandler(async (req: Request, res: Response) => {
       throw e;
     });
 
-    // ── Admin notification emails ────────────────────────────────────────────
     const admins = await pool.query(
       `SELECT email, name FROM users WHERE role = 'admin' AND is_active = true`,
     );
@@ -1470,7 +1446,4 @@ updateDocumentDescription: asyncHandler(async (req: Request, res: Response) => {
       );
     }
   },
-
-
-
 };

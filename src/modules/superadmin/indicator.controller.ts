@@ -343,6 +343,7 @@ export const getIndicatorById = asyncHandler(
   }
 );
 
+
 /* ─── 4. UPDATE INDICATOR ─────────────────────────────────────────────────── */
 
 export const updateIndicator = asyncHandler(
@@ -350,38 +351,94 @@ export const updateIndicator = asyncHandler(
     const { id } = req.params as { id: string };
     const { weight, target, deadline, instructions, reportingCycle } = req.body;
 
-    const check = await pool.query(
-      "SELECT status FROM indicators WHERE id = $1",
-      [id]
-    );
-    if (!check.rows[0]) throw new AppError("Indicator not found.", 404);
-    if (
-      ["Awaiting Admin Approval", "Awaiting Super Admin"].includes(
-        check.rows[0].status
-      )
-    ) {
-      throw new AppError("Cannot edit while under review.", 400);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const check = await client.query(
+        "SELECT status, reporting_cycle FROM indicators WHERE id = $1 FOR UPDATE",
+        [id]
+      );
+      if (!check.rows[0]) throw new AppError("Indicator not found.", 404);
+      if (
+        ["Awaiting Admin Approval", "Awaiting Super Admin"].includes(
+          check.rows[0].status
+        )
+      ) {
+        throw new AppError("Cannot edit while under review.", 400);
+      }
+
+      const cycleChanged =
+        reportingCycle && reportingCycle !== check.rows[0].reporting_cycle;
+
+      if (cycleChanged) {
+        // Wipe submissions and their documents (cascade handles submission_documents
+        // if you have ON DELETE CASCADE, otherwise delete documents first)
+        await client.query(
+          `DELETE FROM submission_documents
+           WHERE submission_id IN (
+             SELECT id FROM submissions WHERE indicator_id = $1
+           )`,
+          [id]
+        );
+        await client.query(
+          "DELETE FROM submissions WHERE indicator_id = $1",
+          [id]
+        );
+        await client.query(
+          "DELETE FROM review_history WHERE indicator_id = $1",
+          [id]
+        );
+      }
+
+      const newActiveQuarter =
+        cycleChanged && reportingCycle === "Annual" ? 1 : null;
+
+      await client.query(
+        `UPDATE indicators SET
+           weight          = COALESCE($1, weight),
+           target          = COALESCE($2, target),
+           deadline        = COALESCE($3, deadline),
+           instructions    = COALESCE($4, instructions),
+           reporting_cycle = COALESCE($5, reporting_cycle),
+           active_quarter  = COALESCE($6, active_quarter),
+           progress               = CASE WHEN $7 THEN 0    ELSE progress               END,
+           current_total_achieved = CASE WHEN $7 THEN 0    ELSE current_total_achieved END,
+           status = CASE
+             WHEN $7                                                THEN 'Pending'
+             WHEN $3 IS NOT NULL                                    THEN 'Pending'
+             WHEN $2 IS NOT NULL                                    THEN 'Pending'
+             WHEN $5 IS NOT NULL AND $5 IS DISTINCT FROM reporting_cycle THEN 'Pending'
+             ELSE status
+           END,
+           updated_at = NOW()
+         WHERE id = $8`,
+        [
+          weight,
+          target,
+          deadline,
+          instructions,
+          reportingCycle,
+          newActiveQuarter,
+          cycleChanged,  // $7 — drives the progress/status reset cleanly
+          id,
+        ]
+      );
+
+      await client.query("COMMIT");
+
+      const { rows } = await pool.query(
+        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+        [id]
+      );
+
+      res.status(200).json({ success: true, data: rows[0] });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
     }
-
-    await pool.query(
-      `UPDATE indicators SET
-         weight          = COALESCE($1, weight),
-         target          = COALESCE($2, target),
-         deadline        = COALESCE($3, deadline),
-         instructions    = COALESCE($4, instructions),
-         reporting_cycle = COALESCE($5, reporting_cycle),
-         status          = CASE WHEN $3 IS NOT NULL OR $2 IS NOT NULL THEN 'Pending' ELSE status END,
-         updated_at      = NOW()
-       WHERE id = $6`,
-      [weight, target, deadline, instructions, reportingCycle, id]
-    );
-
-    const { rows } = await pool.query(
-      `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
-      [id]
-    );
-
-    res.status(200).json({ success: true, data: rows[0] });
   }
 );
 
@@ -405,8 +462,8 @@ export const deleteIndicator = asyncHandler(
   }
 );
 
-/* ─── 6. GET REJECTED BY ADMIN ────────────────────────────────────────────── */
 
+/* ─── 6. GET REJECTED BY ADMIN ────────────────────────────────────────────── */
 export const getRejectedByAdmin = asyncHandler(
   async (_req: Request, res: Response) => {
     const { rows } = await pool.query(
