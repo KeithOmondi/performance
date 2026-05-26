@@ -635,13 +635,13 @@ export const UserIndicatorController = {
 
       const requestId = idempotencyKey || generateIdempotencyKey();
       if (await checkIdempotency(client, requestId)) {
-        await client.query("ROLLBACK");
-        return res.status(200).json({
-          success: true,
-          message: "Duplicate request ignored",
-          idempotent: true,
-        });
-      }
+  await client.query("ROLLBACK");
+  return res.status(200).json({
+    success: true,
+    message: "Duplicate request ignored",
+    idempotent: true,
+  });
+}
 
       const indRes = await client.query(
         "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",

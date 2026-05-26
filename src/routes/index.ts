@@ -11,6 +11,7 @@ import teamRoutes from "../modules/team/team.routes"
 import dashboardRoutes from "../modules/controllers/dashboardRoutes"
 import ExaminerAssignmentRoutes from "../modules/examiner/examinerAssignment.routes"
 import ArchiveRoutes from "../modules/archive/archiveroutes"
+import notificationRoutes from "../modules/notifications/notificationroutes"
 
 const router = Router();
 
@@ -49,6 +50,9 @@ router.use("/teams", teamRoutes);
 router.use("/dashboard", dashboardRoutes);
 router.use("/examiner", ExaminerAssignmentRoutes)
 router.use("/archive", ArchiveRoutes)
+
+//================ Notification ================
+router.use("/notifications", notificationRoutes);
 
 
 

@@ -480,16 +480,20 @@ export const getRejectedByAdmin = asyncHandler(
 export const superAdminReviewProcess = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
-    const { decision, reason, progressOverride, nextDeadline } = req.body;
-    const adminId  = (req as any).user.id;
+    const { decision, reason, progressOverride } = req.body;
+    const adminId = (req as any).user.id;
     const isApprove = decision === "Approved";
+
+    if (isApprove && (progressOverride === undefined || progressOverride === null)) {
+      throw new AppError("Achieved value (progressOverride) is required when approving.", 400);
+    }
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
       const indRes = await client.query(
-        "SELECT * FROM indicators WHERE id = $1",
+        "SELECT * FROM indicators WHERE id = $1 FOR UPDATE",
         [id]
       );
       const indicator = indRes.rows[0];
@@ -509,41 +513,51 @@ export const superAdminReviewProcess = asyncHandler(
 
       let nextStatus: string;
       let nextQuarter = indicator.active_quarter;
-      let newDeadline = indicator.deadline;
 
       if (isApprove) {
+        const achievedValue = Number(progressOverride);
+        const newTotal = (indicator.current_total_achieved || 0) + achievedValue;
+        const progressPct = indicator.target > 0
+          ? Math.min(Math.round((newTotal / indicator.target) * 100), 100)
+          : 0;
+
         if (
           indicator.reporting_cycle === "Quarterly" &&
           indicator.active_quarter < 4
         ) {
           nextStatus  = "Pending";
           nextQuarter = indicator.active_quarter + 1;
-          if (nextDeadline) newDeadline = new Date(nextDeadline);
         } else {
           nextStatus = "Completed";
         }
+
+        await client.query(
+          `UPDATE indicators
+           SET status                 = $1,
+               active_quarter         = $2,
+               current_total_achieved = $3,
+               progress               = $4,
+               updated_at             = NOW()
+           WHERE id = $5`,
+          [nextStatus, nextQuarter, newTotal, progressPct, id]
+        );
       } else {
         nextStatus = "Rejected by Super Admin";
+
+        await client.query(
+          `UPDATE indicators
+           SET status     = $1,
+               updated_at = NOW()
+           WHERE id = $2`,
+          [nextStatus, id]
+        );
       }
-
-      const achievedValue = progressOverride ?? indicator.current_total_achieved;
-
-      await client.query(
-        `UPDATE indicators
-         SET status                 = $1,
-             active_quarter         = $2,
-             deadline               = $3,
-             current_total_achieved = $4,
-             updated_at             = NOW()
-         WHERE id = $5`,
-        [nextStatus, nextQuarter, newDeadline, achievedValue, id]
-      );
 
       await client.query(
         `INSERT INTO review_history
-           (indicator_id, action, reason, reviewer_role, reviewed_by, next_deadline)
-         VALUES ($1, $2, $3, 'superadmin', $4, $5)`,
-        [id, isApprove ? "Approved" : "Rejected", reason, adminId, nextDeadline || null]
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, $2, $3, 'superadmin', $4)`,
+        [id, isApprove ? "Approved" : "Rejected", reason, adminId]
       );
 
       await client.query("COMMIT");

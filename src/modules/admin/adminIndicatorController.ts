@@ -50,19 +50,20 @@ const INDICATOR_DETAIL_QUERY = `
             END AS period_key,
             json_agg(
               json_build_object(
-                'id',                s.id,
-                'indicatorId',       s.indicator_id,
-                'quarter',           s.quarter,
-                'year',              s.year,
-                'reviewStatus',      s.review_status,
-                'adminComment',      s.admin_comment,
-                'resubmissionCount', s.resubmission_count,
-                'achievedValue',     s.achieved_value,
-                'notes',             s.notes,
-                'submittedAt',       s.submitted_at,
-                'isReviewed',        s.is_reviewed,
-                'submittedById',     s.submitted_by,
-                'submittedByName',   su.name,
+                'id',                      s.id,
+                'indicatorId',             s.indicator_id,
+                'quarter',                 s.quarter,
+                'year',                    s.year,
+                'reviewStatus',            s.review_status,
+                'adminComment',            s.admin_comment,
+                'resubmissionCount',       s.resubmission_count,
+                'achievedValue',           s.achieved_value,
+                'notes',                   s.notes,
+                'submittedAt',             s.submitted_at,
+                'isReviewed',              s.is_reviewed,
+                'submittedById',           s.submitted_by,
+                'submittedByName',         su.name,
+                'previousRejectionReason', s.previous_rejection_reason,
                 'documents', (
                   SELECT COALESCE(
                     json_agg(
@@ -107,194 +108,38 @@ const INDICATOR_DETAIL_QUERY = `
   LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
 `;
 
-// ─── Helper Functions ─────────────────────────────────────────────────────────
+// ─── Shared: fetch & lock indicator with assignee ─────────────────────────────
 
-const validateSubmissionPeriod = (
-  reportingCycle: string,
-  quarter: number,
-  year: number
-): void => {
-  if (!year || year < 2000 || year > 2100) {
-    throw new AppError("Invalid year provided", 400);
+async function fetchAndLockIndicator(client: any, id: string) {
+  const { rows } = await client.query(
+    `SELECT
+       i.*,
+       i.active_quarter  AS "activeQuarter",
+       i.reporting_cycle AS "reportingCycle",
+       COALESCE(u.name,  t.name)  AS name,
+       COALESCE(u.email, t.email) AS email
+     FROM indicators i
+     LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+     LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+     WHERE i.id = $1
+     FOR UPDATE OF i`,
+    [id]
+  );
+
+  const indicator = rows[0];
+  if (!indicator) throw new AppError("Indicator not found.", 404);
+
+  if (indicator.status !== "Awaiting Admin Approval") {
+    throw new AppError(
+      `Indicator is not awaiting admin review (current status: ${indicator.status}).`,
+      400
+    );
   }
 
-  if (reportingCycle === "Annual") {
-    if (quarter !== 1) {
-      throw new AppError("Annual submissions must use quarter 1", 400);
-    }
-  } else if (reportingCycle === "Quarterly") {
-    if (quarter < 1 || quarter > 4) {
-      throw new AppError(
-        "Quarter must be between 1 and 4 for quarterly indicators",
-        400
-      );
-    }
-  }
-};
+  return indicator;
+}
 
-/**
- * Returns true when the indicator has no further periods to submit.
- * (kept for potential future use)
- */
-const isFinalPeriod = (
-  currentQuarter: number,
-  reportingCycle: string
-): boolean => {
-  if (reportingCycle === "Annual") return true;
-  return currentQuarter >= 4;
-};
-
-// ─── 1. Create / Resubmit Submission (User) ───────────────────────────────────
-
-export const createSubmission = asyncHandler(
-  async (req: Request, res: Response) => {
-    const { indicatorId, achievedValue, notes, quarter, year } = req.body;
-    const userId = (req as any).user?.id;
-
-    if (!userId) {
-      throw new AppError("Authenticated user required to submit", 401);
-    }
-
-    if (!indicatorId || achievedValue === undefined || !year) {
-      throw new AppError(
-        "Missing required fields: indicatorId, achievedValue, year",
-        400
-      );
-    }
-
-    // Verify user exists and is active
-    const { rows: userRows } = await pool.query(
-      `SELECT id FROM users WHERE id = $1 AND is_active = true`,
-      [userId]
-    );
-    if (!userRows[0]) {
-      throw new AppError("Submitter user not found or inactive", 400);
-    }
-
-    // Fetch indicator
-    const { rows: indicatorRows } = await pool.query(
-      `SELECT id, status, reporting_cycle, active_quarter, assignee_id
-       FROM indicators
-       WHERE id = $1`,
-      [indicatorId]
-    );
-
-    if (!indicatorRows[0]) {
-      throw new AppError("Indicator not found", 404);
-    }
-
-    const indicator = indicatorRows[0];
-
-    if (indicator.assignee_id !== userId) {
-      throw new AppError(
-        "You are not authorized to submit for this indicator",
-        403
-      );
-    }
-
-    if (indicator.status !== "Pending") {
-      throw new AppError(
-        `Cannot submit for indicator with status: ${indicator.status}`,
-        400
-      );
-    }
-
-    const submissionQuarter =
-      indicator.reporting_cycle === "Annual" ? 1 : quarter;
-
-    validateSubmissionPeriod(indicator.reporting_cycle, submissionQuarter, year);
-
-    let existingQuery = `
-      SELECT id, review_status, resubmission_count
-      FROM submissions
-      WHERE indicator_id = $1 AND year = $2
-    `;
-    const queryParams: (string | number)[] = [indicatorId, year];
-
-    if (indicator.reporting_cycle === "Quarterly") {
-      existingQuery += ` AND quarter = $3`;
-      queryParams.push(submissionQuarter);
-    }
-
-    const { rows: existingSubmissions } = await pool.query(
-      existingQuery,
-      queryParams
-    );
-
-    let submissionId: string;
-    let resubmissionCount = 0;
-    let isResubmission = false;
-
-    if (existingSubmissions.length > 0) {
-      const existing = existingSubmissions[0];
-
-      if (
-        existing.review_status === "Pending" ||
-        existing.review_status === "Verified"
-      ) {
-        throw new AppError(
-          "Cannot resubmit while current submission is under review",
-          400
-        );
-      }
-
-      isResubmission = true;
-      resubmissionCount = existing.resubmission_count + 1;
-
-      const { rows: inserted } = await pool.query(
-        `INSERT INTO submissions (
-           indicator_id, quarter, year, achieved_value, notes,
-           submitted_at, review_status, resubmission_count, is_reviewed,
-           submitted_by
-         ) VALUES ($1, $2, $3, $4, $5, NOW(), 'Pending', $6, false, $7)
-         RETURNING id`,
-        [
-          indicatorId,
-          submissionQuarter,
-          year,
-          achievedValue,
-          notes,
-          resubmissionCount,
-          userId,
-        ]
-      );
-
-      submissionId = inserted[0].id;
-    } else {
-      const { rows: inserted } = await pool.query(
-        `INSERT INTO submissions (
-           indicator_id, quarter, year, achieved_value, notes,
-           submitted_at, review_status, resubmission_count, submitted_by
-         ) VALUES ($1, $2, $3, $4, $5, NOW(), 'Pending', 0, $6)
-         RETURNING id`,
-        [indicatorId, submissionQuarter, year, achievedValue, notes, userId]
-      );
-
-      submissionId = inserted[0].id;
-    }
-
-    await pool.query(
-      `UPDATE indicators
-       SET status = 'Awaiting Admin Approval', updated_at = NOW()
-       WHERE id = $1`,
-      [indicatorId]
-    );
-
-    res.status(201).json({
-      success: true,
-      message: isResubmission ? "Resubmission successful" : "Submission successful",
-      data: {
-        submissionId,
-        isResubmission,
-        resubmissionCount,
-        quarter: submissionQuarter,
-        year,
-      },
-    });
-  }
-);
-
-// ─── 2. Fetch All Indicators for Admin ────────────────────────────────────────
+// ─── 1. Fetch All Indicators for Admin ───────────────────────────────────────
 
 export const fetchIndicatorsForAdmin = asyncHandler(
   async (req: Request, res: Response) => {
@@ -325,7 +170,7 @@ export const fetchIndicatorsForAdmin = asyncHandler(
   }
 );
 
-// ─── 3. Get Indicator By ID (Admin) ───────────────────────────────────────────
+// ─── 2. Get Indicator By ID (Admin) ──────────────────────────────────────────
 
 export const getIndicatorByIdAdmin = asyncHandler(
   async (req: Request, res: Response) => {
@@ -357,23 +202,154 @@ export const getIndicatorByIdAdmin = asyncHandler(
   }
 );
 
-// ─── 4. Admin Review Process ──────────────────────────────────────────────────
+// ─── 3. Approve Submission (Admin) ───────────────────────────────────────────
 
-export const adminReviewProcess = asyncHandler(
+export const approveSubmission = asyncHandler(
   async (req: Request, res: Response) => {
-    const { id } = req.params;
-    const {
-      decision,
-      adminOverallComments,
-      submissionUpdates,
-      documentUpdates,
-    } = req.body;
+    const id = req.params.id as string;
+    const { submissionUpdates, adminOverallComments } = req.body;
 
     const adminId   = (req as any).user.id;
     const adminName = (req as any).user.name;
 
-    if (!["Verified", "Rejected"].includes(decision)) {
-      throw new AppError('Decision must be "Verified" or "Rejected".', 400);
+    const client = await pool.connect();
+
+    try {
+      await client.query("BEGIN");
+
+      const indicator = await fetchAndLockIndicator(client, id);
+
+      // ── Mark all pending submissions as Verified ──────────────────────────
+      if (Array.isArray(submissionUpdates) && submissionUpdates.length > 0) {
+        for (const update of submissionUpdates) {
+          if (!update.submissionId) continue;
+
+          await client.query(
+            `UPDATE submissions
+             SET review_status = 'Verified',
+                 admin_comment = $1,
+                 is_reviewed   = true
+             WHERE id = $2
+               AND review_status = 'Pending'`,
+            [
+              update.adminComment?.trim() || adminOverallComments || "Approved.",
+              update.submissionId,
+            ]
+          );
+        }
+      }
+
+      // ── Advance indicator to next stage ───────────────────────────────────
+      await client.query(
+        `UPDATE indicators
+         SET status = 'Awaiting Super Admin',
+             admin_overall_comments = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [adminOverallComments || "Approved by admin.", id]
+      );
+
+      // ── Log ───────────────────────────────────────────────────────────────
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Verified', $2, 'admin', $3)`,
+        [id, adminOverallComments || "Approved by admin.", adminId]
+      );
+
+      await client.query("COMMIT");
+
+      // ── Notify super admins ───────────────────────────────────────────────
+      const taskTitle = indicator.instructions || "Performance Indicator";
+      const year      = new Date().getFullYear();
+
+      const { rows: superAdmins } = await pool.query(
+        `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`
+      );
+
+      superAdmins.forEach(({ email }: { email: string }) => {
+        sendMail({
+          to: email,
+          subject: "Submission Ready for Final Approval",
+          html: superAdminReviewNeededTemplate(
+            taskTitle,
+            indicator.name,
+            adminName,
+            indicator.reporting_cycle,
+            indicator.active_quarter,
+            year
+          ),
+        }).catch(console.error);
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Submission approved and forwarded to Super Admin.",
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+);
+
+// ─── 4. Reject Submission (Admin) ────────────────────────────────────────────
+
+export const rejectSubmission = asyncHandler(
+  async (req: Request, res: Response) => {
+    const id = req.params.id as string;
+    const { submissionUpdates, documentUpdates, adminOverallComments } = req.body;
+    const adminId = (req as any).user.id;
+
+    // 🚀 Incoming request logger
+    console.log("📥 [rejectSubmission] Incoming Request Details:", {
+      indicatorId: id,
+      adminId,
+      adminOverallComments,
+      submissionUpdatesCount: Array.isArray(submissionUpdates) ? submissionUpdates.length : 0,
+      documentUpdatesCount: Array.isArray(documentUpdates) ? documentUpdates.length : 0,
+      payload: { submissionUpdates, documentUpdates }
+    });
+
+    // ── 1. Global Comment Validation ──────────────────────────────────────
+    if (!adminOverallComments?.trim()) {
+      throw new AppError(
+        "An overall comment is required when rejecting a submission.",
+        400
+      );
+    }
+
+    // ── 2. Individual Document Rejection Reason Validation ─────────────────
+    if (Array.isArray(documentUpdates) && documentUpdates.length > 0) {
+      for (const doc of documentUpdates) {
+        if (!doc.documentId) continue;
+        
+        // If the document is being set to 'Rejected', it MUST have a reason
+        if (doc.status === "Rejected" && !doc.reason?.trim()) {
+          throw new AppError(
+            `A specific rejection reason is required for document ID: ${doc.documentId}`,
+            400
+          );
+        }
+      }
+    }
+
+    // ── 3. Individual Submission Rejection Reason Validation ───────────────
+    if (Array.isArray(submissionUpdates) && submissionUpdates.length > 0) {
+      for (const update of submissionUpdates) {
+        if (!update.submissionId) continue;
+
+        // If there is no specific comment for this submission, and no global comment, block it
+        const finalComment = update.adminComment?.trim() || adminOverallComments?.trim();
+        if (!finalComment) {
+          throw new AppError(
+            `A rejection comment is required for submission ID: ${update.submissionId}`,
+            400
+          );
+        }
+      }
     }
 
     const client = await pool.connect();
@@ -381,28 +357,15 @@ export const adminReviewProcess = asyncHandler(
     try {
       await client.query("BEGIN");
 
-      const { rows: indRows } = await client.query(
-        `SELECT
-           i.*,
-           i.active_quarter  AS "activeQuarter",
-           i.reporting_cycle AS "reportingCycle",
-           COALESCE(u.name,  t.name)  AS name,
-           COALESCE(u.email, t.email) AS email
-         FROM indicators i
-         LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
-         LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
-         WHERE i.id = $1
-         FOR UPDATE OF i`,
-        [id]
-      );
+      const indicator = await fetchAndLockIndicator(client, id);
 
-      const indicator = indRows[0];
-      if (!indicator) throw new AppError("Indicator not found.", 404);
-
+      // ── Apply document-level rejections ───────────────────────────────────
       let hasRejectedDocument = false;
 
       if (Array.isArray(documentUpdates) && documentUpdates.length > 0) {
         for (const doc of documentUpdates) {
+          if (!doc.documentId) continue;
+
           if (doc.status === "Rejected") hasRejectedDocument = true;
 
           await client.query(
@@ -414,98 +377,86 @@ export const adminReviewProcess = asyncHandler(
         }
       }
 
-      const finalDecision      = hasRejectedDocument ? "Rejected" : decision;
-      const isVerified         = finalDecision === "Verified";
-      const newIndicatorStatus = isVerified
-        ? "Awaiting Super Admin"
-        : "Rejected by Admin";
+      console.log("[rejectSubmission] indicator:", {
+        id,
+        hasRejectedDocument,
+        adminOverallComments,
+        submissionUpdates,
+        documentUpdates,
+      });
 
-      await client.query(
-        `UPDATE indicators
-         SET status = $1, admin_overall_comments = $2, updated_at = NOW()
-         WHERE id = $3`,
-        [newIndicatorStatus, adminOverallComments, id]
-      );
-
+      // ── Mark submissions as Rejected ──────────────────────────────────────
       if (Array.isArray(submissionUpdates) && submissionUpdates.length > 0) {
         for (const update of submissionUpdates) {
+          if (!update.submissionId) continue;
+
           await client.query(
             `UPDATE submissions
-             SET review_status = $1,
-                 admin_comment = $2,
+             SET review_status = 'Rejected',
+                 admin_comment = $1,
                  is_reviewed   = true
-             WHERE id = $3`,
+             WHERE id = $2`,
             [
-              isVerified ? "Verified" : "Rejected",
-              update.adminComment ?? adminOverallComments,
+              update.adminComment?.trim() || adminOverallComments,
               update.submissionId,
             ]
           );
         }
       }
 
+      // ── Set indicator back to rejected ────────────────────────────────────
+      await client.query(
+        `UPDATE indicators
+         SET status = 'Rejected by Admin',
+             admin_overall_comments = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [adminOverallComments, id]
+      );
+
+      // ── Log ───────────────────────────────────────────────────────────────
       await client.query(
         `INSERT INTO review_history
            (indicator_id, action, reason, reviewer_role, reviewed_by)
-         VALUES ($1, $2, $3, 'admin', $4)`,
-        [
-          id,
-          isVerified ? "Verified" : "Correction Requested",
-          adminOverallComments,
-          adminId,
-        ]
+         VALUES ($1, 'Correction Requested', $2, 'admin', $3)`,
+        [id, adminOverallComments, adminId]
       );
 
       await client.query("COMMIT");
 
+      // ── Notify assignee ───────────────────────────────────────────────────
       const taskTitle = indicator.instructions || "Performance Indicator";
       const year      = new Date().getFullYear();
 
-      if (isVerified) {
-        const { rows: superAdmins } = await pool.query(
-          `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`
-        );
+      const rejectionComment = hasRejectedDocument
+        ? `Specific documents were rejected. ${adminOverallComments}`.trim()
+        : adminOverallComments;
 
-        superAdmins.forEach(({ email }: { email: string }) => {
-          sendMail({
-            to: email,
-            subject: "Submission Ready for Final Approval",
-            html: superAdminReviewNeededTemplate(
-              taskTitle,
-              indicator.name,
-              adminName,
-              indicator.reporting_cycle,
-              indicator.active_quarter,
-              year
-            ),
-          }).catch(console.error);
-        });
-      } else {
-        const comment = hasRejectedDocument
-          ? `Specific documents were rejected: ${adminOverallComments}`
-          : adminOverallComments;
+      console.log("[rejectSubmission] sending rejection email to:", indicator.email, {
+        rejectionComment,
+        hasRejectedDocument,
+      });
 
-        sendMail({
-          to: indicator.email,
-          subject: "Submission Returned for Correction",
-          html: submissionRejectedTemplate(
-            indicator.name,
-            taskTitle,
-            indicator.reporting_cycle,
-            indicator.active_quarter,
-            year,
-            "Admin",
-            comment
-          ),
-        }).catch(console.error);
-      }
+      sendMail({
+        to: indicator.email,
+        subject: "Submission Returned for Correction",
+        html: submissionRejectedTemplate(
+          indicator.name,
+          taskTitle,
+          indicator.reporting_cycle,
+          indicator.active_quarter,
+          year,
+          "Admin",
+          rejectionComment
+        ),
+      }).catch(console.error);
 
       res.status(200).json({
         success: true,
-        message: isVerified
-          ? "Verified successfully."
-          : "Rejected for correction.",
-        autoRejectedDueToDocs: hasRejectedDocument && decision === "Verified",
+        message: "Submission returned for correction.",
+        data: {
+          autoRejectedDueToDocs: hasRejectedDocument,
+        },
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -546,18 +497,19 @@ export const getIndicatorSubmissions = asyncHandler(
     const { rows } = await pool.query(
       `SELECT
          s.id,
-         s.indicator_id       AS "indicatorId",
+         s.indicator_id              AS "indicatorId",
          s.quarter,
          s.year,
-         s.achieved_value     AS "achievedValue",
+         s.achieved_value            AS "achievedValue",
          s.notes,
-         s.review_status      AS "reviewStatus",
-         s.admin_comment      AS "adminComment",
-         s.resubmission_count AS "resubmissionCount",
-         s.submitted_at       AS "submittedAt",
-         s.is_reviewed        AS "isReviewed",
-         s.submitted_by       AS "submittedById",
-         su.name              AS "submittedByName",
+         s.review_status             AS "reviewStatus",
+         s.admin_comment             AS "adminComment",
+         s.resubmission_count        AS "resubmissionCount",
+         s.submitted_at              AS "submittedAt",
+         s.is_reviewed               AS "isReviewed",
+         s.submitted_by              AS "submittedById",
+         s.previous_rejection_reason AS "previousRejectionReason",
+         su.name                     AS "submittedByName",
          COALESCE(
            (
              SELECT json_agg(
@@ -582,7 +534,7 @@ export const getIndicatorSubmissions = asyncHandler(
        FROM submissions s
        LEFT JOIN users su ON su.id = s.submitted_by
        WHERE s.indicator_id = $1
-       ORDER BY s.year DESC, s.quarter DESC`,
+       ORDER BY s.year DESC, s.quarter DESC, s.submitted_at DESC`,
       [id]
     );
 
