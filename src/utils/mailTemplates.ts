@@ -300,4 +300,68 @@ export const taskDueSoonTemplate = (
       Please log in to prepare and submit your progress report before the deadline.
     </p>
   `);
+
+
+  // ─── Super Admin Decision: Approved ──────────────────────────────────────────
+
+export const superAdminApprovedTemplate = (
+  name: string,
+  activityDescription: string,
+  reportingCycle: string,
+  quarter: string | number,
+  year: number,
+  certifiedValue?: number,
+  unit?: string,
+) =>
+  baseLayout(`
+    <h2 style="color: #16a34a; margin-top: 0;">✅ Final Certification Granted</h2>
+    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been reviewed and granted final certification by the Super Admin.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ...(certifiedValue !== undefined ? [["Certified Value", `${certifiedValue} ${unit || "%"}`] as [string, string]] : []),
+      ["Status", "Finally Certified"],
+      ["Certified By", "Super Admin"],
+    ])}
+
+    ${ctaButton("View Dashboard", `${DASHBOARD_URL}/user/dashboard`)}
+
+    <p style="color: #6b7280; font-size: 13px;">
+      No further action is required. This record has been officially certified.
+    </p>
+  `);
+
+// ─── Super Admin Decision: Rejected ──────────────────────────────────────────
+
+export const superAdminRejectedTemplate = (
+  name: string,
+  activityDescription: string,
+  reportingCycle: string,
+  quarter: string | number,
+  year: number,
+  reason: string,
+) =>
+  baseLayout(`
+    <h2 style="color: #dc2626; margin-top: 0;">❌ Submission Returned by Super Admin</h2>
+    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been reviewed by the Super Admin and returned for correction. Please address the issues noted below and resubmit.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ["Reviewed By", "Super Admin"],
+      ["Action Required", "Resubmission Required"],
+    ])}
+
+    <div style="background: #fef2f2; border-left: 4px solid #dc2626; padding: 16px; margin: 20px 0; border-radius: 4px;">
+      <strong style="color: #dc2626; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;">Reason for Return:</strong>
+      <p style="color: #374151; margin: 8px 0 0 0; font-size: 14px;">${reason}</p>
+    </div>
+
+    ${ctaButton("Resubmit Now", `${DASHBOARD_URL}/user/dashboard`)}
+
+    <p style="color: #6b7280; font-size: 13px;">
+      Please log in, review the feedback carefully, make the necessary corrections, and resubmit your progress report.
+    </p>
+  `);
   
