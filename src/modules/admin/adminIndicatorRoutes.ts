@@ -18,15 +18,16 @@ router.use(restrictTo("admin"));
 router.get("/all", fetchIndicatorsForAdmin);
 router.get("/resubmitted", fetchResubmittedIndicators);
 
+// ─── Calendar Routes (must be before /:id) ───────────────────────────────────
+router.get("/calendar/upcoming", getUpcomingDeadlines);
+router.get("/calendar/:id",      getIndicatorCalendarEvents);
+router.get("/calendar",          getCalendarEvents);
+
 // ─── Single Resource Routes ──────────────────────────────────────────────────
 router.get("/:id", getIndicatorByIdAdmin);
 
 // ─── Action Routes ───────────────────────────────────────────────────────────
 router.patch("/:id/approve", approveSubmission);
 router.patch("/:id/reject", rejectSubmission);
-
-router.get("/calendar/upcoming", getUpcomingDeadlines);  // ← must be before /:id
-router.get("/calendar/:id",      getIndicatorCalendarEvents);
-router.get("/calendar",          getCalendarEvents);
 
 export default router;
