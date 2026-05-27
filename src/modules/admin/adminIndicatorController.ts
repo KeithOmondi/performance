@@ -541,3 +541,47 @@ export const getIndicatorSubmissions = asyncHandler(
     res.status(200).json({ success: true, data: rows });
   }
 );
+
+export const getAdminApprovedIndicators = asyncHandler(
+  async (_req: Request, res: Response) => {
+    const { rows } = await pool.query(`
+      WITH admin_approved AS (
+        SELECT DISTINCT i.id
+        FROM indicators i
+        JOIN review_history rh ON rh.indicator_id = i.id
+        WHERE rh.action = 'Verified' AND rh.reviewer_role = 'admin'
+      )
+      ${INDICATOR_DETAIL_QUERY}
+      WHERE i.id IN (SELECT id FROM admin_approved)
+      ORDER BY i.updated_at DESC
+    `);
+
+    // Optionally attach review history for each indicator (single additional query)
+    const indicatorIds = rows.map(row => row.id);
+    let historyMap = new Map();
+    if (indicatorIds.length) {
+      const { rows: historyRows } = await pool.query(
+        `SELECT
+           rh.*,
+           rh.reviewer_role AS "reviewerRole",
+           u.name AS "reviewedByName"
+         FROM review_history rh
+         LEFT JOIN users u ON rh.reviewed_by = u.id
+         WHERE rh.indicator_id = ANY($1)
+         ORDER BY rh.at DESC`,
+        [indicatorIds]
+      );
+      historyRows.forEach(h => {
+        if (!historyMap.has(h.indicator_id)) historyMap.set(h.indicator_id, []);
+        historyMap.get(h.indicator_id).push(h);
+      });
+    }
+
+    const enrichedRows = rows.map(row => ({
+      ...row,
+      reviewHistory: historyMap.get(row.id) || [],
+    }));
+
+    res.status(200).json({ success: true, data: enrichedRows });
+  }
+);

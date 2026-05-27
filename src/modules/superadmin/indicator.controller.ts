@@ -3,7 +3,7 @@ import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
 import { sendMail } from "../../utils/sendMail";
-import { taskAssignedTemplate } from "../../utils/mailTemplates";
+import { superAdminApprovedTemplate, superAdminRejectedTemplate, taskAssignedTemplate } from "../../utils/mailTemplates";
 
 /* ─── SHARED SELECT FRAGMENT ─────────────────────────────────────────────────
    Every query that returns an indicator to the frontend uses this fragment.
@@ -489,6 +489,10 @@ export const superAdminReviewProcess = asyncHandler(
     }
 
     const client = await pool.connect();
+    let submissionYear: number | null = null;
+    let achievedValue: number | null = null;
+    let assigneeInfo: { emails: string[]; displayName: string } | null = null;
+
     try {
       await client.query("BEGIN");
 
@@ -501,6 +505,30 @@ export const superAdminReviewProcess = asyncHandler(
       if (!indicator || indicator.status !== "Awaiting Super Admin") {
         throw new AppError("Not in Super Admin review state.", 400);
       }
+
+      // Fetch submission details for the active quarter (needed for emails later)
+      const subRes = await client.query(
+        `SELECT year, achieved_value
+         FROM submissions
+         WHERE indicator_id = $1 AND quarter = $2
+         ORDER BY year DESC
+         LIMIT 1`,
+        [id, indicator.active_quarter]
+      );
+      if (subRes.rows.length > 0) {
+        submissionYear = subRes.rows[0].year;
+        achievedValue = subRes.rows[0].achieved_value;
+      } else {
+        // Fallback to current year if no submission found (should not happen)
+        submissionYear = new Date().getFullYear();
+      }
+
+      // Get assignee details for email notifications (do this while inside transaction to ensure consistency)
+      const { emails, displayName } = await resolveRecipients(
+        indicator.assignee_id,
+        indicator.assignee_model
+      );
+      assigneeInfo = { emails, displayName };
 
       const subStatus = isApprove ? "Accepted" : "Rejected";
 
@@ -515,8 +543,8 @@ export const superAdminReviewProcess = asyncHandler(
       let nextQuarter = indicator.active_quarter;
 
       if (isApprove) {
-        const achievedValue = Number(progressOverride);
-        const newTotal = (indicator.current_total_achieved || 0) + achievedValue;
+        const approvedValue = Number(progressOverride);
+        const newTotal = (indicator.current_total_achieved || 0) + approvedValue;
         const progressPct = indicator.target > 0
           ? Math.min(Math.round((newTotal / indicator.target) * 100), 100)
           : 0;
@@ -543,7 +571,6 @@ export const superAdminReviewProcess = asyncHandler(
         );
       } else {
         nextStatus = "Rejected by Super Admin";
-
         await client.query(
           `UPDATE indicators
            SET status     = $1,
@@ -561,6 +588,53 @@ export const superAdminReviewProcess = asyncHandler(
       );
 
       await client.query("COMMIT");
+
+      // After commit, fetch additional details needed for email templates
+      const activityRes = await pool.query(
+        `SELECT sa.description AS "activityDescription"
+         FROM strategic_activities sa
+         WHERE sa.id = $1`,
+        [indicator.activity_id]
+      );
+      const activityDescription = activityRes.rows[0]?.activityDescription || "Performance Indicator";
+
+      // Send email notifications to assignee(s)
+      if (assigneeInfo && assigneeInfo.emails.length > 0) {
+        const periodYear = submissionYear || new Date().getFullYear();
+        const emailPromises = assigneeInfo.emails.map((email) => {
+          let html: string;
+          if (isApprove) {
+            html = superAdminApprovedTemplate(
+              assigneeInfo!.displayName,
+              activityDescription,
+              indicator.reporting_cycle,
+              indicator.active_quarter,
+              periodYear,
+              Number(progressOverride),
+              indicator.unit || "%"
+            );
+          } else {
+            html = superAdminRejectedTemplate(
+              assigneeInfo!.displayName,
+              activityDescription,
+              indicator.reporting_cycle,
+              indicator.active_quarter,
+              periodYear,
+              reason || "No reason provided"
+            );
+          }
+          return sendMail({
+            to: email,
+            subject: isApprove
+              ? "✅ Performance Indicator Finally Certified"
+              : "❌ Performance Indicator Returned by Super Admin",
+            html,
+          }).catch((err) =>
+            console.error(`[superAdminReview] Failed to send ${isApprove ? "approval" : "rejection"} email to ${email}:`, err)
+          );
+        });
+        await Promise.all(emailPromises);
+      }
 
       const { rows } = await pool.query(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,

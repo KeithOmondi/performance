@@ -5,6 +5,7 @@ import {
   approveSubmission,
   rejectSubmission,
   fetchResubmittedIndicators,
+  getAdminApprovedIndicators,        // ← new import
 } from "../admin/adminIndicatorController";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 import { getCalendarEvents, getIndicatorCalendarEvents, getUpcomingDeadlines } from "../calendar/calendarcontroller";
@@ -17,6 +18,7 @@ router.use(restrictTo("admin"));
 // ─── Collection Routes ───────────────────────────────────────────────────────
 router.get("/all", fetchIndicatorsForAdmin);
 router.get("/resubmitted", fetchResubmittedIndicators);
+router.get("/approved-by-admin", getAdminApprovedIndicators);   // ← new route
 
 // ─── Calendar Routes (must be before /:id) ───────────────────────────────────
 router.get("/calendar/upcoming", getUpcomingDeadlines);
