@@ -64,10 +64,6 @@ const isUUID = (val: any): boolean =>
   typeof val === "string" &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
 
-/**
- * Resolves recipient emails and display names for notifications.
- * For Team assignments, emails all active members of the team.
- */
 async function resolveRecipients(
   assigneeId: string,
   type: "User" | "Team"
@@ -266,7 +262,8 @@ export const getAllIndicators = asyncHandler(
   }
 );
 
-/* ─── 3. GET INDICATOR BY ID ──────────────────────────────────────────────── */
+/* ─── 3. GET INDICATOR BY ID (with latest submissions per period) ──────────── */
+
 
 export const getIndicatorById = asyncHandler(
   async (req: Request, res: Response) => {
@@ -280,8 +277,16 @@ export const getIndicatorById = asyncHandler(
 
     const indicator = rows[0];
 
+    // ✅ FIX: Use ROW_NUMBER() to get the latest submission per quarter/year,
+    //    then GROUP BY all selected columns.
     const { rows: submissions } = await pool.query(
-      `SELECT
+      `WITH latest_submissions AS (
+         SELECT *,
+           ROW_NUMBER() OVER (PARTITION BY quarter, year ORDER BY submitted_at DESC) as rn
+         FROM submissions
+         WHERE indicator_id = $1
+       )
+       SELECT
          s.id,
          s.indicator_id           AS "indicatorId",
          s.quarter,
@@ -294,7 +299,6 @@ export const getIndicatorById = asyncHandler(
          s.review_status          AS "reviewStatus",
          s.admin_comment          AS "adminComment",
          s.resubmission_count     AS "resubmissionCount",
-
          COALESCE(
            json_agg(
              json_build_object(
@@ -304,16 +308,21 @@ export const getIndicatorById = asyncHandler(
                'evidencePublicId', sd.evidence_public_id,
                'fileType',         sd.file_type,
                'fileName',         sd.file_name,
+               'description',      sd.description,
+               'status',           sd.status,
+               'rejectionReason',  sd.rejection_reason,
                'uploadedAt',       sd.uploaded_at
              )
            ) FILTER (WHERE sd.id IS NOT NULL),
-           '[]'
+           '[]'::json
          ) AS "documents"
-
-       FROM submissions s
+       FROM latest_submissions s
        LEFT JOIN submission_documents sd ON sd.submission_id = s.id
-       WHERE s.indicator_id = $1
-       GROUP BY s.id
+       WHERE s.rn = 1
+       GROUP BY
+         s.id, s.indicator_id, s.quarter, s.year, s.notes,
+         s.admin_description_edit, s.submitted_at, s.achieved_value,
+         s.is_reviewed, s.review_status, s.admin_comment, s.resubmission_count
        ORDER BY s.year ASC, s.quarter ASC`,
       [id]
     );
@@ -344,7 +353,7 @@ export const getIndicatorById = asyncHandler(
 );
 
 
-/* ─── 4. UPDATE INDICATOR ─────────────────────────────────────────────────── */
+/* ─── 4. UPDATE INDICATOR (preserve submissions on cycle change) ──────────── */
 
 export const updateIndicator = asyncHandler(
   async (req: Request, res: Response) => {
@@ -360,39 +369,30 @@ export const updateIndicator = asyncHandler(
         [id]
       );
       if (!check.rows[0]) throw new AppError("Indicator not found.", 404);
-      if (
-        ["Awaiting Admin Approval", "Awaiting Super Admin"].includes(
-          check.rows[0].status
-        )
-      ) {
-        throw new AppError("Cannot edit while under review.", 400);
-      }
+      
+      // ✅ Allow editing regardless of status (removed the under-review restriction)
+      // if (
+      //   ["Awaiting Admin Approval", "Awaiting Super Admin"].includes(
+      //     check.rows[0].status
+      //   )
+      // ) {
+      //   throw new AppError("Cannot edit while under review.", 400);
+      // }
 
       const cycleChanged =
         reportingCycle && reportingCycle !== check.rows[0].reporting_cycle;
 
+      // Determine new active_quarter when cycle changes:
+      //   - If switching to Annual, set active_quarter = 1
+      //   - If switching to Quarterly, set active_quarter = 1 (default) or keep current if already within 1-4?
+      //   We'll set to 1 for simplicity; the user can adjust later if needed.
+      let newActiveQuarter: number | null = null;
       if (cycleChanged) {
-        // Wipe submissions and their documents (cascade handles submission_documents
-        // if you have ON DELETE CASCADE, otherwise delete documents first)
-        await client.query(
-          `DELETE FROM submission_documents
-           WHERE submission_id IN (
-             SELECT id FROM submissions WHERE indicator_id = $1
-           )`,
-          [id]
-        );
-        await client.query(
-          "DELETE FROM submissions WHERE indicator_id = $1",
-          [id]
-        );
-        await client.query(
-          "DELETE FROM review_history WHERE indicator_id = $1",
-          [id]
-        );
+        newActiveQuarter = reportingCycle === "Annual" ? 1 : 1; // start at Q1 for Quarterly
       }
 
-      const newActiveQuarter =
-        cycleChanged && reportingCycle === "Annual" ? 1 : null;
+      // ✅ NO DELETION OF SUBMISSIONS, DOCUMENTS, OR REVIEW HISTORY
+      // We keep all historical data for auditing purposes.
 
       await client.query(
         `UPDATE indicators SET
@@ -402,8 +402,9 @@ export const updateIndicator = asyncHandler(
            instructions    = COALESCE($4, instructions),
            reporting_cycle = COALESCE($5, reporting_cycle),
            active_quarter  = COALESCE($6, active_quarter),
-           progress               = CASE WHEN $7 THEN 0    ELSE progress               END,
-           current_total_achieved = CASE WHEN $7 THEN 0    ELSE current_total_achieved END,
+           -- Reset progress and total achieved when cycle changes (to avoid wrong aggregations)
+           progress               = CASE WHEN $7 THEN 0 ELSE progress END,
+           current_total_achieved = CASE WHEN $7 THEN 0 ELSE current_total_achieved END,
            status = CASE
              WHEN $7                                                THEN 'Pending'
              WHEN $3 IS NOT NULL                                    THEN 'Pending'
@@ -420,7 +421,7 @@ export const updateIndicator = asyncHandler(
           instructions,
           reportingCycle,
           newActiveQuarter,
-          cycleChanged,  // $7 — drives the progress/status reset cleanly
+          cycleChanged,      // $7 — true if cycle changed, resets progress/total
           id,
         ]
       );
@@ -506,12 +507,11 @@ export const superAdminReviewProcess = asyncHandler(
         throw new AppError("Not in Super Admin review state.", 400);
       }
 
-      // Fetch submission details for the active quarter (needed for emails later)
       const subRes = await client.query(
         `SELECT year, achieved_value
          FROM submissions
          WHERE indicator_id = $1 AND quarter = $2
-         ORDER BY year DESC
+         ORDER BY submitted_at DESC
          LIMIT 1`,
         [id, indicator.active_quarter]
       );
@@ -519,11 +519,9 @@ export const superAdminReviewProcess = asyncHandler(
         submissionYear = subRes.rows[0].year;
         achievedValue = subRes.rows[0].achieved_value;
       } else {
-        // Fallback to current year if no submission found (should not happen)
         submissionYear = new Date().getFullYear();
       }
 
-      // Get assignee details for email notifications (do this while inside transaction to ensure consistency)
       const { emails, displayName } = await resolveRecipients(
         indicator.assignee_id,
         indicator.assignee_model
@@ -589,7 +587,6 @@ export const superAdminReviewProcess = asyncHandler(
 
       await client.query("COMMIT");
 
-      // After commit, fetch additional details needed for email templates
       const activityRes = await pool.query(
         `SELECT sa.description AS "activityDescription"
          FROM strategic_activities sa
@@ -598,7 +595,6 @@ export const superAdminReviewProcess = asyncHandler(
       );
       const activityDescription = activityRes.rows[0]?.activityDescription || "Performance Indicator";
 
-      // Send email notifications to assignee(s)
       if (assigneeInfo && assigneeInfo.emails.length > 0) {
         const periodYear = submissionYear || new Date().getFullYear();
         const emailPromises = assigneeInfo.emails.map((email) => {
@@ -761,6 +757,7 @@ export const getAllSubmissions = asyncHandler(
               'evidencePublicId', sd.evidence_public_id,
               'fileType',         sd.file_type,
               'fileName',         sd.file_name,
+              'description',      sd.description,
               'uploadedAt',       sd.uploaded_at
             )
           ) FILTER (WHERE sd.id IS NOT NULL),
@@ -822,10 +819,6 @@ export const getSuperAdminStats = asyncHandler(
     const result = await pool.query(query);
     const s = result.rows[0];
 
-    // ✅ FIX: wrap in `general` so the frontend dashboardSlice can read
-    //    stats.general.assigned, stats.general.approved, etc.
-    //    Previously the response was flat and stats?.general?.X was always
-    //    undefined, causing all KPI cards to show 0.
     res.status(200).json({
       success: true,
       data: {
@@ -968,10 +961,6 @@ export const deleteSubmission = asyncHandler(
 
 export const getAssignedIndicators = asyncHandler(
   async (_req: Request, res: Response) => {
-    // ✅ FIX: Assignment is purely whether assignee_id is set — we no longer
-    //    exclude indicators that are under review or rejected. Those are still
-    //    assigned to someone; excluding them caused the assigned count to be
-    //    far lower than reality (e.g. showing 0 when 65 were truly assigned).
     const { rows } = await pool.query(
       `${INDICATOR_SELECT} ${INDICATOR_JOINS}
        WHERE i.assignee_id IS NOT NULL
@@ -1065,33 +1054,19 @@ export const getReviewIndicators = asyncHandler(
 );
 
 
-/* ─── 16. GET INDICATOR COUNTS ───────────────────────────────────────────────
-   Add this function to indicator.controller.ts.
-   Returns accurate server-side counts for every filter tab on the
-   SuperAdminIndicators page — no frontend array.length() derivation.
-
-   Also returns per-perspective activity totals so the tab badges are
-   computed from the DB, not from iterating Redux state.
-────────────────────────────────────────────────────────────────────────────── */
-
+/* ─── 16. GET INDICATOR COUNTS ─────────────────────────────────────────────── */
 export const getIndicatorCounts = asyncHandler(
   async (_req: Request, res: Response) => {
-
-    /* ── Core status counts ── */
     const countsQuery = `
       SELECT
         COUNT(*)::int                                                     AS total,
-
         COUNT(*) FILTER (WHERE assignee_id IS NOT NULL)::int              AS assigned,
-
         COUNT(*) FILTER (
           WHERE assignee_id IS NULL AND status = 'Pending'
         )::int                                                            AS unassigned,
-
         COUNT(*) FILTER (
           WHERE status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')
         )::int                                                            AS review,
-
         COUNT(*) FILTER (
           WHERE deadline < NOW()
             AND status NOT IN (
@@ -1100,14 +1075,9 @@ export const getIndicatorCounts = asyncHandler(
               'Awaiting Super Admin'
             )
         )::int                                                            AS overdue
-
       FROM indicators
     `;
 
-    /* ── Per-perspective activity totals ──
-       Counts how many strategic_activities exist under each perspective.
-       Used for the perspective filter tab badges.
-    ── */
     const perspectiveQuery = `
       SELECT
         sp.perspective,
@@ -1124,9 +1094,6 @@ export const getIndicatorCounts = asyncHandler(
     ]);
 
     const counts = countsResult.rows[0];
-
-    /* Turn the perspective rows into a lookup map:
-       { "CORE BUSINESS / MANDATE": 12, "CUSTOMER PERSPECTIVE": 8, ... } */
     const perspectives: Record<string, number> = {};
     perspectiveResult.rows.forEach((row) => {
       if (row.perspective) {
@@ -1145,5 +1112,38 @@ export const getIndicatorCounts = asyncHandler(
         perspectives,
       },
     });
+  }
+);
+
+/* ─── 17. GET SUPER ADMIN APPROVED INDICATORS (Finally Certified & Completed) ── */
+export const getSuperAdminApprovedIndicators = asyncHandler(
+  async (req: Request, res: Response) => {
+    const includePending = req.query.includePending === 'true';
+
+    let whereClause = `
+      WHERE EXISTS (
+        SELECT 1
+        FROM review_history rh
+        WHERE rh.indicator_id = i.id
+          AND rh.action = 'Approved'
+          AND rh.reviewer_role = 'superadmin'
+      )
+    `;
+
+    if (!includePending) {
+      whereClause += ` AND i.status = 'Completed'`;
+    }
+
+    // ✅ Insert DISTINCT after the first SELECT keyword
+    const selectWithDistinct = INDICATOR_SELECT.replace(/SELECT/i, 'SELECT DISTINCT');
+
+    const { rows } = await pool.query(`
+      ${selectWithDistinct}
+      ${INDICATOR_JOINS}
+      ${whereClause}
+      ORDER BY i.updated_at DESC
+    `);
+
+    res.status(200).json({ success: true, data: rows });
   }
 );

@@ -16,6 +16,7 @@ import {
   getUnassignedIndicators,
   getReviewIndicators,
   getIndicatorCounts,
+  getSuperAdminApprovedIndicators,
 } from "./indicator.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
@@ -37,6 +38,7 @@ router.get("/assigned", getAssignedIndicators);
 router.get("/unassigned", getUnassignedIndicators);
 router.get("/review", getReviewIndicators);
 router.get("/counts", getIndicatorCounts);
+router.get("/approved-by-superadmin", getSuperAdminApprovedIndicators); // ✅ MOVED HERE
 
 // ─── Indicators (collection) ──────────────────────────────────────────────────
 router.get("/", getAllIndicators);
@@ -53,6 +55,5 @@ router.patch("/:id/reopen", reopenIndicator);
 
 // ─── Assignment Management ────────────────────────────────────────────────────
 router.delete("/:id/unassign", unassignIndicator);
-//router.get("/dashboard-stats/full", getIndicatorCounts);
 
 export const IndicatorRoutes = router;
