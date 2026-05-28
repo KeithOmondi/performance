@@ -98,4 +98,12 @@ router.patch(
   UserIndicatorController.updateDocumentDescription,
 );
 
+
+router.delete(
+  "/:id/submissions/:submissionId/documents/:docId",
+  protect,
+  restrictTo("user"),
+  UserIndicatorController.deletePendingDocument,
+);
+
 export default router;

@@ -20,6 +20,7 @@ app.use(
       "Authorization",
       "X-Requested-With",
       "Accept",
+      "idempotency-key",  
     ],
   })
 );

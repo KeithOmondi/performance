@@ -1383,6 +1383,55 @@ export const UserIndicatorController = {
     }
   }),
 
+
+  // ── 12. Delete a pending submission (pre-approval window) ──────────────────
+// In your backend controller, modify the deleteDocument function (line ~1036):
+deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
+  const user    = getAuthUser(req);
+  const { docId } = req.params;
+  const teamIds = await getUserTeamIds(user.id);
+
+  const ownershipFilter =
+    teamIds.length > 0
+      ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
+           OR i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')`
+      : `AND i.assignee_id = $2 AND i.assignee_model = 'User'`;
+
+  const checkParams: unknown[] =
+    teamIds.length > 0 ? [docId, user.id, teamIds] : [docId, user.id];
+
+  const { rows } = await pool.query(
+    `SELECT d.id, d.evidence_public_id, d.status AS doc_status, s.review_status
+     FROM submission_documents d
+     JOIN submissions s ON d.submission_id = s.id
+     JOIN indicators i  ON s.indicator_id  = i.id
+     WHERE d.id = $1 ${ownershipFilter}`,
+    checkParams,
+  );
+
+  if (rows.length === 0)
+    throw new AppError("Document not found or access denied.", 404);
+
+  const doc = rows[0] as { 
+    evidence_public_id: string; 
+    doc_status: string;
+    review_status: string;
+  };
+  
+  // Allow deletion of rejected documents OR pending documents from pending submissions
+  if (doc.doc_status !== "Rejected" && doc.review_status !== "Pending")
+    throw new AppError("Only rejected documents or documents from pending submissions can be deleted.", 400);
+
+  await pool.query("DELETE FROM submission_documents WHERE id = $1", [docId]);
+
+  if (doc.evidence_public_id)
+    deleteFromCloudinary(doc.evidence_public_id).catch((e) =>
+      console.error("[deleteDocument] Cloudinary cleanup failed:", e),
+    );
+
+  res.status(200).json({ success: true, message: "Document removed successfully." });
+}),
+
   // ── Internal: send email alerts after a submission ────────────────────────
   _sendAlerts: async (
     user: IUser,
@@ -1447,3 +1496,5 @@ export const UserIndicatorController = {
     }
   },
 };
+
+
