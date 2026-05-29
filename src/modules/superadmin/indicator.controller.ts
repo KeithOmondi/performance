@@ -839,6 +839,8 @@ export const getSuperAdminStats = asyncHandler(
 
 /* ─── 11. UNASSIGN INDICATOR ─────────────────────────────────────────────── */
 
+/* ─── 11. UNASSIGN INDICATOR (HARD DELETE VERSION) ─────────────────────────── */
+
 export const unassignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
@@ -847,36 +849,35 @@ export const unassignIndicator = asyncHandler(
     try {
       await client.query("BEGIN");
 
+      // Check if indicator exists
       const indRes = await client.query(
-        "SELECT id FROM indicators WHERE id = $1 FOR UPDATE",
+        "SELECT id, assignee_id, status FROM indicators WHERE id = $1 FOR UPDATE",
         [id]
       );
       if (indRes.rowCount === 0) throw new AppError("Indicator not found.", 404);
 
+      const indicator = indRes.rows[0];
+      
+      // Log for debugging
+      console.log(`[unassignIndicator] Deleting indicator ${id}. Previously assigned to: ${indicator.assignee_id}`);
+
+      // Delete all related data first (foreign key constraints)
+      await client.query("DELETE FROM submission_documents WHERE submission_id IN (SELECT id FROM submissions WHERE indicator_id = $1)", [id]);
       await client.query("DELETE FROM submissions WHERE indicator_id = $1", [id]);
       await client.query("DELETE FROM review_history WHERE indicator_id = $1", [id]);
-
-      await client.query(
-        `UPDATE indicators
-         SET assignee_id            = NULL,
-             assignee_model         = 'User',
-             status                 = 'Pending',
-             progress               = 0,
-             current_total_achieved = 0,
-             active_quarter         = 1,
-             updated_at             = NOW()
-         WHERE id = $1`,
-        [id]
-      );
+      
+      // HARD DELETE the indicator - this will REMOVE it from the system entirely
+      await client.query("DELETE FROM indicators WHERE id = $1", [id]);
 
       await client.query("COMMIT");
 
-      const { rows } = await pool.query(
-        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
-        [id]
-      );
+      console.log(`[unassignIndicator] Successfully deleted indicator ${id}`);
 
-      res.status(200).json({ success: true, data: rows[0] });
+      res.status(200).json({ 
+        success: true, 
+        message: "Indicator permanently removed from the system.",
+        data: { deletedId: id }
+      });
     } catch (e) {
       await client.query("ROLLBACK");
       throw e;

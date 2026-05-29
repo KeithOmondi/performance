@@ -66,7 +66,7 @@ router.post(
   UserIndicatorController.addDocuments,
 );
 
-// 8. Delete a single rejected document
+// 8. Delete a single document (legacy - use /:id/submissions/:submissionId/documents/:docId instead)
 router.delete(
   "/documents/:docId",
   protect,
