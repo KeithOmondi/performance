@@ -303,14 +303,13 @@ export const rejectSubmission = asyncHandler(
     const { submissionUpdates, documentUpdates, adminOverallComments } = req.body;
     const adminId = (req as any).user.id;
 
-    // 🚀 Incoming request logger
     console.log("📥 [rejectSubmission] Incoming Request Details:", {
       indicatorId: id,
       adminId,
       adminOverallComments,
       submissionUpdatesCount: Array.isArray(submissionUpdates) ? submissionUpdates.length : 0,
       documentUpdatesCount: Array.isArray(documentUpdates) ? documentUpdates.length : 0,
-      payload: { submissionUpdates, documentUpdates }
+      payload: { submissionUpdates, documentUpdates },
     });
 
     // ── 1. Global Comment Validation ──────────────────────────────────────
@@ -321,12 +320,10 @@ export const rejectSubmission = asyncHandler(
       );
     }
 
-    // ── 2. Individual Document Rejection Reason Validation ─────────────────
+    // ── 2. Individual Document Rejection Reason Validation ────────────────
     if (Array.isArray(documentUpdates) && documentUpdates.length > 0) {
       for (const doc of documentUpdates) {
         if (!doc.documentId) continue;
-        
-        // If the document is being set to 'Rejected', it MUST have a reason
         if (doc.status === "Rejected" && !doc.reason?.trim()) {
           throw new AppError(
             `A specific rejection reason is required for document ID: ${doc.documentId}`,
@@ -336,12 +333,10 @@ export const rejectSubmission = asyncHandler(
       }
     }
 
-    // ── 3. Individual Submission Rejection Reason Validation ───────────────
+    // ── 3. Individual Submission Comment Validation ────────────────────────
     if (Array.isArray(submissionUpdates) && submissionUpdates.length > 0) {
       for (const update of submissionUpdates) {
         if (!update.submissionId) continue;
-
-        // If there is no specific comment for this submission, and no global comment, block it
         const finalComment = update.adminComment?.trim() || adminOverallComments?.trim();
         if (!finalComment) {
           throw new AppError(
@@ -359,7 +354,7 @@ export const rejectSubmission = asyncHandler(
 
       const indicator = await fetchAndLockIndicator(client, id);
 
-      // ── Apply document-level rejections ───────────────────────────────────
+      // ── Apply document-level status updates ───────────────────────────────
       let hasRejectedDocument = false;
 
       if (Array.isArray(documentUpdates) && documentUpdates.length > 0) {
@@ -385,18 +380,36 @@ export const rejectSubmission = asyncHandler(
         documentUpdates,
       });
 
-      // ── Mark submissions as Rejected ──────────────────────────────────────
+      // ── Update each submission based on its document outcomes ─────────────
       if (Array.isArray(submissionUpdates) && submissionUpdates.length > 0) {
         for (const update of submissionUpdates) {
           if (!update.submissionId) continue;
 
+          // Check the current status of all documents on this submission
+          const { rows: submissionDocs } = await client.query(
+            `SELECT id, status FROM submission_documents WHERE submission_id = $1`,
+            [update.submissionId]
+          );
+
+          // Only fully reject the submission if admin explicitly flagged it
+          // OR every one of its documents has been rejected
+          const allDocsRejected =
+            submissionDocs.length > 0 &&
+            submissionDocs.every((d) => d.status === "Rejected");
+
+          const shouldFullyReject =
+            update.reviewStatus === "Rejected" || allDocsRejected;
+
+          const newReviewStatus = shouldFullyReject ? "Rejected" : "Correction Needed";
+
           await client.query(
             `UPDATE submissions
-             SET review_status = 'Rejected',
-                 admin_comment = $1,
+             SET review_status = $1,
+                 admin_comment = $2,
                  is_reviewed   = true
-             WHERE id = $2`,
+             WHERE id = $3`,
             [
+              newReviewStatus,
               update.adminComment?.trim() || adminOverallComments,
               update.submissionId,
             ]
@@ -404,14 +417,30 @@ export const rejectSubmission = asyncHandler(
         }
       }
 
-      // ── Set indicator back to rejected ────────────────────────────────────
+      // ── Determine indicator-level outcome ─────────────────────────────────
+      // Only fully reject the indicator if every reviewed submission is Rejected
+      const { rows: submissionStatuses } = await client.query(
+        `SELECT review_status
+         FROM submissions
+         WHERE indicator_id = $1 AND is_reviewed = true`,
+        [id]
+      );
+
+      const allSubmissionsRejected =
+        submissionStatuses.length > 0 &&
+        submissionStatuses.every((s) => s.review_status === "Rejected");
+
+      const indicatorStatus = allSubmissionsRejected
+        ? "Rejected by Admin"
+        : "Correction Needed";
+
       await client.query(
         `UPDATE indicators
-         SET status = 'Rejected by Admin',
-             admin_overall_comments = $1,
+         SET status = $1,
+             admin_overall_comments = $2,
              updated_at = NOW()
-         WHERE id = $2`,
-        [adminOverallComments, id]
+         WHERE id = $3`,
+        [indicatorStatus, adminOverallComments, id]
       );
 
       // ── Log ───────────────────────────────────────────────────────────────
@@ -435,6 +464,7 @@ export const rejectSubmission = asyncHandler(
       console.log("[rejectSubmission] sending rejection email to:", indicator.email, {
         rejectionComment,
         hasRejectedDocument,
+        indicatorStatus,
       });
 
       sendMail({
@@ -455,6 +485,7 @@ export const rejectSubmission = asyncHandler(
         success: true,
         message: "Submission returned for correction.",
         data: {
+          indicatorStatus,
           autoRejectedDueToDocs: hasRejectedDocument,
         },
       });

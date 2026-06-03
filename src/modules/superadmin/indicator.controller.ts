@@ -9,6 +9,10 @@ import { superAdminApprovedTemplate, superAdminRejectedTemplate, taskAssignedTem
    Every query that returns an indicator to the frontend uses this fragment.
    All snake_case columns are aliased to camelCase so the frontend slice works
    without any transformation.
+
+   FIX: assignee_id is now aliased as both "assignee" AND "assigneeId".
+   The frontend useMemo checks `ind.assignee` (string), so it must be present
+   for assigned/unassigned counts to be correct.
 ────────────────────────────────────────────────────────────────────────────── */
 const INDICATOR_SELECT = `
   SELECT
@@ -21,6 +25,7 @@ const INDICATOR_SELECT = `
     i.deadline,
     i.instructions,
 
+    i.assignee_id            AS "assignee",
     i.assignee_id            AS "assigneeId",
     i.assignee_model         AS "assignmentType",
     i.assigned_by            AS "assignedBy",
@@ -262,8 +267,7 @@ export const getAllIndicators = asyncHandler(
   }
 );
 
-/* ─── 3. GET INDICATOR BY ID (with latest submissions per period) ──────────── */
-
+/* ─── 3. GET INDICATOR BY ID (with latest submissions per period) ─────────── */
 
 export const getIndicatorById = asyncHandler(
   async (req: Request, res: Response) => {
@@ -277,8 +281,6 @@ export const getIndicatorById = asyncHandler(
 
     const indicator = rows[0];
 
-    // ✅ FIX: Use ROW_NUMBER() to get the latest submission per quarter/year,
-    //    then GROUP BY all selected columns.
     const { rows: submissions } = await pool.query(
       `WITH latest_submissions AS (
          SELECT *,
@@ -352,8 +354,7 @@ export const getIndicatorById = asyncHandler(
   }
 );
 
-
-/* ─── 4. UPDATE INDICATOR (preserve submissions on cycle change) ──────────── */
+/* ─── 4. UPDATE INDICATOR ─────────────────────────────────────────────────── */
 
 export const updateIndicator = asyncHandler(
   async (req: Request, res: Response) => {
@@ -369,30 +370,14 @@ export const updateIndicator = asyncHandler(
         [id]
       );
       if (!check.rows[0]) throw new AppError("Indicator not found.", 404);
-      
-      // ✅ Allow editing regardless of status (removed the under-review restriction)
-      // if (
-      //   ["Awaiting Admin Approval", "Awaiting Super Admin"].includes(
-      //     check.rows[0].status
-      //   )
-      // ) {
-      //   throw new AppError("Cannot edit while under review.", 400);
-      // }
 
       const cycleChanged =
         reportingCycle && reportingCycle !== check.rows[0].reporting_cycle;
 
-      // Determine new active_quarter when cycle changes:
-      //   - If switching to Annual, set active_quarter = 1
-      //   - If switching to Quarterly, set active_quarter = 1 (default) or keep current if already within 1-4?
-      //   We'll set to 1 for simplicity; the user can adjust later if needed.
       let newActiveQuarter: number | null = null;
       if (cycleChanged) {
-        newActiveQuarter = reportingCycle === "Annual" ? 1 : 1; // start at Q1 for Quarterly
+        newActiveQuarter = 1;
       }
-
-      // ✅ NO DELETION OF SUBMISSIONS, DOCUMENTS, OR REVIEW HISTORY
-      // We keep all historical data for auditing purposes.
 
       await client.query(
         `UPDATE indicators SET
@@ -402,7 +387,6 @@ export const updateIndicator = asyncHandler(
            instructions    = COALESCE($4, instructions),
            reporting_cycle = COALESCE($5, reporting_cycle),
            active_quarter  = COALESCE($6, active_quarter),
-           -- Reset progress and total achieved when cycle changes (to avoid wrong aggregations)
            progress               = CASE WHEN $7 THEN 0 ELSE progress END,
            current_total_achieved = CASE WHEN $7 THEN 0 ELSE current_total_achieved END,
            status = CASE
@@ -421,7 +405,7 @@ export const updateIndicator = asyncHandler(
           instructions,
           reportingCycle,
           newActiveQuarter,
-          cycleChanged,      // $7 — true if cycle changed, resets progress/total
+          cycleChanged,
           id,
         ]
       );
@@ -463,8 +447,8 @@ export const deleteIndicator = asyncHandler(
   }
 );
 
-
 /* ─── 6. GET REJECTED BY ADMIN ────────────────────────────────────────────── */
+
 export const getRejectedByAdmin = asyncHandler(
   async (_req: Request, res: Response) => {
     const { rows } = await pool.query(
@@ -626,7 +610,7 @@ export const superAdminReviewProcess = asyncHandler(
               : "❌ Performance Indicator Returned by Super Admin",
             html,
           }).catch((err) =>
-            console.error(`[superAdminReview] Failed to send ${isApprove ? "approval" : "rejection"} email to ${email}:`, err)
+            console.error(`[superAdminReview] Failed to send email to ${email}:`, err)
           );
         });
         await Promise.all(emailPromises);
@@ -823,67 +807,53 @@ export const getSuperAdminStats = asyncHandler(
       success: true,
       data: {
         general: {
-          total:         parseInt(s.total_indicators, 10),
-          assigned:      parseInt(s.assigned, 10),
-          unassigned:    parseInt(s.unassigned, 10),
-          overdue:       parseInt(s.overdue, 10),
+          total:          parseInt(s.total_indicators, 10),
+          assigned:       parseInt(s.assigned, 10),
+          unassigned:     parseInt(s.unassigned, 10),
+          overdue:        parseInt(s.overdue, 10),
           awaitingReview: parseInt(s.awaiting_review, 10),
-          approved:      parseInt(s.approved, 10),
-          rejected:      parseInt(s.rejected, 10),
-          users:         parseInt(s.users, 10),
+          approved:       parseInt(s.approved, 10),
+          rejected:       parseInt(s.rejected, 10),
+          users:          parseInt(s.users, 10),
         },
       },
     });
   }
 );
 
-/* ─── 11. UNASSIGN INDICATOR ─────────────────────────────────────────────── */
-
-/* ─── 11. UNASSIGN INDICATOR (HARD DELETE VERSION) ─────────────────────────── */
-
+/* ─── 11. UNASSIGN INDICATOR ──────────────────────────────────────────────── */
+/*
+   FIX: Previously this handler hard-deleted the indicator and all its data.
+   Now it simply clears the assignee fields and resets status to 'Pending',
+   preserving the indicator and all its history in the database.
+*/
 export const unassignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
 
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
+    const { rows: existing } = await pool.query(
+      "SELECT id, assignee_id, status FROM indicators WHERE id = $1",
+      [id]
+    );
+    if (!existing[0]) throw new AppError("Indicator not found.", 404);
 
-      // Check if indicator exists
-      const indRes = await client.query(
-        "SELECT id, assignee_id, status FROM indicators WHERE id = $1 FOR UPDATE",
-        [id]
-      );
-      if (indRes.rowCount === 0) throw new AppError("Indicator not found.", 404);
+    await pool.query(
+      `UPDATE indicators
+       SET assignee_id    = NULL,
+           assignee_model = NULL,
+           assigned_by    = NULL,
+           status         = 'Pending',
+           updated_at     = NOW()
+       WHERE id = $1`,
+      [id]
+    );
 
-      const indicator = indRes.rows[0];
-      
-      // Log for debugging
-      console.log(`[unassignIndicator] Deleting indicator ${id}. Previously assigned to: ${indicator.assignee_id}`);
+    const { rows: updated } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+      [id]
+    );
 
-      // Delete all related data first (foreign key constraints)
-      await client.query("DELETE FROM submission_documents WHERE submission_id IN (SELECT id FROM submissions WHERE indicator_id = $1)", [id]);
-      await client.query("DELETE FROM submissions WHERE indicator_id = $1", [id]);
-      await client.query("DELETE FROM review_history WHERE indicator_id = $1", [id]);
-      
-      // HARD DELETE the indicator - this will REMOVE it from the system entirely
-      await client.query("DELETE FROM indicators WHERE id = $1", [id]);
-
-      await client.query("COMMIT");
-
-      console.log(`[unassignIndicator] Successfully deleted indicator ${id}`);
-
-      res.status(200).json({ 
-        success: true, 
-        message: "Indicator permanently removed from the system.",
-        data: { deletedId: id }
-      });
-    } catch (e) {
-      await client.query("ROLLBACK");
-      throw e;
-    } finally {
-      client.release();
-    }
+    res.status(200).json({ success: true, data: updated[0] });
   }
 );
 
@@ -1054,8 +1024,8 @@ export const getReviewIndicators = asyncHandler(
   }
 );
 
+/* ─── 16. GET INDICATOR COUNTS ────────────────────────────────────────────── */
 
-/* ─── 16. GET INDICATOR COUNTS ─────────────────────────────────────────────── */
 export const getIndicatorCounts = asyncHandler(
   async (_req: Request, res: Response) => {
     const countsQuery = `
@@ -1105,21 +1075,22 @@ export const getIndicatorCounts = asyncHandler(
     res.status(200).json({
       success: true,
       data: {
-        total:    counts.total,
-        assigned: counts.assigned,
+        total:      counts.total,
+        assigned:   counts.assigned,
         unassigned: counts.unassigned,
-        review:   counts.review,
-        overdue:  counts.overdue,
+        review:     counts.review,
+        overdue:    counts.overdue,
         perspectives,
       },
     });
   }
 );
 
-/* ─── 17. GET SUPER ADMIN APPROVED INDICATORS (Finally Certified & Completed) ── */
+/* ─── 17. GET SUPER ADMIN APPROVED INDICATORS ────────────────────────────── */
+
 export const getSuperAdminApprovedIndicators = asyncHandler(
   async (req: Request, res: Response) => {
-    const includePending = req.query.includePending === 'true';
+    const includePending = req.query.includePending === "true";
 
     let whereClause = `
       WHERE EXISTS (
@@ -1135,8 +1106,7 @@ export const getSuperAdminApprovedIndicators = asyncHandler(
       whereClause += ` AND i.status = 'Completed'`;
     }
 
-    // ✅ Insert DISTINCT after the first SELECT keyword
-    const selectWithDistinct = INDICATOR_SELECT.replace(/SELECT/i, 'SELECT DISTINCT');
+    const selectWithDistinct = INDICATOR_SELECT.replace(/SELECT/i, "SELECT DISTINCT");
 
     const { rows } = await pool.query(`
       ${selectWithDistinct}

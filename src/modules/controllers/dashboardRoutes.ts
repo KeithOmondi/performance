@@ -1,13 +1,15 @@
+// src/routes/dashboard.routes.ts
 import { Router } from "express";
-import { getDashboardStats } from "./dashboard.controller";
-import { protect, restrictTo } from "../../middleware/auth.middleware";
+import { DashboardController } from "../controllers/dashboard.controller";
+import { protect } from "../../middleware/auth.middleware";
 
 const router = Router();
 
-/**
- * GET /api/superadmin/dashboard
- * Superadmin only — returns stats, perspectives, and recent submissions.
- */
-router.get("/stats", protect, restrictTo("superadmin", "admin"), getDashboardStats);
+// All dashboard routes are protected (any authenticated user can view)
+router.use(protect);
+
+router.get("/stats", DashboardController.getStats);
+router.get("/recent-submissions", DashboardController.getRecentSubmissions);
+router.get("/team-overview", DashboardController.getTeamOverview);
 
 export default router;
