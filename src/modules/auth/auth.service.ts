@@ -53,34 +53,36 @@ export class AuthService {
   }
 
   // ─── Request OTP ─────────────────────────────────────────────────────────
-  static async requestLoginOTP(pjNumber: string): Promise<string> {
-    const cleanPj = pjNumber.trim();
+  // ─── Request OTP ─────────────────────────────────────────────────────────
+static async requestLoginOTP(pjNumber: string): Promise<string> {
+  const cleanPj = pjNumber.trim();
 
-    const userRes = await pool.query(
-      "SELECT id, name, email, login_otp_expires FROM users WHERE pj_number = $1 AND is_active = true",
-      [cleanPj]
-    );
+  const userRes = await pool.query(
+    "SELECT id, name, email, login_otp_expires FROM users WHERE pj_number = $1 AND is_active = true",
+    [cleanPj]
+  );
 
-    const user = userRes.rows[0];
-    if (!user) throw new AppError("No active account found with this PJ Number.", 404);
+  const user = userRes.rows[0];
+  if (!user) throw new AppError("No active account found with this PJ Number.", 404);
 
-    // Rate limit: prevent OTP spam (1 minute window)
-    if (user.login_otp_expires && (new Date(user.login_otp_expires).getTime() - Date.now() > 9 * 60 * 1000)) {
-      throw new AppError("An OTP was recently sent. Please wait before requesting a new one.", 429);
-    }
-
-    const { otp, hashedOtp, expiresAt } = generateOTP(6, 10);
-
-    // Update OTP fields in DB
-    await pool.query(
-      "UPDATE users SET login_otp = $1, login_otp_expires = $2 WHERE id = $3",
-      [hashedOtp, expiresAt, user.id]
-    );
-
-    await sendOtpMail(user.email, otp, user.name);
-
-    return maskEmail(user.email);
+  if (user.login_otp_expires && (new Date(user.login_otp_expires).getTime() - Date.now() > 9 * 60 * 1000)) {
+    throw new AppError("An OTP was recently sent. Please wait before requesting a new one.", 429);
   }
+
+  const { otp, hashedOtp, expiresAt } = generateOTP(6, 10);
+
+  await pool.query(
+    "UPDATE users SET login_otp = $1, login_otp_expires = $2 WHERE id = $3",
+    [hashedOtp, expiresAt, user.id]
+  );
+
+  // ✅ Don't await — respond immediately after DB write, send email in background
+  sendOtpMail(user.email, otp, user.name).catch((err) => {
+    console.error(`[OTP EMAIL FAILED] user=${user.id} error=${err.message}`);
+  });
+
+  return maskEmail(user.email);
+}
 
   // ─── Verify OTP ──────────────────────────────────────────────────────────
   static async verifyOTP(pjNumber: string, otp: string): Promise<IUser> {

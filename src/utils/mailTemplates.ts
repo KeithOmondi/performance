@@ -364,4 +364,61 @@ export const superAdminRejectedTemplate = (
       Please log in, review the feedback carefully, make the necessary corrections, and resubmit your progress report.
     </p>
   `);
+
+  // ─── Partial Approval (Incremental Progress) ─────────────────────────────────
+
+export const partialApprovalTemplate = (
+  name: string,
+  activityDescription: string,
+  reportingCycle: string,
+  quarter: string | number,
+  year: number,
+  approvedAmount: number,
+  currentTotal: number,
+  target: number,
+  unit?: string,
+) =>
+  baseLayout(`
+    <h2 style="color: #e67e22; margin-top: 0;">📈 Progress Partially Approved</h2>
+    <p style="color: #374151;">Hello <strong>${name}</strong>, your submission has been reviewed and <strong>partially approved</strong> by the Super Admin.</p>
+
+    ${infoTable([
+      ["Activity / Task", activityDescription || "See dashboard"],
+      ["Period", `${formatPeriod(reportingCycle, quarter)} ${year}`],
+      ["Amount Approved", `+${approvedAmount} ${unit || "%"}`],
+      ["Total Progress", `${currentTotal} ${unit || "%"} out of ${target} ${unit || "%"}`],
+      ["Remaining", `${Math.max(0, target - currentTotal)} ${unit || "%"}`],
+      ["Status", currentTotal >= target ? "Fully Completed" : "Partially Complete - Awaiting Further Submission"],
+      ["Approved By", "Super Admin"],
+    ])}
+
+    ${currentTotal < target ? `
+      <div style="background: #fef3c7; border-left: 4px solid #f59e0b; padding: 16px; margin: 20px 0; border-radius: 4px;">
+        <strong style="color: #d97706; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;">Partial Approval Only</strong>
+        <p style="color: #92400e; margin: 8px 0 0 0; font-size: 14px;">
+          You have been approved for ${approvedAmount} ${unit || "%"} of progress. 
+          You still need to achieve the remaining ${Math.max(0, target - currentTotal)} ${unit || "%"} 
+          to reach full certification.
+        </p>
+        <p style="color: #92400e; margin: 8px 0 0 0; font-size: 14px;">
+          Please continue working and submit additional evidence for the remaining target.
+        </p>
+      </div>
+    ` : `
+      <div style="background: #d1fae5; border-left: 4px solid #10b981; padding: 16px; margin: 20px 0; border-radius: 4px;">
+        <strong style="color: #047857; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;">🎉 Fully Completed!</strong>
+        <p style="color: #065f46; margin: 8px 0 0 0; font-size: 14px;">
+          Congratulations! You have reached the full target. This indicator is now certified as complete.
+        </p>
+      </div>
+    `}
+
+    ${ctaButton("View Dashboard", `${DASHBOARD_URL}/user/dashboard`)}
+
+    <p style="color: #6b7280; font-size: 13px;">
+      ${currentTotal < target 
+        ? "Continue submitting evidence for the remaining target. You will be notified when further approvals are made."
+        : "No further action required. This record has been officially certified."}
+    </p>
+  `);
   
