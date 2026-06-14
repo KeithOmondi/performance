@@ -434,7 +434,11 @@ export const getRejectedByAdmin = asyncHandler(
   async (_req: Request, res: Response) => {
     const { rows } = await pool.query(
       `${INDICATOR_SELECT} ${INDICATOR_JOINS}
-       WHERE i.status = 'Rejected by Admin'
+       WHERE EXISTS (
+         SELECT 1 FROM review_history rh
+         WHERE rh.indicator_id = i.id
+           AND rh.action IN ('Correction Requested', 'Rejected')
+       )
        ORDER BY i.updated_at DESC`
     );
     res.status(200).json({ success: true, count: rows.length, data: rows });
@@ -882,6 +886,8 @@ export const getAllSubmissions = asyncHandler(
               'fileType',         sd.file_type,
               'fileName',         sd.file_name,
               'description',      sd.description,
+              'status',           sd.status,
+              'rejectionReason',  sd.rejection_reason,
               'uploadedAt',       sd.uploaded_at
             )
           ) FILTER (WHERE sd.id IS NOT NULL),
