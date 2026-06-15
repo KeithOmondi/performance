@@ -5,7 +5,8 @@ import {
   approveSubmission,
   rejectSubmission,
   fetchResubmittedIndicators,
-  getAdminApprovedIndicators,        // ← new import
+  getAdminApprovedIndicators,
+  rejectDocument,        // ← new import
 } from "../admin/adminIndicatorController";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 import { getCalendarEvents, getIndicatorCalendarEvents, getUpcomingDeadlines } from "../calendar/calendarcontroller";
@@ -30,6 +31,7 @@ router.get("/:id", getIndicatorByIdAdmin);
 
 // ─── Action Routes ───────────────────────────────────────────────────────────
 router.patch("/:id/approve", approveSubmission);
-router.patch("/:id/reject", rejectSubmission);
+router.patch("/:id/reject",               rejectSubmission);        // existing — overall rejection
+router.patch("/:id/reject-document",      rejectDocument);          // NEW — single doc rejection
 
 export default router;

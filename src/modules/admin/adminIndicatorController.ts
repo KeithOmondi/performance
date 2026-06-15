@@ -616,3 +616,68 @@ export const getAdminApprovedIndicators = asyncHandler(
     res.status(200).json({ success: true, data: enrichedRows });
   }
 );
+
+
+export const rejectDocument = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params; // indicator id (for auth/ownership check)
+    const { documentId, reason, submissionId } = req.body;
+
+    if (!documentId) throw new AppError("documentId is required.", 400);
+    if (!reason?.trim()) throw new AppError("A rejection reason is required for document rejection.", 400);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Verify the document belongs to this indicator
+      const { rows } = await client.query(
+        `SELECT sd.id
+         FROM submission_documents sd
+         JOIN submissions s ON s.id = sd.submission_id
+         WHERE sd.id = $1 AND s.indicator_id = $2`,
+        [documentId, id]
+      );
+      if (!rows.length) throw new AppError("Document not found for this indicator.", 404);
+
+      // Reject the specific document
+      await client.query(
+        `UPDATE submission_documents
+         SET status = 'Rejected', rejection_reason = $1
+         WHERE id = $2`,
+        [reason.trim(), documentId]
+      );
+
+      // Mark the parent submission as Correction Needed (not fully rejected)
+      if (submissionId) {
+        await client.query(
+          `UPDATE submissions
+           SET review_status = 'Correction Needed', is_reviewed = true
+           WHERE id = $1 AND review_status = 'Pending'`,
+          [submissionId]
+        );
+
+        // If all docs on this submission are now rejected, escalate to Rejected
+        const { rows: docs } = await client.query(
+          `SELECT status FROM submission_documents WHERE submission_id = $1`,
+          [submissionId]
+        );
+        const allRejected = docs.length > 0 && docs.every(d => d.status === "Rejected");
+        if (allRejected) {
+          await client.query(
+            `UPDATE submissions SET review_status = 'Rejected' WHERE id = $1`,
+            [submissionId]
+          );
+        }
+      }
+
+      await client.query("COMMIT");
+      res.status(200).json({ success: true, message: "Document rejected." });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+);
