@@ -5,7 +5,7 @@ import { StrategicPlanRoutes } from "../modules/SPlanning/strategicPlan.routes";
 import { IndicatorRoutes } from "../modules/superadmin/indicator.routes";
 import userIndicatorRoutes from "../modules/controller/userIndicatorRoutes";
 import adminIndicatorRoutes from "../modules/admin/adminIndicatorRoutes";
-import reportsRoutes from "../modules/superadmin/report.routes";
+import { ReportRoutes } from "../modules/superadmin/report.routes";
 import registryRoute from "../modules/registry/registryRoute";
 import teamRoutes from "../modules/team/team.routes"
 import dashboardRoutes from "../modules/controllers/dashboardRoutes"
@@ -39,7 +39,7 @@ router.use("/user-indicators", userIndicatorRoutes);
 router.use("/admin", adminIndicatorRoutes);
 
 // ---------------- Reports ----------------
-router.use("/reports", reportsRoutes);
+router.use("/reports", ReportRoutes);
 
 // ---------------- Registry ----------------
 router.use("/registry", registryRoute);
