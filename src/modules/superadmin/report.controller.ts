@@ -3,8 +3,9 @@ import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
 import PDFDocument from "pdfkit";
+import axios from "axios";
 
-/* ─── SHARED SELECT ───────────────────────────────────────────────────────── */
+/* ─── SHARED SELECT (without assignedByName, without i.name) ───────────────── */
 const REPORT_SELECT = `
   SELECT
     sp.id                    AS "planId",
@@ -30,16 +31,23 @@ const REPORT_SELECT = `
     i.assignee_model         AS "assignmentType",
 
     CASE
-      WHEN i.assignee_model = 'User' THEN u.name
-      ELSE t.name
-    END                      AS "assigneeDisplayName",
-
-    CASE
       WHEN i.assignee_model = 'User' THEN u.id
       ELSE t.id
     END                      AS "assigneeId",
 
-    ab.name                  AS "assignedByName",
+    -- Display name for the assignee (User or Team)
+    CASE
+      WHEN i.assignee_model = 'User' THEN u.name
+      ELSE COALESCE(
+        (
+          SELECT string_agg(tm_u.name, ', ' ORDER BY tm_u.name)
+          FROM team_members tm
+          JOIN users tm_u ON tm_u.id = tm.user_id
+          WHERE tm.team_id = t.id
+        ),
+        t.name
+      )
+    END                      AS "assigneeDisplayName",
 
     COALESCE(
       (
@@ -81,7 +89,6 @@ const REPORT_JOINS = `
   JOIN indicators i             ON i.activity_id    = sa.id
   LEFT JOIN users u             ON i.assignee_id    = u.id AND i.assignee_model = 'User'
   LEFT JOIN teams t             ON i.assignee_id    = t.id AND i.assignee_model = 'Team'
-  LEFT JOIN users ab            ON i.assigned_by    = ab.id
 `;
 
 /* ─── SHARED FILTER BUILDER ───────────────────────────────────────────────── */
@@ -140,7 +147,6 @@ interface IndicatorRow {
   assignmentType:       string;
   assigneeId:           string;
   assigneeDisplayName:  string;
-  assignedByName:       string;
   submissions:          SubmissionRow[];
 }
 
@@ -233,7 +239,6 @@ function groupByPerspective(rows: IndicatorRow[]): GroupedPerspective[] {
       assignmentType:       row.assignmentType,
       assigneeId:           row.assigneeId,
       assigneeDisplayName:  row.assigneeDisplayName,
-      assignedByName:       row.assignedByName,
       submissions:          row.submissions,
     } as IndicatorRow);
   }
@@ -248,7 +253,7 @@ function groupByPerspective(rows: IndicatorRow[]): GroupedPerspective[] {
 }
 
 /* ─── HELPER: draw a table row in pdfkit ─────────────────────────────────── */
-const COL_WIDTHS  = [160, 40, 150, 110, 200, 110]; // landscape ~770pt usable
+const COL_WIDTHS  = [160, 40, 150, 110, 200, 110];
 const ROW_PADDING = 6;
 const FONT_SIZE   = 7.5;
 const LINE_HEIGHT  = FONT_SIZE * 1.35;
@@ -260,7 +265,6 @@ function drawTableRow(
   y: number,
   opts: { bold?: boolean; fillColor?: string } = {}
 ): number {
-  // measure tallest cell first
   let maxLines = 1;
   cells.forEach((text, i) => {
     const w        = COL_WIDTHS[i] - ROW_PADDING * 2;
@@ -275,20 +279,17 @@ function drawTableRow(
 
   const rowHeight = maxLines * LINE_HEIGHT + ROW_PADDING * 2;
 
-  // background fill
   if (opts.fillColor) {
     doc.save().rect(x, y, COL_WIDTHS.reduce((a, b) => a + b, 0), rowHeight)
        .fill(opts.fillColor).restore();
   }
 
-  // borders
   let cx = x;
   COL_WIDTHS.forEach((w) => {
     doc.save().rect(cx, y, w, rowHeight).stroke("#d1d5db").restore();
     cx += w;
   });
 
-  // text
   cx = x;
   cells.forEach((text, i) => {
     doc
@@ -383,6 +384,21 @@ export const getReportSummary = asyncHandler(
 );
 
 /* ─── 4. GET TRACKER PDF ──────────────────────────────────────────────────── */
+
+// URL where the office logo is hosted — adjust to wherever it actually lives
+// (e.g. your client's deployed assets, a CDN, or Cloudinary).
+const LOGO_URL = "https://res.cloudinary.com/do0yflasl/image/upload/v1781759596/JOB_LOGO_ubls4m.jpg";
+
+async function fetchLogoBuffer(url: string): Promise<Buffer | null> {
+  try {
+    const response = await axios.get(url, { responseType: "arraybuffer" });
+    return Buffer.from(response.data);
+  } catch (err) {
+    console.error("[getTrackerPdf] Failed to fetch logo:", err);
+    return null;
+  }
+}
+
 export const getTrackerPdf = asyncHandler(
   async (req: Request, res: Response) => {
     const { where, params } = buildWhereClause(req.query);
@@ -395,7 +411,8 @@ export const getTrackerPdf = asyncHandler(
 
     const grouped = groupByPerspective(rows as IndicatorRow[]);
 
-    /* ── Create PDF (A4 landscape) ── */
+    const logoBuffer = await fetchLogoBuffer(LOGO_URL);
+
     const doc = new PDFDocument({
       size:    "A4",
       layout:  "landscape",
@@ -409,18 +426,43 @@ export const getTrackerPdf = asyncHandler(
     );
     doc.pipe(res);
 
-    /* ── Header ── */
+    /* ── Header: logo + office name + report title ── */
+    const PAGE_WIDTH = doc.page.width;
+    const LOGO_SIZE   = 60;
+
+    if (logoBuffer) {
+      try {
+        doc.image(logoBuffer, (PAGE_WIDTH - LOGO_SIZE) / 2, doc.y, {
+          width:  LOGO_SIZE,
+          height: LOGO_SIZE,
+        });
+        doc.moveDown(LOGO_SIZE / doc.currentLineHeight() + 1);
+      } catch (err) {
+        console.error("[getTrackerPdf] Failed to render logo image:", err);
+      }
+    }
+
+    doc
+      .font("Helvetica-Bold")
+      .fontSize(11)
+      .fillColor("#1f2937")
+      .text("OFFICE OF THE REGISTRAR HIGH COURT", { align: "center" })
+      .moveDown(0.3);
+
     doc
       .font("Helvetica-Bold")
       .fontSize(10)
       .fillColor("#374151")
       .text(
-        "RHC 2024/2025 PMMU — Implementation and Evaluation Tracker",
+        "RHC 2025/2026 PMMU 1ST JULY 2025 TO 30TH JUNE 2026",
+        { align: "center" }
+      )
+      .text(
+        "IMPLEMENTATION AND EVALUATION TRACKER",
         { align: "center" }
       )
       .moveDown(0.5);
 
-    /* ── Generated date ── */
     doc
       .font("Helvetica")
       .fontSize(8)
@@ -428,7 +470,6 @@ export const getTrackerPdf = asyncHandler(
       .text(`Generated: ${new Date().toLocaleDateString("en-KE")}`, { align: "right" })
       .moveDown(0.5);
 
-    /* ── Column headers ── */
     const TABLE_X      = doc.page.margins.left;
     const HEADER_CELLS = [
       "INDICATORS", "Unit", "Explanatory Notes",
@@ -443,19 +484,15 @@ export const getTrackerPdf = asyncHandler(
     });
     cursorY += headerHeight;
 
-    /* ── Table body ── */
-    let indicatorIndex = 0;
     const PAGE_BOTTOM  = doc.page.height - doc.page.margins.bottom - 20;
     const TABLE_WIDTH  = COL_WIDTHS.reduce((a, b) => a + b, 0);
 
     for (const persp of grouped) {
-      /* Check space — add page if needed */
       if (cursorY + 20 > PAGE_BOTTOM) {
         doc.addPage();
         cursorY = doc.page.margins.top;
       }
 
-      /* Perspective section header */
       doc.save()
          .rect(TABLE_X, cursorY, TABLE_WIDTH, 18)
          .fill("#d1fae5")
@@ -472,23 +509,26 @@ export const getTrackerPdf = asyncHandler(
       doc.save().rect(TABLE_X, cursorY, TABLE_WIDTH, 18).stroke("#d1d5db").restore();
       cursorY += 18;
 
+      // Track the last objective whose title was printed, so it's only
+      // shown once per group of activities/indicators — matching the
+      // frontend table component's behaviour.
+      let lastObjectiveId: string | null = null;
+
       for (const obj of persp.objectives) {
         for (const act of obj.activities) {
           for (const ind of act.indicators) {
-            indicatorIndex += 1;
-
-            /* Evidence lines */
             const evidenceLines: string[] = [];
             if (ind.submissions?.length > 0) {
               for (const sub of ind.submissions) {
                 const period = sub.quarter === 0 ? "Annual" : `Q${sub.quarter}`;
-                evidenceLines.push(`${period} ${sub.year} [${sub.reviewStatus}]`);
+                evidenceLines.push(`${period} ${sub.year}`);
                 if (sub.notes) evidenceLines.push(`  ${sub.notes}`);
                 if (sub.documents) {
                   for (const doc of sub.documents) {
-                    evidenceLines.push(
-                      `  * ${doc.fileName || doc.description || "Document"}`
-                    );
+                    const desc = doc.description?.trim();
+                    if (desc) {
+                      evidenceLines.push(`  * ${desc}`);
+                    }
                   }
                 }
               }
@@ -496,16 +536,24 @@ export const getTrackerPdf = asyncHandler(
               evidenceLines.push("No submissions yet");
             }
 
+            const isFirstForObjective = obj.id !== lastObjectiveId;
+            lastObjectiveId = obj.id;
+
+            // INDICATORS column: just the objective title, no numbering
+            // prefix and no progress line — shown only on the first row
+            // for this objective, blank for subsequent rows in the group.
+            const indicatorLabel = obj.title?.trim() || act.description;
+            const indicatorCell = isFirstForObjective ? indicatorLabel : "";
+
             const cells = [
-              `${indicatorIndex}. ${obj.title}\n[${ind.status}] ${ind.progress ?? 0}%`,
+              indicatorCell,
               ind.unit || "%",
               act.description + (ind.instructions ? `\n${ind.instructions}` : ""),
               ind.assigneeDisplayName || "Unassigned",
               evidenceLines.join("\n"),
-              ind.assignedByName || "—",
+              "—",
             ];
 
-            /* Estimate row height to check for page break */
             const estLines = cells.reduce((max, text, i) => {
               const w        = COL_WIDTHS[i] - ROW_PADDING * 2;
               const approxCh = Math.floor(w / (FONT_SIZE * 0.52));
@@ -518,7 +566,6 @@ export const getTrackerPdf = asyncHandler(
               doc.addPage();
               cursorY = doc.page.margins.top;
 
-              /* Re-draw header on new page */
               const h = drawTableRow(doc, HEADER_CELLS, TABLE_X, cursorY, {
                 bold:      true,
                 fillColor: "#bbf7d0",
@@ -533,7 +580,6 @@ export const getTrackerPdf = asyncHandler(
       }
     }
 
-    /* ── Footer on each page (pdfkit doesn't auto-footer, so stamp last page) ── */
     const totalPages = (doc as any)._pageBuffer?.length ?? 1;
     doc
       .font("Helvetica")

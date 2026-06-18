@@ -6,7 +6,8 @@ import {
   rejectSubmission,
   fetchResubmittedIndicators,
   getAdminApprovedIndicators,
-  rejectDocument,        // ← new import
+  rejectDocument,
+  deleteSubmission,                // ← new import
 } from "../admin/adminIndicatorController";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 import { getCalendarEvents, getIndicatorCalendarEvents, getUpcomingDeadlines } from "../calendar/calendarcontroller";
@@ -19,9 +20,9 @@ router.use(restrictTo("admin"));
 // ─── Collection Routes ───────────────────────────────────────────────────────
 router.get("/all", fetchIndicatorsForAdmin);
 router.get("/resubmitted", fetchResubmittedIndicators);
-router.get("/approved-by-admin", getAdminApprovedIndicators);   // ← new route
+router.get("/approved-by-admin", getAdminApprovedIndicators);
 
-// ─── Calendar Routes (must be before /:id) ───────────────────────────────────
+// ─── Calendar Routes ──────────────────────────────────────────────────────────
 router.get("/calendar/upcoming", getUpcomingDeadlines);
 router.get("/calendar/:id",      getIndicatorCalendarEvents);
 router.get("/calendar",          getCalendarEvents);
@@ -30,8 +31,14 @@ router.get("/calendar",          getCalendarEvents);
 router.get("/:id", getIndicatorByIdAdmin);
 
 // ─── Action Routes ───────────────────────────────────────────────────────────
-router.patch("/:id/approve", approveSubmission);
-router.patch("/:id/reject",               rejectSubmission);        // existing — overall rejection
-router.patch("/:id/reject-document",      rejectDocument);          // NEW — single doc rejection
+router.patch("/:id/approve",           approveSubmission);
+router.patch("/:id/reject",            rejectSubmission);        // overall rejection
+router.patch("/:id/reject-document",   rejectDocument);          // single document rejection
+
+// ─── Delete submission ─────────────────────────────────────────────────────
+router.delete(
+  "/:indicatorId/submissions/:submissionId",
+  deleteSubmission
+);
 
 export default router;

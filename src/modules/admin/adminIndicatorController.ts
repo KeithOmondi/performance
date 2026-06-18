@@ -762,3 +762,97 @@ ORDER BY i.updated_at DESC
 
   res.status(200).json({ success: true, data: result });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  9. Delete a Single Submission (Admin)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const deleteSubmission = asyncHandler(async (req: Request, res: Response) => {
+  // Explicitly cast params to strings – they are always strings in practice
+  const indicatorId = req.params.indicatorId as string;
+  const submissionId = req.params.submissionId as string;
+
+  // Safety check: if either is an array, throw an error
+  if (Array.isArray(indicatorId) || Array.isArray(submissionId)) {
+    throw new AppError("Invalid parameter format. Expected single IDs.", 400);
+  }
+
+  const adminId = (req as any).user.id;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1. Lock and verify the indicator exists
+    const indicator = await fetchAndLockIndicator(client, indicatorId);
+
+    // 2. Check submission exists, belongs to indicator, and is deletable
+    const { rows: subRows } = await client.query(
+      `SELECT id, review_status, resubmission_count
+       FROM submissions
+       WHERE id = $1 AND indicator_id = $2
+       FOR UPDATE`,
+      [submissionId, indicatorId]
+    );
+    if (subRows.length === 0) {
+      throw new AppError("Submission not found for this indicator.", 404);
+    }
+    const submission = subRows[0];
+    if (!["Rejected", "Pending"].includes(submission.review_status)) {
+      throw new AppError(
+        `Cannot delete a submission with status: ${submission.review_status}. Only rejected or pending submissions can be deleted.`,
+        400
+      );
+    }
+
+    // 3. Get Cloudinary public IDs (for optional cleanup)
+    const { rows: docRows } = await client.query(
+      `SELECT evidence_public_id FROM submission_documents WHERE submission_id = $1`,
+      [submissionId]
+    );
+    const publicIds = docRows.map(r => r.evidence_public_id).filter(Boolean);
+
+    // 4. Delete documents and submission (hard delete)
+    await client.query(
+      `DELETE FROM submission_documents WHERE submission_id = $1`,
+      [submissionId]
+    );
+    await client.query(
+      `DELETE FROM submissions WHERE id = $1`,
+      [submissionId]
+    );
+
+    // 5. Recalculate indicator status
+    const newStatus = await recalcIndicatorStatus(client, indicatorId);
+    await client.query(
+      `UPDATE indicators SET status = $1, updated_at = NOW() WHERE id = $2`,
+      [newStatus, indicatorId]
+    );
+
+    // 6. Log the action
+    await client.query(
+      `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+       VALUES ($1, 'Submission Deleted', $2, 'admin', $3)`,
+      [indicatorId, `Submission ${submissionId} (${submission.review_status}) deleted by admin.`, adminId]
+    );
+
+    await client.query("COMMIT");
+
+    // 7. (Optional) Delete from Cloudinary asynchronously
+    if (publicIds.length > 0) {
+      // Uncomment if you have a deleteFromCloudinary helper:
+      // publicIds.forEach(pid => deleteFromCloudinary(pid).catch(console.error));
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Submission and associated documents have been deleted.",
+      data: { indicatorStatus: newStatus }
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+});
