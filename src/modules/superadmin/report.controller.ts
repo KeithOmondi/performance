@@ -473,7 +473,7 @@ export const getTrackerPdf = asyncHandler(
     const TABLE_X      = doc.page.margins.left;
     const HEADER_CELLS = [
       "INDICATORS", "Unit", "Explanatory Notes",
-      "Responsibility", "Evidence", "Eval. Person",
+      "Responsibility", "Evidence", "Status",  // Changed from "Eval. Person" to "Status"
     ];
 
     let cursorY = doc.y;
@@ -545,13 +545,16 @@ export const getTrackerPdf = asyncHandler(
             const indicatorLabel = obj.title?.trim() || act.description;
             const indicatorCell = isFirstForObjective ? indicatorLabel : "";
 
+            // Status: Only show "Complete" if completed, otherwise show nothing (or "In Progress")
+            const statusDisplay = ind.status === "Completed" ? "Complete" : "";
+
             const cells = [
               indicatorCell,
               ind.unit || "%",
               act.description + (ind.instructions ? `\n${ind.instructions}` : ""),
               ind.assigneeDisplayName || "Unassigned",
               evidenceLines.join("\n"),
-              "—",
+              statusDisplay,  // Now shows "Complete" or empty string
             ];
 
             const estLines = cells.reduce((max, text, i) => {

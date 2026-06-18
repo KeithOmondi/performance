@@ -38,6 +38,7 @@ const INDICATOR_SELECT = `
   LEFT JOIN strategic_plans sp     ON i.strategic_plan_id = sp.id
   LEFT JOIN strategic_objectives so ON i.objective_id = so.id
   LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+  WHERE i.deleted_at IS NULL
 `;
 
 /* ─── 1. GET ALL ASSIGNMENTS (superadmin view) ───────────────────────────── */
@@ -70,7 +71,7 @@ export const getAllExaminerAssignments = asyncHandler(
       FROM strategic_objectives so
       JOIN  strategic_plans           sp  ON sp.id  = so.plan_id
       LEFT JOIN strategic_activities  sa  ON sa.objective_id = so.id
-      LEFT JOIN indicators            i   ON i.activity_id   = sa.id
+      LEFT JOIN indicators            i   ON i.activity_id   = sa.id AND i.deleted_at IS NULL
       LEFT JOIN examiner_folder_assignments efa ON efa.objective_id = so.id
       LEFT JOIN users                 e   ON e.id = efa.examiner_id
 
@@ -159,7 +160,8 @@ export const unassignExaminerFromFolder = asyncHandler(
 /* ─── 4. EXAMINER — GET MY FOLDERS ──────────────────────────────────────── */
 /**
  * Called by the examiner role.
- * Returns only the folders assigned to them, with completed indicators inside.
+ * Returns only the folders assigned to them, with completed indicators inside,
+ * including submissions and their documents with full document details.
  */
 export const getMyExaminerFolders = asyncHandler(
   async (req: Request, res: Response) => {
@@ -186,18 +188,66 @@ export const getMyExaminerFolders = asyncHandler(
 
     const objectiveIds = folders.map((f: { objectiveId: string }) => f.objectiveId);
 
-    /* Get completed indicators for those objectives only */
+    /* Get completed indicators for those objectives */
     const { rows: indicators } = await pool.query(
       `${INDICATOR_SELECT}
-       WHERE i.objective_id = ANY($1::uuid[])
+       AND i.objective_id = ANY($1::uuid[])
          AND i.status = 'Completed'
        ORDER BY i.updated_at DESC`,
       [objectiveIds]
     );
 
+    /* For each indicator, fetch its submissions and documents with full details */
+    const indicatorsWithSubmissions = await Promise.all(
+      indicators.map(async (indicator: any) => {
+        const { rows: submissions } = await pool.query(
+          `
+          SELECT
+            s.id AS "submissionId",
+            s.quarter,
+            s.year,
+            s.achieved_value AS "achievedValue",
+            s.notes,
+            s.review_status AS "reviewStatus",
+            s.submitted_at AS "submittedAt",
+            COALESCE(
+              (
+                SELECT json_agg(
+                  json_build_object(
+                    'id',               sd.id,
+                    'submissionId',     sd.submission_id,
+                    'evidenceUrl',      sd.evidence_url,
+                    'evidencePublicId', sd.evidence_public_id,
+                    'fileType',         sd.file_type,
+                    'fileName',         sd.file_name,
+                    'description',      sd.description,
+                    'status',           sd.status,
+                    'rejectionReason',  sd.rejection_reason,
+                    'uploadedAt',       sd.uploaded_at
+                  ) ORDER BY sd.uploaded_at ASC
+                )
+                FROM submission_documents sd
+                WHERE sd.submission_id = s.id
+              ),
+              '[]'::json
+            ) AS documents
+          FROM submissions s
+          WHERE s.indicator_id = $1
+          ORDER BY s.year ASC, s.quarter ASC
+          `,
+          [indicator.id]
+        );
+
+        return {
+          ...indicator,
+          submissions: submissions || [],
+        };
+      })
+    );
+
     /* Nest indicators under their objective */
-    const indicatorsByObjective: Record<string, typeof indicators> = {};
-    indicators.forEach((ind: { objectiveId: string }) => {
+    const indicatorsByObjective: Record<string, typeof indicatorsWithSubmissions> = {};
+    indicatorsWithSubmissions.forEach((ind) => {
       if (!indicatorsByObjective[ind.objectiveId]) {
         indicatorsByObjective[ind.objectiveId] = [];
       }
