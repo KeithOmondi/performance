@@ -2,6 +2,8 @@ import { pool } from "../../config/db";
 import { AppError } from "../../utils/AppError";
 import { StrategicPlanModel } from "./strategicPlan.model";
 
+/* ─── STRATEGIC PLAN SERVICES ─────────────────────────────────────────────── */
+
 const createStrategicPlan = async (payload: any, createdBy: string) => {
   // Check if perspective already exists (Postgres UNIQUE constraint would also catch this)
   const { rows } = await pool.query(
@@ -43,7 +45,9 @@ const updateStrategicPlan = async (id: string, payload: any) => {
       [payload.perspective, id]
     );
 
-    if (result.rows.length === 0) throw new AppError("Strategic Plan not found.", 404);
+    if (result.rows.length === 0) {
+      throw new AppError("Strategic Plan not found.", 404);
+    }
 
     /**
      * NOTE: For nested objectives/activities update logic:
@@ -65,17 +69,135 @@ const updateStrategicPlan = async (id: string, payload: any) => {
 const deleteStrategicPlan = async (id: string) => {
   // PostgreSQL handles deleting objectives and activities automatically 
   // because we set 'ON DELETE CASCADE' in the schema.
-  const result = await pool.query("DELETE FROM strategic_plans WHERE id = $1 RETURNING id", [id]);
+  const result = await pool.query(
+    "DELETE FROM strategic_plans WHERE id = $1 RETURNING id", 
+    [id]
+  );
   
   if (result.rows.length === 0) {
     throw new AppError("Strategic Plan not found.", 404);
   }
 };
 
+/* ─── OBJECTIVE SERVICES ──────────────────────────────────────────────────── */
+
+const addObjective = async (planId: string, title: string) => {
+  const planCheck = await pool.query(
+    "SELECT id FROM strategic_plans WHERE id = $1",
+    [planId]
+  );
+  if (planCheck.rows.length === 0) {
+    throw new AppError("Strategic Plan not found.", 404);
+  }
+
+  const { rows } = await pool.query(
+    `INSERT INTO strategic_objectives (plan_id, title)
+     VALUES ($1, $2)
+     RETURNING id, plan_id AS "planId", title, created_at AS "createdAt"`,
+    [planId, title]
+  );
+  return rows[0];
+};
+
+const updateObjective = async (objectiveId: string, title: string) => {
+  const { rows } = await pool.query(
+    `UPDATE strategic_objectives
+     SET title = $1, updated_at = NOW()
+     WHERE id = $2
+     RETURNING id, plan_id AS "planId", title`,
+    [title, objectiveId]
+  );
+  
+  if (rows.length === 0) {
+    throw new AppError("Objective not found.", 404);
+  }
+  return rows[0];
+};
+
+/* ─── ACTIVITY SERVICES ───────────────────────────────────────────────────── */
+
+const addActivity = async (objectiveId: string, description: string) => {
+  const objCheck = await pool.query(
+    "SELECT id FROM strategic_objectives WHERE id = $1",
+    [objectiveId]
+  );
+  if (objCheck.rows.length === 0) {
+    throw new AppError("Objective not found.", 404);
+  }
+
+  const { rows } = await pool.query(
+    `INSERT INTO strategic_activities (objective_id, description)
+     VALUES ($1, $2)
+     RETURNING id, objective_id AS "objectiveId", description, created_at AS "createdAt"`,
+    [objectiveId, description]
+  );
+  return rows[0];
+};
+
+const updateActivity = async (activityId: string, description: string) => {
+  const { rows } = await pool.query(
+    `UPDATE strategic_activities
+     SET description = $1, updated_at = NOW()
+     WHERE id = $2
+     RETURNING id, objective_id AS "objectiveId", description`,
+    [description, activityId]
+  );
+  
+  if (rows.length === 0) {
+    throw new AppError("Activity not found.", 404);
+  }
+  return rows[0];
+};
+
+/* ─── INDICATOR LOOKUP SERVICE ───────────────────────────────────────────── */
+
+const getIndicatorByActivity = async (activityId: string) => {
+  const { rows } = await pool.query(
+    `SELECT
+       i.id,
+       i.status,
+       i.progress,
+       i.target,
+       i.unit,
+       i.deadline,
+       i.assignee_id        AS "assigneeId",
+       i.assignee_model     AS "assignmentType",
+       i.reporting_cycle    AS "reportingCycle",
+       i.active_quarter     AS "activeQuarter",
+       CASE
+         WHEN i.assignee_model = 'User' THEN u.name
+         ELSE t.name
+       END                  AS "assigneeDisplayName"
+     FROM indicators i
+     LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+     LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+     WHERE i.activity_id = $1
+       AND i.deleted_at IS NULL`,
+    [activityId]
+  );
+  
+  // Returns null if no indicator assigned yet — that's valid
+  return rows[0] ?? null;
+};
+
+/* ─── EXPORTS ──────────────────────────────────────────────────────────────── */
+
 export const StrategicPlanService = {
+  // Strategic Plan CRUD
   createStrategicPlan,
   fetchAllStrategicPlans,
   fetchStrategicPlanById,
   updateStrategicPlan,
   deleteStrategicPlan,
+  
+  // Objectives
+  addObjective,
+  updateObjective,
+  
+  // Activities
+  addActivity,
+  updateActivity,
+  
+  // Indicator Lookup
+  getIndicatorByActivity,
 };

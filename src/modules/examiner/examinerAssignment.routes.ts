@@ -40,7 +40,7 @@ router.delete(
 /* ── Examiner route ── */
 router.get(
   "/my-folders",
-  restrictTo("examiner"),
+  restrictTo("examiner", "superadmin"),
   getMyExaminerFolders
 );
 

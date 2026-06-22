@@ -35,4 +35,37 @@ router.delete(
   StrategicPlanController.deleteStrategicPlan,
 );
 
+// strategicPlan.routes.ts
+
+// ─── OBJECTIVES (superadmin only) ────────────────────────────────────────────
+router.post(
+  "/:id/objectives",
+  restrictTo("superadmin"),
+  StrategicPlanController.addObjective,
+);
+router.patch(
+  "/objectives/:objectiveId",
+  restrictTo("superadmin"),
+  StrategicPlanController.updateObjective,
+);
+
+// ─── ACTIVITIES (superadmin only) ────────────────────────────────────────────
+router.post(
+  "/objectives/:objectiveId/activities",
+  restrictTo("superadmin"),
+  StrategicPlanController.addActivity,
+);
+router.patch(
+  "/activities/:activityId",
+  restrictTo("superadmin"),
+  StrategicPlanController.updateActivity,
+);
+
+// ─── INDICATOR LOOKUP ────────────────────────────────────────────────────────
+router.get(
+  "/activities/:activityId/indicator",
+  restrictTo("superadmin", "admin"),
+  StrategicPlanController.getIndicatorByActivity,
+);
+
 export const StrategicPlanRoutes = router;
