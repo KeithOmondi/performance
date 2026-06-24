@@ -10,7 +10,7 @@ import { protect, restrictTo } from "../../middleware/auth.middleware";
 const router = express.Router();
 
 router.use(protect);
-router.use(restrictTo("superadmin", "admin"));
+router.use(restrictTo("superadmin", "admin", "user"));
 
 // ── Static routes FIRST ──────────────────────────────────────────────────────
 router.get("/",        getTrackerReport);   // GET /api/reports
