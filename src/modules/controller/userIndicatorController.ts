@@ -597,18 +597,25 @@ export const UserIndicatorController: IUserIndicatorController = {
       const newResubmissionCount = latestSubmission.resubmission_count + 1;
 
       // Create new submission with optional values
-      const { rows: inserted } = await client.query(
-        `INSERT INTO submissions
-           (indicator_id, quarter, year, achieved_value, notes,
-            review_status, submitted_by, resubmission_count, 
-            previous_submission_id, resubmitted_from_rejection, is_reviewed)
-         VALUES ($1, $2, $3, $4, $5, 'Pending', $6, $7, $8, true, false)
-         RETURNING id`,
-        [indicatorId, quarterNum, yearNum, validated.achievedValue, validated.notes,
-         user.id, newResubmissionCount, latestSubmission.id],
-      );
+      // ✅ UPDATE the rejected row — no new row, no constraint violation
+const { rows: updated } = await client.query(
+  `UPDATE submissions
+   SET achieved_value            = $1,
+       notes                     = $2,
+       review_status             = 'Pending',
+       submitted_by              = $3,
+       resubmission_count        = $4,
+       resubmitted_from_rejection = true,
+       is_reviewed               = false,
+       admin_comment             = NULL,
+       submitted_at              = NOW()
+   WHERE id = $5
+   RETURNING id`,
+  [validated.achievedValue, validated.notes, user.id,
+   newResubmissionCount, latestSubmission.id],
+);
 
-      const newSubmissionId = (inserted[0] as { id: string }).id;
+const newSubmissionId = (updated[0] as { id: string }).id;
 
       if (files.length > 0) {
         const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
