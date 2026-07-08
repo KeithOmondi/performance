@@ -21,17 +21,17 @@ router.get(
 // ─── SuperAdmin only ──────────────────────────────────────────────────────────
 router.post(
   "/",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "admin"),
   StrategicPlanController.createStrategicPlan,
 );
 router.patch(
   "/:id",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "admin"),
   StrategicPlanController.updateStrategicPlan,
 );
 router.delete(
   "/:id",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "admin"),
   StrategicPlanController.deleteStrategicPlan,
 );
 
@@ -40,24 +40,24 @@ router.delete(
 // ─── OBJECTIVES (superadmin only) ────────────────────────────────────────────
 router.post(
   "/:id/objectives",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "admin"),
   StrategicPlanController.addObjective,
 );
 router.patch(
   "/objectives/:objectiveId",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "admin"),
   StrategicPlanController.updateObjective,
 );
 
 // ─── ACTIVITIES (superadmin only) ────────────────────────────────────────────
 router.post(
   "/objectives/:objectiveId/activities",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "admin"),
   StrategicPlanController.addActivity,
 );
 router.patch(
   "/activities/:activityId",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "admin"),
   StrategicPlanController.updateActivity,
 );
 
