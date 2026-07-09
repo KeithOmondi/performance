@@ -7,7 +7,7 @@ export const StrategicPlanController = {
   createStrategicPlan: asyncHandler(async (req: Request, res: Response) => {
     const result = await StrategicPlanService.createStrategicPlan(
       req.body,
-      (req as any).user.id, // Use the UUID string from the session
+      (req as any).user.id,
     );
 
     res.status(201).json({
@@ -27,11 +27,8 @@ export const StrategicPlanController = {
   }),
 
   fetchStrategicPlanById: asyncHandler(async (req: Request, res: Response) => {
-    // Destructure and cast to satisfy TS string requirement
     const { id } = req.params as { id: string };
-
     const result = await StrategicPlanService.fetchStrategicPlanById(id);
-
     res.status(200).json({
       success: true,
       data: result,
@@ -39,9 +36,7 @@ export const StrategicPlanController = {
   }),
 
   updateStrategicPlan: asyncHandler(async (req: Request, res: Response) => {
-    // Destructure and cast to string to satisfy TS
     const { id } = req.params as { id: string };
-
     const result = await StrategicPlanService.updateStrategicPlan(id, req.body);
     res.status(200).json({
       success: true,
@@ -51,9 +46,7 @@ export const StrategicPlanController = {
   }),
 
   deleteStrategicPlan: asyncHandler(async (req: Request, res: Response) => {
-    // Alternative fix: Type casting inline
     const id = req.params.id as string;
-
     await StrategicPlanService.deleteStrategicPlan(id);
     res.status(200).json({
       success: true,
@@ -61,12 +54,10 @@ export const StrategicPlanController = {
     });
   }),
 
-  // strategicPlan.controller.ts — add to StrategicPlanController object
-
   // ─── OBJECTIVES ─────────────────────────────────────────────────────────────
 
   addObjective: asyncHandler(async (req: Request, res: Response) => {
-    const { id } = req.params as { id: string }; // planId
+    const { id } = req.params as { id: string };
     const { title } = req.body;
     if (!title?.trim()) throw new AppError("Objective title is required.", 400);
 
@@ -103,6 +94,31 @@ export const StrategicPlanController = {
     res.status(200).json({ success: true, data: result });
   }),
 
+  deleteActivity: asyncHandler(async (req: Request, res: Response) => {
+    const { activityId } = req.params as { activityId: string };
+    await StrategicPlanService.deleteActivity(activityId);
+    res.status(200).json({
+      success: true,
+      message: "Activity deleted successfully.",
+    });
+  }),
+
+  reorderActivities: asyncHandler(async (req: Request, res: Response) => {
+    const { objectiveId } = req.params as { objectiveId: string };
+    const { activityIds } = req.body;
+    
+    if (!Array.isArray(activityIds) || activityIds.length === 0) {
+      throw new AppError("Activity IDs array is required.", 400);
+    }
+
+    const result = await StrategicPlanService.reorderActivities(objectiveId, activityIds);
+    res.status(200).json({
+      success: true,
+      message: "Activities reordered successfully.",
+      data: result,
+    });
+  }),
+
   // ─── INDICATOR LOOKUP ────────────────────────────────────────────────────────
 
   getIndicatorByActivity: asyncHandler(async (req: Request, res: Response) => {
@@ -112,7 +128,7 @@ export const StrategicPlanController = {
     res.status(200).json({
       success: true,
       hasIndicator: result !== null,
-      data: result,   // null means no indicator assigned yet — frontend can use this
+      data: result,
     });
   }),
 };

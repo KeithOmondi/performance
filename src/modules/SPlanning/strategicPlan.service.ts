@@ -5,7 +5,7 @@ import { StrategicPlanModel } from "./strategicPlan.model";
 /* ─── STRATEGIC PLAN SERVICES ─────────────────────────────────────────────── */
 
 const createStrategicPlan = async (payload: any, createdBy: string) => {
-  // Check if perspective already exists (Postgres UNIQUE constraint would also catch this)
+  // Check if perspective already exists
   const { rows } = await pool.query(
     "SELECT id FROM strategic_plans WHERE perspective = $1",
     [payload.perspective]
@@ -14,7 +14,6 @@ const createStrategicPlan = async (payload: any, createdBy: string) => {
     throw new AppError("A strategic plan with this perspective already exists.", 400);
   }
 
-  // Use the Transactional create method from our Model
   return await StrategicPlanModel.createFullPlan(
     payload.perspective,
     createdBy,
@@ -37,7 +36,6 @@ const updateStrategicPlan = async (id: string, payload: any) => {
   try {
     await client.query("BEGIN");
 
-    // 1. Update the main plan details
     const result = await client.query(
       `UPDATE strategic_plans 
        SET perspective = COALESCE($1, perspective), updated_at = NOW() 
@@ -48,13 +46,6 @@ const updateStrategicPlan = async (id: string, payload: any) => {
     if (result.rows.length === 0) {
       throw new AppError("Strategic Plan not found.", 404);
     }
-
-    /**
-     * NOTE: For nested objectives/activities update logic:
-     * In a relational DB, you usually handle these via separate endpoints 
-     * (e.g., PUT /objectives/:id) rather than replacing the whole array.
-     * For now, we return the updated parent record.
-     */
 
     await client.query("COMMIT");
     return result.rows[0];
@@ -67,8 +58,6 @@ const updateStrategicPlan = async (id: string, payload: any) => {
 };
 
 const deleteStrategicPlan = async (id: string) => {
-  // PostgreSQL handles deleting objectives and activities automatically 
-  // because we set 'ON DELETE CASCADE' in the schema.
   const result = await pool.query(
     "DELETE FROM strategic_plans WHERE id = $1 RETURNING id", 
     [id]
@@ -125,11 +114,18 @@ const addActivity = async (objectiveId: string, description: string) => {
     throw new AppError("Objective not found.", 404);
   }
 
+  // Get max order for this objective
+  const orderResult = await pool.query(
+    "SELECT COALESCE(MAX(\"order\"), -1) + 1 as next_order FROM strategic_activities WHERE objective_id = $1",
+    [objectiveId]
+  );
+  const nextOrder = orderResult.rows[0].next_order;
+
   const { rows } = await pool.query(
-    `INSERT INTO strategic_activities (objective_id, description)
-     VALUES ($1, $2)
-     RETURNING id, objective_id AS "objectiveId", description, created_at AS "createdAt"`,
-    [objectiveId, description]
+    `INSERT INTO strategic_activities (objective_id, description, "order")
+     VALUES ($1, $2, $3)
+     RETURNING id, objective_id AS "objectiveId", description, "order", created_at AS "createdAt"`,
+    [objectiveId, description, nextOrder]
   );
   return rows[0];
 };
@@ -139,7 +135,7 @@ const updateActivity = async (activityId: string, description: string) => {
     `UPDATE strategic_activities
      SET description = $1, updated_at = NOW()
      WHERE id = $2
-     RETURNING id, objective_id AS "objectiveId", description`,
+     RETURNING id, objective_id AS "objectiveId", description, "order"`,
     [description, activityId]
   );
   
@@ -147,6 +143,56 @@ const updateActivity = async (activityId: string, description: string) => {
     throw new AppError("Activity not found.", 404);
   }
   return rows[0];
+};
+
+const deleteActivity = async (activityId: string) => {
+  const result = await pool.query(
+    "DELETE FROM strategic_activities WHERE id = $1 RETURNING id",
+    [activityId]
+  );
+  
+  if (result.rows.length === 0) {
+    throw new AppError("Activity not found.", 404);
+  }
+  
+  // Optionally reorder remaining activities
+  // This can be handled by the frontend or a trigger
+};
+
+// ─── REORDER ACTIVITIES ─────────────────────────────────────────────────────
+
+const reorderActivities = async (objectiveId: string, activityIds: string[]) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Verify objective exists
+    const objCheck = await client.query(
+      "SELECT id FROM strategic_objectives WHERE id = $1",
+      [objectiveId]
+    );
+    if (objCheck.rows.length === 0) {
+      throw new AppError("Objective not found.", 404);
+    }
+
+    // Update order for each activity
+    for (let i = 0; i < activityIds.length; i++) {
+      await client.query(
+        `UPDATE strategic_activities 
+         SET "order" = $1, updated_at = NOW()
+         WHERE id = $2 AND objective_id = $3`,
+        [i, activityIds[i], objectiveId]
+      );
+    }
+
+    await client.query("COMMIT");
+    return { success: true, message: "Activities reordered successfully" };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 /* ─── INDICATOR LOOKUP SERVICE ───────────────────────────────────────────── */
@@ -176,7 +222,6 @@ const getIndicatorByActivity = async (activityId: string) => {
     [activityId]
   );
   
-  // Returns null if no indicator assigned yet — that's valid
   return rows[0] ?? null;
 };
 
@@ -197,6 +242,8 @@ export const StrategicPlanService = {
   // Activities
   addActivity,
   updateActivity,
+  deleteActivity,
+  reorderActivities,
   
   // Indicator Lookup
   getIndicatorByActivity,
