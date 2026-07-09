@@ -195,8 +195,58 @@ export const createIndicator = asyncHandler(
       return;
     }
 
-    // ✅ No existing indicator - create new one (rest of your create logic)
-    // ... (your existing create logic here)
+    // ✅ No existing indicator - create new one
+    const { rows: newRows } = await pool.query(
+      `INSERT INTO indicators (
+         strategic_plan_id,
+         objective_id,
+         activity_id,
+         reporting_cycle,
+         weight,
+         unit,
+         target,
+         deadline,
+         instructions,
+         active_quarter,
+         assignee_id,
+         assignee_model,
+         assigned_by,
+         status,
+         progress,
+         current_total_achieved
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 0, 0
+       )
+       RETURNING id`,
+      [
+        strategicPlanId,
+        objectiveId,
+        activityId,
+        reportingCycle || "Quarterly",
+        weight ?? 5,
+        unit || "%",
+        target ?? 100,
+        deadline ? new Date(deadline) : null,
+        instructions || "",
+        activeQuarter || 1,
+        assignee && assignee !== "unassigned" ? assignee : null,
+        assignmentType === "Team" ? "Team" : "User",
+        adminId,
+        assignee && assignee !== "unassigned" ? "Pending" : "Pending",
+      ]
+    );
+
+    const { rows: createdRows } = await pool.query(
+      `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+      [newRows[0].id]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Indicator created successfully.",
+      data: createdRows[0],
+    });
   }
 );
 
