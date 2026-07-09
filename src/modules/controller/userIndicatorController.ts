@@ -134,17 +134,10 @@ async function assertIndicatorOwnership(
   throw new AppError("Unable to verify your permission for this indicator. Please contact support.", 403);
 }
 
-/**
- * ✅ VALIDATION REMOVED - notes and achievedValue are NOT required at submission
- * - achievedValue is auto-updated by super admin upon approval
- * - notes are not needed - document descriptions provide the necessary context
- * - This function is kept for backward compatibility but no longer validates
- */
 function validateSubmissionInput(
   notes: unknown,
   achievedValue: unknown,
 ): { notes: string | null; achievedValue: number | null } {
-  // No validation - both fields are optional
   const notesStr = typeof notes === "string" && notes.trim().length > 0 ? notes.trim() : null;
   
   let achievedNum: number | null = null;
@@ -388,10 +381,9 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ SUBMIT PROGRESS - ONLY for first-time submissions
-   * - Rejects if ANY submission exists (pending, rejected, or accepted)
+   * ✅ SUBMIT PROGRESS - First-time submission
+   * - Allows submission even if indicator is 100% complete
    * - Creates a brand new submission with status 'Pending'
-   * - notes and achievedValue are OPTIONAL (achievedValue auto-updated by admin on approval)
    */
   submitProgress: asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
@@ -403,7 +395,6 @@ export const UserIndicatorController: IUserIndicatorController = {
       throw new AppError("Both quarter and year are required for submission.", 400);
     }
 
-    // ✅ FIX: notes and achievedValue are now OPTIONAL - no validation required
     const validated = validateSubmissionInput(notes, achievedValue);
     
     if (files.length > 0) validateFiles(files);
@@ -451,6 +442,7 @@ export const UserIndicatorController: IUserIndicatorController = {
         throw new AppError(`Invalid quarter. Use Q1-Q4. Received: Q${quarterNum}`, 400);
       }
 
+      // Check for existing submissions
       const existingSubmissions = await client.query(
         `SELECT id, review_status FROM submissions
          WHERE indicator_id = $1 AND quarter = $2 AND year = $3
@@ -480,7 +472,7 @@ export const UserIndicatorController: IUserIndicatorController = {
         }
       }
 
-      // Create new submission with optional values (achieved_value and notes can be NULL)
+      // Create new submission
       const { rows: inserted } = await client.query(
         `INSERT INTO submissions
            (indicator_id, quarter, year, achieved_value, notes,
@@ -506,15 +498,19 @@ export const UserIndicatorController: IUserIndicatorController = {
         }
       }
 
-      await client.query(
-        `UPDATE indicators SET status = 'Awaiting Admin Approval', updated_at = NOW() WHERE id = $1`,
-        [id],
-      );
+      // ✅ FIX: Don't change indicator status to "Awaiting Admin Approval" if already 100%
+      // Only update status if not already completed
+      if (indicator.status !== "Completed") {
+        await client.query(
+          `UPDATE indicators SET status = 'Awaiting Admin Approval', updated_at = NOW() WHERE id = $1`,
+          [id],
+        );
+      }
 
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
 
-      console.log(`✅ [submitProgress] First-time submission for ${quarterDisplay(quarterNum, yearNum)}`);
+      console.log(`✅ [submitProgress] Submission for ${quarterDisplay(quarterNum, yearNum)}`);
 
       UserIndicatorController._sendAlerts(
         user, indicator, quarterNum, yearNum,
@@ -535,10 +531,7 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ RESUBMIT PROGRESS - ONLY for rejected submissions
-   * - Requires an existing submission with status 'Rejected'
-   * - Creates a new submission linked to the rejected one
-   * - notes and achievedValue are OPTIONAL (achievedValue auto-updated by admin on approval)
+   * ✅ RESUBMIT PROGRESS - For rejected submissions
    */
   resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
     const { id: indicatorId } = req.params;
@@ -550,7 +543,6 @@ export const UserIndicatorController: IUserIndicatorController = {
       throw new AppError("Quarter and year are required for resubmission.", 400);
     }
 
-    // ✅ FIX: notes and achievedValue are OPTIONAL
     const validated = validateSubmissionInput(notes, achievedValue);
     if (files.length > 0) validateFiles(files);
 
@@ -596,26 +588,25 @@ export const UserIndicatorController: IUserIndicatorController = {
       const latestSubmission = rejectedSubmission.rows[0] as Submission;
       const newResubmissionCount = latestSubmission.resubmission_count + 1;
 
-      // Create new submission with optional values
-      // ✅ UPDATE the rejected row — no new row, no constraint violation
-const { rows: updated } = await client.query(
-  `UPDATE submissions
-   SET achieved_value            = $1,
-       notes                     = $2,
-       review_status             = 'Pending',
-       submitted_by              = $3,
-       resubmission_count        = $4,
-       resubmitted_from_rejection = true,
-       is_reviewed               = false,
-       admin_comment             = NULL,
-       submitted_at              = NOW()
-   WHERE id = $5
-   RETURNING id`,
-  [validated.achievedValue, validated.notes, user.id,
-   newResubmissionCount, latestSubmission.id],
-);
+      // Update the rejected row
+      const { rows: updated } = await client.query(
+        `UPDATE submissions
+         SET achieved_value            = $1,
+             notes                     = $2,
+             review_status             = 'Pending',
+             submitted_by              = $3,
+             resubmission_count        = $4,
+             resubmitted_from_rejection = true,
+             is_reviewed               = false,
+             admin_comment             = NULL,
+             submitted_at              = NOW()
+         WHERE id = $5
+         RETURNING id`,
+        [validated.achievedValue, validated.notes, user.id,
+         newResubmissionCount, latestSubmission.id],
+      );
 
-const newSubmissionId = (updated[0] as { id: string }).id;
+      const newSubmissionId = (updated[0] as { id: string }).id;
 
       if (files.length > 0) {
         const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
@@ -630,10 +621,13 @@ const newSubmissionId = (updated[0] as { id: string }).id;
         }
       }
 
-      await client.query(
-        `UPDATE indicators SET status = 'Awaiting Admin Approval', updated_at = NOW() WHERE id = $1`,
-        [indicatorId],
-      );
+      // ✅ FIX: Don't change indicator status if already 100%
+      if (indicator.status !== "Completed") {
+        await client.query(
+          `UPDATE indicators SET status = 'Awaiting Admin Approval', updated_at = NOW() WHERE id = $1`,
+          [indicatorId],
+        );
+      }
 
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
@@ -658,9 +652,8 @@ const newSubmissionId = (updated[0] as { id: string }).id;
   }),
 
   /**
-   * ✅ ADD DOCUMENTS - ONLY for pending submissions
-   * - Requires an existing submission with status 'Pending'
-   * - Adds additional documents without modifying existing data
+   * ✅ ADD DOCUMENTS - For pending submissions
+   * - Allows adding documents even if indicator is 100% complete
    */
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
@@ -743,7 +736,6 @@ const newSubmissionId = (updated[0] as { id: string }).id;
 
   /**
    * ✅ UPDATE SUBMISSION - Smart router
-   * - Checks submission status and delegates to correct endpoint
    */
   updateSubmission: asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
@@ -795,9 +787,6 @@ const newSubmissionId = (updated[0] as { id: string }).id;
 
     const checkParams: unknown[] = teamIds.length > 0 ? [docId, user.id, teamIds] : [docId, user.id];
 
-    console.log(`🔍 [deletePendingDocument] Ownership filter:`, ownershipFilter.trim());
-    console.log(`🔍 [deletePendingDocument] Query params:`, checkParams);
-
     const { rows } = await pool.query(
       `SELECT d.id, d.evidence_public_id, d.file_name, d.status AS doc_status, 
               s.review_status, s.quarter, s.year
@@ -808,21 +797,7 @@ const newSubmissionId = (updated[0] as { id: string }).id;
       checkParams,
     );
 
-    console.log(`📋 [deletePendingDocument] Ownership check — rows found: ${rows.length}`, rows);
-
     if (rows.length === 0) {
-      const diagnosticResult = await pool.query(
-        `SELECT d.id, d.deleted_at, d.status AS doc_status,
-                s.review_status, s.indicator_id,
-                i.assignee_id, i.assignee_model
-         FROM submission_documents d
-         JOIN submissions s ON d.submission_id = s.id
-         JOIN indicators i ON s.indicator_id = i.id
-         WHERE d.id = $1`,
-        [docId],
-      );
-      console.error(`❌ [deletePendingDocument] Doc without ownership filter:`, diagnosticResult.rows);
-      console.error(`❌ [deletePendingDocument] Expected assignee_id: ${user.id} | teamIds: ${JSON.stringify(teamIds)}`);
       throw new AppError("Document not found or you don't have permission to delete it.", 404);
     }
 
@@ -835,23 +810,12 @@ const newSubmissionId = (updated[0] as { id: string }).id;
       year: number;
     };
 
-    console.log(`📄 [deletePendingDocument] Doc found:`, {
-      file_name:     doc.file_name,
-      doc_status:    doc.doc_status,
-      review_status: doc.review_status,
-      quarter:       doc.quarter,
-      year:          doc.year,
-    });
-
     if (doc.review_status !== "Pending" && doc.doc_status !== "Rejected") {
-      console.warn(`⛔ [deletePendingDocument] Blocked — review_status: "${doc.review_status}" | doc_status: "${doc.doc_status}"`);
       throw new AppError(
         `Cannot delete this document because the submission is ${doc.review_status}. Documents can only be deleted when the submission is pending review or when specifically rejected by an admin.`,
         400,
       );
     }
-
-    console.log(`✅ [deletePendingDocument] Status check passed — proceeding with soft delete`);
 
     await pool.query(
       `UPDATE submission_documents 
@@ -860,18 +824,13 @@ const newSubmissionId = (updated[0] as { id: string }).id;
       [user.id, docId],
     );
 
-    console.log(`✅ [deletePendingDocument] Soft delete complete for docId: ${docId}`);
-
     if (doc.evidence_public_id) {
-      console.log(`☁️ [deletePendingDocument] Queuing Cloudinary cleanup for: ${doc.evidence_public_id}`);
       deleteFromCloudinary(doc.evidence_public_id).catch((err: Error) =>
         console.error("[deletePendingDocument] Cloudinary cleanup failed:", err),
       );
     }
 
     const quarterDisplayText = doc.quarter === 0 ? "Annual" : `Q${doc.quarter}`;
-    console.log(`🎉 [deletePendingDocument] Done — "${doc.file_name}" removed from ${quarterDisplayText} ${doc.year}`);
-
     res.status(200).json({
       success: true,
       message: `Document "${doc.file_name}" has been removed from your ${quarterDisplayText} ${doc.year} submission.`,
@@ -1216,10 +1175,7 @@ const newSubmissionId = (updated[0] as { id: string }).id;
     const user = getAuthUser(req);
     const { docId } = req.params;
 
-    console.log(`🗑️ [deleteDocument] START — docId: ${docId} | user: ${user.id}`);
-
     const teamIds = await getUserTeamIds(user.id);
-    console.log(`👥 [deleteDocument] teamIds for user ${user.id}:`, teamIds);
 
     const ownershipFilter = teamIds.length > 0
       ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
@@ -1227,9 +1183,6 @@ const newSubmissionId = (updated[0] as { id: string }).id;
       : `AND i.assignee_id = $2 AND i.assignee_model = 'User'`;
 
     const checkParams: unknown[] = teamIds.length > 0 ? [docId, user.id, teamIds] : [docId, user.id];
-
-    console.log(`🔍 [deleteDocument] Ownership filter:`, ownershipFilter.trim());
-    console.log(`🔍 [deleteDocument] Query params:`, checkParams);
 
     const { rows } = await pool.query(
       `SELECT d.id, d.evidence_public_id, d.file_name, d.status AS doc_status, 
@@ -1241,21 +1194,7 @@ const newSubmissionId = (updated[0] as { id: string }).id;
       checkParams,
     );
 
-    console.log(`📋 [deleteDocument] Ownership check — rows found: ${rows.length}`, rows);
-
     if (rows.length === 0) {
-      const { rows: rawRows } = await pool.query(
-        `SELECT d.id, d.deleted_at, d.status AS doc_status,
-                s.review_status, s.indicator_id,
-                i.assignee_id, i.assignee_model
-         FROM submission_documents d
-         JOIN submissions s ON d.submission_id = s.id
-         JOIN indicators i ON s.indicator_id = i.id
-         WHERE d.id = $1`,
-        [docId],
-      );
-      console.error(`❌ [deleteDocument] Doc exists without ownership filter:`, rawRows);
-      console.error(`❌ [deleteDocument] Expected assignee_id: ${user.id} | teamIds: ${JSON.stringify(teamIds)}`);
       throw new AppError("Document not found or you don't have permission to delete it.", 404);
     }
 
@@ -1268,23 +1207,12 @@ const newSubmissionId = (updated[0] as { id: string }).id;
       year: number;
     };
 
-    console.log(`📄 [deleteDocument] Doc found:`, {
-      file_name:      doc.file_name,
-      doc_status:     doc.doc_status,
-      review_status:  doc.review_status,
-      quarter:        doc.quarter,
-      year:           doc.year,
-    });
-
     if (doc.review_status !== "Pending" && doc.doc_status !== "Rejected") {
-      console.warn(`⛔ [deleteDocument] Blocked — review_status: "${doc.review_status}" | doc_status: "${doc.doc_status}"`);
       throw new AppError(
         `Cannot delete this document because the submission is ${doc.review_status}. Documents can only be deleted when the submission is pending review or when specifically rejected by an admin.`,
         400,
       );
     }
-
-    console.log(`✅ [deleteDocument] Status check passed — proceeding with soft delete`);
 
     await pool.query(
       `UPDATE submission_documents 
@@ -1293,18 +1221,13 @@ const newSubmissionId = (updated[0] as { id: string }).id;
       [user.id, docId],
     );
 
-    console.log(`✅ [deleteDocument] Soft delete complete for docId: ${docId}`);
-
     if (doc.evidence_public_id) {
-      console.log(`☁️ [deleteDocument] Queuing Cloudinary cleanup for: ${doc.evidence_public_id}`);
       deleteFromCloudinary(doc.evidence_public_id).catch((err: Error) =>
         console.error("[deleteDocument] Cloudinary cleanup failed:", err),
       );
     }
 
     const quarterDisplayText = doc.quarter === 0 ? "Annual" : `Q${doc.quarter}`;
-    console.log(`🎉 [deleteDocument] Done — "${doc.file_name}" removed from ${quarterDisplayText} ${doc.year}`);
-
     res.status(200).json({
       success: true,
       message: `Document "${doc.file_name}" has been removed from your ${quarterDisplayText} ${doc.year} submission.`,

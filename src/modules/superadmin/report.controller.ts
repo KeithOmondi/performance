@@ -5,7 +5,7 @@ import { AppError } from "../../utils/AppError";
 import PDFDocument from "pdfkit";
 import axios from "axios";
 
-/* ─── SHARED SELECT (without assignedByName, without i.name) ───────────────── */
+/* ─── SHARED SELECT ───────────────────────────────────────────────── */
 const REPORT_SELECT = `
   SELECT
     sp.id                    AS "planId",
@@ -35,7 +35,6 @@ const REPORT_SELECT = `
       ELSE t.id
     END                      AS "assigneeId",
 
-    -- Display name for the assignee (User or Team)
     CASE
       WHEN i.assignee_model = 'User' THEN u.name
       ELSE COALESCE(
@@ -103,23 +102,47 @@ function buildWhereClause(query: Request["query"]): {
     params.push(query.perspective as string);
     where += ` AND sp.perspective = $${params.length}`;
   }
+  
   if (query.status) {
     params.push(query.status as string);
     where += ` AND i.status = $${params.length}`;
   }
+  
   if (query.assigneeId) {
     params.push(query.assigneeId as string);
     where += ` AND i.assignee_id = $${params.length}`;
   }
+  
   if (query.quarter) {
     params.push(Number(query.quarter));
     where += ` AND i.active_quarter = $${params.length}`;
   }
+  
   if (query.year) {
     params.push(Number(query.year));
     where += ` AND EXISTS (
       SELECT 1 FROM submissions s2
       WHERE s2.indicator_id = i.id AND s2.year = $${params.length}
+    )`;
+  }
+
+  // Filter for indicators that have at least one submission
+  if (query.hasSubmission === 'true') {
+    where += ` AND EXISTS (
+      SELECT 1 FROM submissions s
+      WHERE s.indicator_id = i.id
+    )`;
+  }
+
+  // Filter for indicators that only have submissions with specific statuses
+  if (query.submissionStatus) {
+    const statuses = (query.submissionStatus as string).split(',');
+    const statusPlaceholders = statuses.map((_, idx) => `$${params.length + idx + 1}`).join(', ');
+    params.push(...statuses);
+    where += ` AND EXISTS (
+      SELECT 1 FROM submissions s
+      WHERE s.indicator_id = i.id
+      AND s.review_status = ANY(ARRAY[${statusPlaceholders}]::review_status[])
     )`;
   }
 
@@ -369,7 +392,20 @@ export const getReportSummary = asyncHandler(
             AND i.status NOT IN ('Completed', 'Awaiting Admin Approval', 'Awaiting Super Admin')
             AND i.assignee_id IS NOT NULL
         )::int                                                              AS "overdue",
-        ROUND(AVG(i.progress))::int                                         AS "avgProgress"
+        ROUND(AVG(i.progress))::int                                         AS "avgProgress",
+        COUNT(DISTINCT i.id) FILTER (
+          WHERE EXISTS (
+            SELECT 1 FROM submissions s
+            WHERE s.indicator_id = i.id
+          )
+        )::int                                                              AS "hasSubmissions",
+        COUNT(DISTINCT i.id) FILTER (
+          WHERE EXISTS (
+            SELECT 1 FROM submissions s
+            WHERE s.indicator_id = i.id
+            AND s.review_status IN ('Verified', 'Accepted', 'Partially Approved')
+          )
+        )::int                                                              AS "submittedComplete"
       FROM strategic_plans sp
       JOIN strategic_objectives so ON so.plan_id      = sp.id
       JOIN strategic_activities sa  ON sa.objective_id = so.id
@@ -385,8 +421,6 @@ export const getReportSummary = asyncHandler(
 
 /* ─── 4. GET TRACKER PDF ──────────────────────────────────────────────────── */
 
-// URL where the office logo is hosted — adjust to wherever it actually lives
-// (e.g. your client's deployed assets, a CDN, or Cloudinary).
 const LOGO_URL = "https://res.cloudinary.com/do0yflasl/image/upload/v1781759596/JOB_LOGO_ubls4m.jpg";
 
 async function fetchLogoBuffer(url: string): Promise<Buffer | null> {
@@ -426,7 +460,6 @@ export const getTrackerPdf = asyncHandler(
     );
     doc.pipe(res);
 
-    /* ── Header: logo + office name + report title ── */
     const PAGE_WIDTH = doc.page.width;
     const LOGO_SIZE   = 60;
 
@@ -473,7 +506,7 @@ export const getTrackerPdf = asyncHandler(
     const TABLE_X      = doc.page.margins.left;
     const HEADER_CELLS = [
       "INDICATORS", "Unit", "Explanatory Notes",
-      "Responsibility", "Evidence", "Status",  // Changed from "Eval. Person" to "Status"
+      "Responsibility", "Evidence", "Status",
     ];
 
     let cursorY = doc.y;
@@ -509,9 +542,6 @@ export const getTrackerPdf = asyncHandler(
       doc.save().rect(TABLE_X, cursorY, TABLE_WIDTH, 18).stroke("#d1d5db").restore();
       cursorY += 18;
 
-      // Track the last objective whose title was printed, so it's only
-      // shown once per group of activities/indicators — matching the
-      // frontend table component's behaviour.
       let lastObjectiveId: string | null = null;
 
       for (const obj of persp.objectives) {
@@ -539,13 +569,9 @@ export const getTrackerPdf = asyncHandler(
             const isFirstForObjective = obj.id !== lastObjectiveId;
             lastObjectiveId = obj.id;
 
-            // INDICATORS column: just the objective title, no numbering
-            // prefix and no progress line — shown only on the first row
-            // for this objective, blank for subsequent rows in the group.
             const indicatorLabel = obj.title?.trim() || act.description;
             const indicatorCell = isFirstForObjective ? indicatorLabel : "";
 
-            // Status: Only show "Complete" if completed, otherwise show nothing (or "In Progress")
             const statusDisplay = ind.status === "Completed" ? "Complete" : "";
 
             const cells = [
@@ -554,7 +580,7 @@ export const getTrackerPdf = asyncHandler(
               act.description + (ind.instructions ? `\n${ind.instructions}` : ""),
               ind.assigneeDisplayName || "Unassigned",
               evidenceLines.join("\n"),
-              statusDisplay,  // Now shows "Complete" or empty string
+              statusDisplay,
             ];
 
             const estLines = cells.reduce((max, text, i) => {
