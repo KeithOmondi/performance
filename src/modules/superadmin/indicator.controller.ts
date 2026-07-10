@@ -38,10 +38,11 @@ const INDICATOR_SELECT = `
     i.current_total_achieved AS "currentTotalAchieved",
     i.created_at             AS "createdAt",
     i.updated_at             AS "updatedAt",
+    i.is_multi_assignee      AS "isMultiAssignee",
 
     sp.perspective,
 
-    -- Resolved display name (works for both User and Team assignments)
+    -- Primary assignee display name
     CASE
       WHEN i.assignee_model = 'User' THEN u.name
       ELSE t.name
@@ -100,7 +101,23 @@ async function resolveRecipients(
   };
 }
 
+async function resolveMultipleRecipients(
+  assigneeIds: string[]
+): Promise<{ emails: string[]; displayNames: string[] }> {
+  if (assigneeIds.length === 0) {
+    return { emails: [], displayNames: [] };
+  }
 
+  const { rows } = await pool.query(
+    `SELECT id, name, email FROM users WHERE id = ANY($1) AND is_active = true`,
+    [assigneeIds]
+  );
+
+  return {
+    emails: rows.map((r: { email: string }) => r.email),
+    displayNames: rows.map((r: { name: string }) => r.name),
+  };
+}
 
 async function getCurrentQuarter(indicatorId: string): Promise<number> {
   const { rows } = await pool.query(
@@ -127,6 +144,7 @@ export const createIndicator = asyncHandler(
       deadline,
       instructions,
       activeQuarter,
+      additionalAssignees = [], // NEW: Array of additional user IDs for multi-assignee
     } = req.body;
 
     const adminId = (req as any).user?.id;
@@ -138,12 +156,11 @@ export const createIndicator = asyncHandler(
 
     // ✅ CHECK IF INDICATOR ALREADY EXISTS FOR THIS ACTIVITY
     const existingIndicator = await pool.query(
-      `SELECT id, assignee_id, status FROM indicators WHERE activity_id = $1 AND deleted_at IS NULL`,
+      `SELECT id, assignee_id, status, is_multi_assignee FROM indicators WHERE activity_id = $1 AND deleted_at IS NULL`,
       [activityId]
     );
 
     if (existingIndicator.rows.length > 0) {
-      // Indicator already exists - update it instead of creating new
       const existing = existingIndicator.rows[0];
       
       // Update the existing indicator
@@ -161,8 +178,9 @@ export const createIndicator = asyncHandler(
              assignee_id = COALESCE($10, assignee_id),
              assignee_model = COALESCE($11, assignee_model),
              assigned_by = COALESCE($12, assigned_by),
+             is_multi_assignee = COALESCE($13, is_multi_assignee),
              updated_at = NOW()
-         WHERE id = $13
+         WHERE id = $14
          RETURNING id`,
         [
           strategicPlanId,
@@ -177,9 +195,29 @@ export const createIndicator = asyncHandler(
           assignee && assignee !== "unassigned" ? assignee : null,
           assignmentType === "Team" ? "Team" : "User",
           adminId,
+          additionalAssignees.length > 0, // is_multi_assignee
           existing.id
         ]
       );
+
+      // Handle multi-assignee updates
+      if (additionalAssignees.length > 0) {
+        // Clear existing additional assignees
+        await pool.query(
+          "DELETE FROM indicator_assignees WHERE indicator_id = $1 AND is_primary = false",
+          [existing.id]
+        );
+        
+        // Add new additional assignees
+        for (const userId of additionalAssignees) {
+          await pool.query(
+            `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
+             VALUES ($1, $2, false)
+             ON CONFLICT (indicator_id, user_id) DO NOTHING`,
+            [existing.id, userId]
+          );
+        }
+      }
 
       // Fetch and return the updated indicator
       const { rows: updatedRows } = await pool.query(
@@ -187,15 +225,22 @@ export const createIndicator = asyncHandler(
         [existing.id]
       );
 
+      // Get all assignees for the response
+      const allAssignees = await getIndicatorAssignees(existing.id);
+
       res.status(200).json({
         success: true,
         message: "Indicator already existed and has been updated.",
-        data: updatedRows[0]
+        data: { ...updatedRows[0], allAssignees }
       });
       return;
     }
 
     // ✅ No existing indicator - create new one
+    const isMultiAssignee = additionalAssignees.length > 0;
+    const primaryAssignee = assignee && assignee !== "unassigned" ? assignee : null;
+    const assigneeModel = assignmentType === "Team" ? "Team" : "User";
+
     const { rows: newRows } = await pool.query(
       `INSERT INTO indicators (
          strategic_plan_id,
@@ -213,10 +258,11 @@ export const createIndicator = asyncHandler(
          assigned_by,
          status,
          progress,
-         current_total_achieved
+         current_total_achieved,
+         is_multi_assignee
        )
        VALUES (
-         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 0, 0
+         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 0, 0, $15
        )
        RETURNING id`,
       [
@@ -230,22 +276,50 @@ export const createIndicator = asyncHandler(
         deadline ? new Date(deadline) : null,
         instructions || "",
         activeQuarter || 1,
-        assignee && assignee !== "unassigned" ? assignee : null,
-        assignmentType === "Team" ? "Team" : "User",
+        primaryAssignee,
+        assigneeModel,
         adminId,
-        assignee && assignee !== "unassigned" ? "Pending" : "Pending",
+        primaryAssignee ? "Pending" : "Pending",
+        isMultiAssignee
       ]
     );
 
+    const indicatorId = newRows[0].id;
+
+    // Add additional assignees if multi-assignee
+    if (isMultiAssignee && primaryAssignee) {
+      // Add primary as first assignee
+      await pool.query(
+        `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
+         VALUES ($1, $2, true)`,
+        [indicatorId, primaryAssignee]
+      );
+
+      // Add additional assignees
+      for (const userId of additionalAssignees) {
+        if (userId !== primaryAssignee) {
+          await pool.query(
+            `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
+             VALUES ($1, $2, false)
+             ON CONFLICT (indicator_id, user_id) DO NOTHING`,
+            [indicatorId, userId]
+          );
+        }
+      }
+    }
+
     const { rows: createdRows } = await pool.query(
       `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
-      [newRows[0].id]
+      [indicatorId]
     );
+
+    // Get all assignees for the response
+    const allAssignees = await getIndicatorAssignees(indicatorId);
 
     res.status(201).json({
       success: true,
       message: "Indicator created successfully.",
-      data: createdRows[0],
+      data: { ...createdRows[0], allAssignees },
     });
   }
 );
@@ -293,6 +367,13 @@ export const getAllIndicators = asyncHandler(
       params
     );
 
+    // Enrich with all assignees for multi-assignee indicators
+    for (const row of rows) {
+      if (row.isMultiAssignee) {
+        row.allAssignees = await getIndicatorAssignees(row.id);
+      }
+    }
+
     res.status(200).json({ success: true, count: rows.length, data: rows });
   }
 );
@@ -310,6 +391,11 @@ export const getIndicatorById = asyncHandler(
     if (!rows[0]) throw new AppError("Indicator not found.", 404);
 
     const indicator = rows[0];
+
+    // Get all assignees if multi-assignee
+    if (indicator.isMultiAssignee) {
+      indicator.allAssignees = await getIndicatorAssignees(id);
+    }
 
     const { rows: submissions } = await pool.query(
       `WITH latest_submissions AS (
@@ -331,6 +417,7 @@ export const getIndicatorById = asyncHandler(
          s.review_status          AS "reviewStatus",
          s.admin_comment          AS "adminComment",
          s.resubmission_count     AS "resubmissionCount",
+         s.submitted_by           AS "submittedBy",
          COALESCE(
            json_agg(
              json_build_object(
@@ -354,7 +441,8 @@ export const getIndicatorById = asyncHandler(
        GROUP BY
          s.id, s.indicator_id, s.quarter, s.year, s.notes,
          s.admin_description_edit, s.submitted_at, s.achieved_value,
-         s.is_reviewed, s.review_status, s.admin_comment, s.resubmission_count
+         s.is_reviewed, s.review_status, s.admin_comment, s.resubmission_count,
+         s.submitted_by
        ORDER BY s.year ASC, s.quarter ASC`,
       [id]
     );
@@ -448,6 +536,11 @@ export const updateIndicator = asyncHandler(
         [id]
       );
 
+      // Get all assignees if multi-assignee
+      if (rows[0]?.isMultiAssignee) {
+        rows[0].allAssignees = await getIndicatorAssignees(id);
+      }
+
       res.status(200).json({ success: true, data: rows[0] });
     } catch (e) {
       await client.query("ROLLBACK");
@@ -473,7 +566,10 @@ export const deleteIndicator = asyncHandler(
       throw new AppError("Cannot delete completed task.", 400);
     }
 
+    // Clean up indicator_assignees
+    await pool.query("DELETE FROM indicator_assignees WHERE indicator_id = $1", [id]);
     await pool.query("DELETE FROM indicators WHERE id = $1", [id]);
+    
     res.status(200).json({ success: true, message: "Indicator removed." });
   }
 );
@@ -506,13 +602,12 @@ export const superAdminReviewProcess = asyncHandler(
       progressOverride, 
       year, 
       quarter,
-      isPartialApproval = false  // NEW: flag for partial approvals
+      isPartialApproval = false
     } = req.body;
     
     const adminId = (req as any).user.id;
     const isApprove = decision === "Approved";
 
-    // Validate approval requirements
     if (isApprove && (progressOverride === undefined || progressOverride === null)) {
       throw new AppError("Achieved value (progressOverride) is required when approving.", 400);
     }
@@ -526,6 +621,7 @@ export const superAdminReviewProcess = asyncHandler(
 
     const client = await pool.connect();
     let assigneeInfo: { emails: string[]; displayName: string } | null = null;
+    let multiAssigneeInfo: { emails: string[]; displayNames: string[] } | null = null;
 
     try {
       await client.query("BEGIN");
@@ -538,12 +634,10 @@ export const superAdminReviewProcess = asyncHandler(
 
       if (!indicator) throw new AppError("Indicator not found.", 404);
       
-      // Check if already completed
       if (indicator.status === "Completed") {
         throw new AppError("This indicator has already been completed.", 400);
       }
 
-      // Find the submission being reviewed
       const subRes = await client.query(
         `SELECT id, year, achieved_value, submitted_at, review_status
          FROM submissions
@@ -562,36 +656,39 @@ export const superAdminReviewProcess = asyncHandler(
 
       const submission = subRes.rows[0];
       
-      // Check if submission is already approved
       if (submission.review_status === "Accepted" && !isPartialApproval) {
         throw new AppError("This submission has already been approved.", 400);
       }
 
-      const { emails, displayName } = await resolveRecipients(
-        indicator.assignee_id,
-        indicator.assignee_model
-      );
-      assigneeInfo = { emails, displayName };
+      // Get assignee information
+      if (indicator.is_multi_assignee) {
+        const assignees = await getIndicatorAssignees(id);
+        const userIds = assignees.map((a: any) => a.userId);
+        multiAssigneeInfo = await resolveMultipleRecipients(userIds);
+      } else {
+        const { emails, displayName } = await resolveRecipients(
+          indicator.assignee_id,
+          indicator.assignee_model
+        );
+        assigneeInfo = { emails, displayName };
+      }
 
       // Calculate new totals
       const currentTotal = indicator.current_total_achieved || 0;
       let newTotal: number;
       let newProgress: number;
       let newStatus: string;
-      let nextQuarter = targetQuarter;
       let approvalMessage = "";
 
       if (isApprove) {
         const approvedAmount = Number(progressOverride);
         
         if (isPartialApproval) {
-          // PARTIAL APPROVAL: Add to existing total without marking as fully approved
           newTotal = currentTotal + approvedAmount;
           newProgress = indicator.target > 0 
             ? Math.min(Math.round((newTotal / indicator.target) * 100), 100)
             : 0;
           
-          // Keep status as "Awaiting Super Admin" if not yet complete
           if (newProgress >= 100) {
             newStatus = "Completed";
             approvalMessage = `Final approval completed. Total progress: 100%`;
@@ -600,7 +697,6 @@ export const superAdminReviewProcess = asyncHandler(
             approvalMessage = `Partially approved: +${approvedAmount}%. Current total: ${newProgress}%. Remaining: ${100 - newProgress}%`;
           }
           
-          // Update submission with partial approval note
           await client.query(
             `UPDATE submissions
              SET review_status = 'Partially Approved', 
@@ -612,9 +708,7 @@ export const superAdminReviewProcess = asyncHandler(
             [approvalMessage, approvedAmount, id, targetQuarter, targetYear]
           );
         } else {
-          // FULL APPROVAL: Replace or set final value
           if (currentTotal > 0 && currentTotal < indicator.target) {
-            // This is a final approval after partial approvals
             const remainingNeeded = indicator.target - currentTotal;
             if (approvedAmount !== remainingNeeded) {
               throw new AppError(
@@ -625,7 +719,6 @@ export const superAdminReviewProcess = asyncHandler(
             newTotal = indicator.target;
             newProgress = 100;
           } else {
-            // First-time approval
             newTotal = approvedAmount;
             newProgress = indicator.target > 0 
               ? Math.min(Math.round((newTotal / indicator.target) * 100), 100)
@@ -635,7 +728,6 @@ export const superAdminReviewProcess = asyncHandler(
           newStatus = "Completed";
           approvalMessage = `Fully approved: ${newProgress}% complete`;
           
-          // Update submission as fully accepted
           await client.query(
             `UPDATE submissions
              SET review_status = 'Accepted', 
@@ -648,7 +740,6 @@ export const superAdminReviewProcess = asyncHandler(
           );
         }
         
-        // Update indicator with new totals
         await client.query(
           `UPDATE indicators
            SET status = $1,
@@ -659,7 +750,6 @@ export const superAdminReviewProcess = asyncHandler(
           [newStatus, newProgress, newTotal, id]
         );
         
-        // Record in review history
         await client.query(
           `INSERT INTO review_history
              (indicator_id, action, reason, reviewer_role, reviewed_by, quarter, year, approved_amount, is_partial)
@@ -677,7 +767,6 @@ export const superAdminReviewProcess = asyncHandler(
         );
         
       } else {
-        // REJECTION
         newStatus = "Rejected by Super Admin";
         
         await client.query(
@@ -708,25 +797,76 @@ export const superAdminReviewProcess = asyncHandler(
 
       await client.query("COMMIT");
 
-      // Fetch updated indicator data
       const { rows: updatedRows } = await pool.query(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
         [id]
       );
 
       // Send email notifications
-      if (assigneeInfo && assigneeInfo.emails.length > 0) {
-        const activityRes = await pool.query(
-          `SELECT sa.description AS "activityDescription"
-           FROM strategic_activities sa
-           WHERE sa.id = $1`,
-          [indicator.activity_id]
-        );
-        const activityDescription = activityRes.rows[0]?.activityDescription || "Performance Indicator";
-        
-        const periodYear = targetYear;
-        const periodLabel = targetQuarter === 0 ? "Annual" : `Q${targetQuarter}`;
-        
+      const activityRes = await pool.query(
+        `SELECT sa.description AS "activityDescription"
+         FROM strategic_activities sa
+         WHERE sa.id = $1`,
+        [indicator.activity_id]
+      );
+      const activityDescription = activityRes.rows[0]?.activityDescription || "Performance Indicator";
+      
+      const periodYear = targetYear;
+      const periodLabel = targetQuarter === 0 ? "Annual" : `Q${targetQuarter}`;
+
+      // Send emails based on assignee type
+      if (indicator.is_multi_assignee && multiAssigneeInfo) {
+        const emailPromises = multiAssigneeInfo.emails.map((email, index) => {
+          const displayName = multiAssigneeInfo!.displayNames[index] || "Team Member";
+          let html: string;
+          
+          if (isApprove) {
+            if (isPartialApproval) {
+              html = partialApprovalTemplate(
+                displayName,
+                activityDescription,
+                indicator.reporting_cycle,
+                targetQuarter,
+                periodYear,
+                progressOverride,
+                newProgress,
+                indicator.target,
+                indicator.unit || "%"
+              );
+            } else {
+              html = superAdminApprovedTemplate(
+                displayName,
+                activityDescription,
+                indicator.reporting_cycle,
+                targetQuarter,
+                periodYear,
+                newProgress,
+                indicator.unit || "%"
+              );
+            }
+          } else {
+            html = superAdminRejectedTemplate(
+              displayName,
+              activityDescription,
+              indicator.reporting_cycle,
+              targetQuarter,
+              periodYear,
+              reason || "No reason provided"
+            );
+          }
+          
+          return sendMail({
+            to: email,
+            subject: isApprove 
+              ? (isPartialApproval ? "📈 Progress Partially Approved" : "✅ Performance Indicator Certified")
+              : "❌ Performance Indicator Returned by Super Admin",
+            html,
+          }).catch((err) =>
+            console.error(`[superAdminReview] Failed to send email to ${email}:`, err)
+          );
+        });
+        await Promise.all(emailPromises);
+      } else if (assigneeInfo && assigneeInfo.emails.length > 0) {
         const emailPromises = assigneeInfo.emails.map((email) => {
           let html: string;
           
@@ -775,7 +915,6 @@ export const superAdminReviewProcess = asyncHandler(
             console.error(`[superAdminReview] Failed to send email to ${email}:`, err)
           );
         });
-        
         await Promise.all(emailPromises);
       }
 
@@ -891,6 +1030,10 @@ export const reopenIndicator = asyncHandler(
         [id]
       );
 
+      if (rows[0]?.isMultiAssignee) {
+        rows[0].allAssignees = await getIndicatorAssignees(id);
+      }
+
       res.status(200).json({ success: true, data: rows[0] });
     } catch (e) {
       await client.query("ROLLBACK");
@@ -921,11 +1064,13 @@ export const getAllSubmissions = asyncHandler(
         s.review_status              AS "reviewStatus",
         s.admin_comment              AS "adminComment",
         s.resubmission_count         AS "resubmissionCount",
+        s.submitted_by               AS "submittedBy",
         sa.description               AS "indicatorTitle",
         CASE
           WHEN i.assignee_model = 'User' THEN u.name
           ELSE t.name
-        END                          AS "submittedBy",
+        END                          AS "primaryAssignee",
+        i.is_multi_assignee          AS "isMultiAssignee",
 
         COALESCE(
           json_agg(
@@ -953,10 +1098,10 @@ export const getAllSubmissions = asyncHandler(
       LEFT JOIN submission_documents sd ON sd.submission_id = s.id
 
       GROUP BY
-        i.id, i.status, i.assignee_model, i.active_quarter,
+        i.id, i.status, i.assignee_model, i.active_quarter, i.is_multi_assignee,
         s.id, s.year, s.submitted_at, s.achieved_value, s.notes,
         s.admin_description_edit, s.is_reviewed, s.review_status,
-        s.admin_comment, s.resubmission_count,
+        s.admin_comment, s.resubmission_count, s.submitted_by,
         sa.description, u.name, t.name
 
       ORDER BY s.submitted_at DESC
@@ -1017,15 +1162,14 @@ export const getSuperAdminStats = asyncHandler(
   }
 );
 
-
-
 /* ─── 12. UNASSIGN INDICATOR ──────────────────────────────────────────────── */
+
 export const unassignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params as { id: string };
 
     const { rows: existing } = await pool.query(
-      "SELECT id, assignee_id, assigned_by, status, progress, current_total_achieved FROM indicators WHERE id = $1",
+      "SELECT id, assignee_id, assigned_by, status, progress, current_total_achieved, is_multi_assignee FROM indicators WHERE id = $1",
       [id]
     );
     
@@ -1035,9 +1179,12 @@ export const unassignIndicator = asyncHandler(
       throw new AppError("Indicator is already unassigned.", 400);
     }
 
-    
+    // Clean up indicator_assignees
+    await pool.query(
+      "DELETE FROM indicator_assignees WHERE indicator_id = $1",
+      [id]
+    );
 
-    // Reset ALL assignment-related fields
     await pool.query(
       `UPDATE indicators
        SET assignee_id          = NULL,
@@ -1045,8 +1192,8 @@ export const unassignIndicator = asyncHandler(
            status               = 'Pending',
            progress             = 0,
            current_total_achieved = 0,
+           is_multi_assignee    = false,
            updated_at           = NOW()
-           -- assigned_by remains unchanged (keep historical record of who created it)
        WHERE id = $1`,
       [id]
     );
@@ -1145,14 +1292,15 @@ export const getAssignedIndicators = asyncHandler(
        ORDER BY i.created_at DESC`
     );
 
-    const enrichedRows = rows.map((row) => ({
+    const enrichedRows = await Promise.all(rows.map(async (row) => ({
       ...row,
       needsAction:
         row.status === "Awaiting Admin Approval" ||
         row.status === "Awaiting Super Admin",
       isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
       completionPercentage: row.progress || 0,
-    }));
+      allAssignees: row.isMultiAssignee ? await getIndicatorAssignees(row.id) : undefined,
+    })));
 
     res.status(200).json({
       success: true,
@@ -1213,7 +1361,7 @@ export const getReviewIndicators = asyncHandler(
        ORDER BY i.updated_at DESC`
     );
 
-    const enrichedRows = rows.map((row) => ({
+    const enrichedRows = await Promise.all(rows.map(async (row) => ({
       ...row,
       needsAction:
         row.pendingSubmissionCount > 0 ||
@@ -1221,7 +1369,8 @@ export const getReviewIndicators = asyncHandler(
         row.status === "Awaiting Super Admin",
       isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
       completionPercentage: row.progress || 0,
-    }));
+      allAssignees: row.isMultiAssignee ? await getIndicatorAssignees(row.id) : undefined,
+    })));
 
     res.status(200).json({
       success: true,
@@ -1336,8 +1485,7 @@ export const getSuperAdminApprovedIndicators = asyncHandler(
   }
 );
 
-
-/* ─── ASSIGN INDICATOR (for existing unassigned indicators) ─────────────────── */
+/* ─── 19. ASSIGN INDICATOR (for existing unassigned indicators) ──────────── */
 
 export const assignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
@@ -1345,7 +1493,6 @@ export const assignIndicator = asyncHandler(
     const { assigneeId, assigneeModel = "User" } = req.body;
     const adminId = (req as any).user.id;
 
-    // Validate inputs
     if (!assigneeId) {
       throw new AppError("Please provide an assignee ID.", 400);
     }
@@ -1359,9 +1506,8 @@ export const assignIndicator = asyncHandler(
     try {
       await client.query("BEGIN");
 
-      // Check if the indicator exists and get current status
       const indRes = await client.query(
-        "SELECT id, status, assignee_id FROM indicators WHERE id = $1 FOR UPDATE",
+        "SELECT id, status, assignee_id, is_multi_assignee FROM indicators WHERE id = $1 FOR UPDATE",
         [id]
       );
       
@@ -1372,27 +1518,31 @@ export const assignIndicator = asyncHandler(
       const wasUnassigned = indRes.rows[0].assignee_id === null;
       const type = assigneeModel === "Team" ? "Team" : "User";
 
-      // Update the indicator with the new assignee
       await client.query(
         `UPDATE indicators
          SET assignee_id = $1,
              assignee_model = $2,
              assigned_by = $3,
              status = 'Pending',
+             is_multi_assignee = false,
              updated_at = NOW()
          WHERE id = $4`,
         [assigneeId, type, adminId, id]
       );
 
+      // Clear any existing multi-assignee records
+      await client.query(
+        "DELETE FROM indicator_assignees WHERE indicator_id = $1",
+        [id]
+      );
+
       await client.query("COMMIT");
 
-      // Fetch the updated indicator with all relations
       const { rows: updated } = await pool.query(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
         [id]
       );
 
-      // Send email notification to the new assignee
       const { rows: activityRows } = await pool.query(
         `SELECT sa.description AS "activityDescription"
          FROM strategic_activities sa
@@ -1443,3 +1593,454 @@ export const assignIndicator = asyncHandler(
     }
   }
 );
+
+/* ─── 20. REASSIGN INDICATOR (replace primary assignee) ──────────────────── */
+
+export const reassignIndicator = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { newAssigneeId, newAssigneeModel = "User", reason } = req.body;
+    const adminId = (req as any).user.id;
+
+    if (!newAssigneeId) {
+      throw new AppError("Please provide a new assignee ID.", 400);
+    }
+
+    if (!isUUID(newAssigneeId)) {
+      throw new AppError("Invalid assignee ID format.", 400);
+    }
+
+    const client = await pool.connect();
+    
+    try {
+      await client.query("BEGIN");
+
+      // Get current indicator details - FIXED: Use string for id
+      const indicatorId = Array.isArray(id) ? id[0] : id;
+      const indRes = await client.query(
+        `SELECT i.id, i.assignee_id, i.assignee_model, i.status, i.is_multi_assignee, 
+                sa.description AS "activityDescription"
+         FROM indicators i
+         LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+         WHERE i.id = $1 FOR UPDATE`,
+        [indicatorId]
+      );
+      
+      if (!indRes.rows[0]) {
+        throw new AppError("Indicator not found.", 404);
+      }
+
+      const indicator = indRes.rows[0];
+      const oldAssigneeId = indicator.assignee_id;
+      const oldAssigneeModel = indicator.assignee_model;
+
+      if (!oldAssigneeId) {
+        throw new AppError("Cannot reassign an unassigned indicator. Please use assign endpoint.", 400);
+      }
+
+      // Get old assignee info for email
+      let oldAssigneeInfo = null;
+      if (!indicator.is_multi_assignee) {
+        oldAssigneeInfo = await resolveRecipients(oldAssigneeId, oldAssigneeModel);
+      }
+
+      // Update primary assignee
+      const type = newAssigneeModel === "Team" ? "Team" : "User";
+      await client.query(
+        `UPDATE indicators
+         SET assignee_id = $1,
+             assignee_model = $2,
+             assigned_by = $3,
+             updated_at = NOW()
+         WHERE id = $4`,
+        [newAssigneeId, type, adminId, indicatorId]
+      );
+
+      // If multi-assignee, update the assignees table
+      if (indicator.is_multi_assignee) {
+        // Remove old primary and add new primary
+        await client.query(
+          `DELETE FROM indicator_assignees WHERE indicator_id = $1 AND is_primary = true`,
+          [indicatorId]
+        );
+        
+        await client.query(
+          `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
+           VALUES ($1, $2, true)
+           ON CONFLICT (indicator_id, user_id) DO NOTHING`,
+          [indicatorId, newAssigneeId]
+        );
+      }
+
+      // Record the reassignment in review history
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Reassigned', $2, 'admin', $3)`,
+        [indicatorId, reason || `Reassigned from ${oldAssigneeId} to ${newAssigneeId}`, adminId]
+      );
+
+      await client.query("COMMIT");
+
+      // Fetch updated indicator
+      const { rows: updated } = await pool.query(
+        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+        [indicatorId]
+      );
+
+      if (updated[0]?.isMultiAssignee) {
+        updated[0].allAssignees = await getIndicatorAssignees(indicatorId);
+      }
+
+      // Send notifications
+      const activityDescription = indicator.activityDescription || "Performance Indicator";
+      
+      // Notify new assignee
+      const newAssigneeInfo = await resolveRecipients(newAssigneeId, type);
+      const emailPromises = newAssigneeInfo.emails.map((email) =>
+        sendMail({
+          to: email,
+          subject: "Performance Indicator Reassigned to You",
+          html: taskAssignedTemplate(
+            newAssigneeInfo.displayName,
+            activityDescription,
+            updated[0]?.reportingCycle || "Quarterly",
+            updated[0]?.activeQuarter || 1,
+            new Date().getFullYear(),
+            updated[0]?.deadline ? new Date(updated[0].deadline).toDateString() : "Not specified",
+            updated[0]?.objectiveTitle,
+            updated[0]?.target,
+            updated[0]?.unit
+          ),
+        }).catch((e) =>
+          console.error(`[reassignIndicator] Failed to send email to ${email}:`, e)
+        )
+      );
+
+      // Notify old assignee if different
+      if (oldAssigneeInfo && oldAssigneeInfo.emails.length > 0) {
+        oldAssigneeInfo.emails.forEach((email) => {
+          emailPromises.push(
+            sendMail({
+              to: email,
+              subject: "Performance Indicator Reassigned Away",
+              html: `
+                <h2>Indicator Reassigned</h2>
+                <p>Hello ${oldAssigneeInfo.displayName},</p>
+                <p>The following indicator has been reassigned from you:</p>
+                <ul>
+                  <li><strong>Activity:</strong> ${activityDescription}</li>
+                  <li><strong>New Assignee:</strong> ${newAssigneeInfo.displayName}</li>
+                  ${reason ? `<li><strong>Reason:</strong> ${reason}</li>` : ''}
+                </ul>
+                <p>You are no longer responsible for this indicator.</p>
+              `,
+            }).catch((e) =>
+              console.error(`[reassignIndicator] Failed to send email to ${email}:`, e)
+            )
+          );
+        });
+      }
+
+      await Promise.all(emailPromises);
+
+      res.status(200).json({
+        success: true,
+        message: "Indicator reassigned successfully.",
+        data: updated[0],
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/* ─── 21. ADD USERS TO TASK (multi-assignee) ────────────────────────────── */
+
+export const addUsersToIndicator = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { userIds, role = "contributor" } = req.body;
+    const adminId = (req as any).user.id;
+
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      throw new AppError("Please provide an array of user IDs to add.", 400);
+    }
+
+    // Validate UUIDs
+    for (const userId of userIds) {
+      if (!isUUID(userId)) {
+        throw new AppError(`Invalid user ID format: ${userId}`, 400);
+      }
+    }
+
+    const client = await pool.connect();
+    
+    try {
+      await client.query("BEGIN");
+
+      const indicatorId = Array.isArray(id) ? id[0] : id;
+
+      // Check if indicator exists
+      const indRes = await client.query(
+        "SELECT id, assignee_id, is_multi_assignee FROM indicators WHERE id = $1 FOR UPDATE",
+        [indicatorId]
+      );
+      
+      if (!indRes.rows[0]) {
+        throw new AppError("Indicator not found.", 404);
+      }
+
+      const indicator = indRes.rows[0];
+
+      // If not already multi-assignee, convert it
+      if (!indicator.is_multi_assignee) {
+        // If there's an existing assignee, add them as primary
+        if (indicator.assignee_id) {
+          await client.query(
+            `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
+             VALUES ($1, $2, true)
+             ON CONFLICT (indicator_id, user_id) DO NOTHING`,
+            [indicatorId, indicator.assignee_id]
+          );
+        }
+        
+        // Mark as multi-assignee
+        await client.query(
+          `UPDATE indicators SET is_multi_assignee = true WHERE id = $1`,
+          [indicatorId]
+        );
+      }
+
+      // Add new users
+      let addedCount = 0;
+      for (const userId of userIds) {
+        // Skip if user is already primary assignee
+        if (indicator.assignee_id === userId) {
+          continue;
+        }
+
+        const result = await client.query(
+          `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
+           VALUES ($1, $2, false)
+           ON CONFLICT (indicator_id, user_id) DO NOTHING`,
+          [indicatorId, userId]
+        );
+        
+        // FIXED: Check rowCount with null coalescing
+        if ((result.rowCount ?? 0) > 0) {
+          addedCount++;
+        }
+      }
+
+      if (addedCount === 0) {
+        throw new AppError("No new users were added. They may already be assigned to this indicator.", 400);
+      }
+
+      // Record in review history
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Users Added', $2, 'admin', $3)`,
+        [indicatorId, `Added ${addedCount} user(s) to the task: ${userIds.join(', ')}`, adminId]
+      );
+
+      await client.query("COMMIT");
+
+      // Fetch updated indicator
+      const { rows: updated } = await pool.query(
+        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+        [indicatorId]
+      );
+
+      const allAssignees = await getIndicatorAssignees(indicatorId);
+      if (updated[0]) {
+        updated[0].allAssignees = allAssignees;
+      }
+
+      // Get user details for notification
+      const userDetails = await pool.query(
+        `SELECT name, email FROM users WHERE id = ANY($1)`,
+        [userIds]
+      );
+
+      // Get activity description for email
+      const activityRes = await pool.query(
+        `SELECT sa.description AS "activityDescription"
+         FROM strategic_activities sa
+         WHERE sa.id = (SELECT activity_id FROM indicators WHERE id = $1)`,
+        [indicatorId]
+      );
+      const activityDescription = activityRes.rows[0]?.activityDescription || "Performance Indicator";
+
+      // Send notifications to new users
+      const emailPromises = userDetails.rows.map((user: any) =>
+        sendMail({
+          to: user.email,
+          subject: "Added to Performance Indicator",
+          html: `
+            <h2>You've Been Added to a Task</h2>
+            <p>Hello ${user.name},</p>
+            <p>You have been added as a contributor to the following indicator:</p>
+            <ul>
+              <li><strong>Activity:</strong> ${activityDescription}</li>
+              <li><strong>Reporting Cycle:</strong> ${updated[0]?.reportingCycle || "Quarterly"}</li>
+              <li><strong>Target:</strong> ${updated[0]?.target || 100}${updated[0]?.unit || "%"}</li>
+              ${updated[0]?.deadline ? `<li><strong>Deadline:</strong> ${new Date(updated[0].deadline).toDateString()}</li>` : ''}
+            </ul>
+            <p>You can now view and contribute to this indicator.</p>
+          `,
+        }).catch((e) =>
+          console.error(`[addUsersToIndicator] Failed to send email to ${user.email}:`, e)
+        )
+      );
+
+      await Promise.all(emailPromises);
+
+      res.status(200).json({
+        success: true,
+        message: `${addedCount} user(s) added to the indicator successfully.`,
+        data: updated[0],
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/* ─── 22. REMOVE USERS FROM TASK ──────────────────────────────────────────── */
+
+export const removeUsersFromIndicator = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { userIds } = req.body;
+    const adminId = (req as any).user.id;
+
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      throw new AppError("Please provide an array of user IDs to remove.", 400);
+    }
+
+    const client = await pool.connect();
+    
+    try {
+      await client.query("BEGIN");
+
+      const indicatorId = Array.isArray(id) ? id[0] : id;
+
+      // Check if indicator exists
+      const indRes = await client.query(
+        "SELECT id, assignee_id, is_multi_assignee FROM indicators WHERE id = $1 FOR UPDATE",
+        [indicatorId]
+      );
+      
+      if (!indRes.rows[0]) {
+        throw new AppError("Indicator not found.", 404);
+      }
+
+      const indicator = indRes.rows[0];
+
+      if (!indicator.is_multi_assignee) {
+        throw new AppError("This indicator is not a multi-assignee task.", 400);
+      }
+
+      // Check if trying to remove primary assignee
+      let removedPrimary = false;
+      for (const userId of userIds) {
+        if (indicator.assignee_id === userId) {
+          removedPrimary = true;
+          break;
+        }
+      }
+
+      if (removedPrimary) {
+        throw new AppError(
+          "Cannot remove the primary assignee. Please reassign or unassign the indicator first.",
+          400
+        );
+      }
+
+      // Remove users
+      const result = await client.query(
+        `DELETE FROM indicator_assignees
+         WHERE indicator_id = $1 AND user_id = ANY($2) AND is_primary = false
+         RETURNING user_id`,
+        [indicatorId, userIds]
+      );
+
+      // FIXED: Check rowCount with null coalescing
+      if ((result.rowCount ?? 0) === 0) {
+        throw new AppError("No users were removed. They may not be assigned to this indicator.", 400);
+      }
+
+      // If no other assignees remain, convert back to single assignee
+      const remainingAssignees = await client.query(
+        `SELECT COUNT(*) FROM indicator_assignees WHERE indicator_id = $1`,
+        [indicatorId]
+      );
+
+      if (parseInt(remainingAssignees.rows[0].count) <= 1) {
+        // Only primary remains, mark as not multi-assignee
+        await client.query(
+          `UPDATE indicators SET is_multi_assignee = false WHERE id = $1`,
+          [indicatorId]
+        );
+      }
+
+      // Record in review history
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Users Removed', $2, 'admin', $3)`,
+        [indicatorId, `Removed user(s): ${userIds.join(', ')}`, adminId]
+      );
+
+      await client.query("COMMIT");
+
+      // Fetch updated indicator
+      const { rows: updated } = await pool.query(
+        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+        [indicatorId]
+      );
+
+      if (updated[0]?.isMultiAssignee) {
+        updated[0].allAssignees = await getIndicatorAssignees(indicatorId);
+      }
+
+      res.status(200).json({
+        success: true,
+        message: `${result.rowCount ?? 0} user(s) removed from the indicator successfully.`,
+        data: updated[0],
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+);
+
+/* ─── HELPER: GET INDICATOR ASSIGNEES ────────────────────────────────────── */
+
+async function getIndicatorAssignees(indicatorId: string): Promise<any[]> {
+  const { rows } = await pool.query(
+    `SELECT 
+       ia.user_id AS "userId",
+       ia.is_primary AS "isPrimary",
+       u.name,
+       u.email,
+       u.pj_number AS "pjNumber"
+     FROM indicator_assignees ia
+     JOIN users u ON ia.user_id = u.id
+     WHERE ia.indicator_id = $1
+     ORDER BY ia.is_primary DESC, u.name ASC`,
+    [indicatorId]
+  );
+  return rows;
+}

@@ -11,7 +11,7 @@ import {
   getRejectedByAdmin,
   reopenIndicator,
   unassignIndicator,
-  assignIndicator,  // ✅ ADDED - assign indicator
+  assignIndicator,
   deleteSubmission,
   getAssignedIndicators,
   getUnassignedIndicators,
@@ -19,6 +19,10 @@ import {
   getIndicatorCounts,
   getSuperAdminApprovedIndicators,
   getPartialApprovalsHistory,
+  // NEW: Import the new controllers
+  reassignIndicator,
+  addUsersToIndicator,
+  removeUsersFromIndicator,
 } from "./indicator.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
@@ -59,7 +63,13 @@ router.patch("/:id/review", superAdminReviewProcess);
 router.patch("/:id/reopen", reopenIndicator);
 
 // ─── Assignment Management ────────────────────────────────────────────────────
-router.patch("/:id/assign", assignIndicator);      // ✅ ADDED - assign an indicator
-router.delete("/:id/unassign", unassignIndicator); // unassign an indicator
+// Single assignee operations
+router.patch("/:id/assign", assignIndicator);        // Assign an unassigned indicator
+router.delete("/:id/unassign", unassignIndicator);   // Unassign an indicator
+
+// Multi-assignee operations (NEW)
+router.patch("/:id/reassign", reassignIndicator);    // Replace primary assignee
+router.post("/:id/add-users", addUsersToIndicator);  // Add users to task
+router.delete("/:id/remove-users", removeUsersFromIndicator); // Remove users from task
 
 export const IndicatorRoutes = router;
