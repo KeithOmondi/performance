@@ -202,28 +202,48 @@ async function uploadDocumentsWithRetry(
     description: string;
   }>
 > {
+  console.log(`📁 [uploadDocumentsWithRetry] Starting upload of ${files.length} files`);
+  
   let lastError: Error | null = null;
+
+  // Ensure descriptions is an array
+  let descriptionsArray: string[] = [];
+  if (descriptions) {
+    if (Array.isArray(descriptions)) {
+      descriptionsArray = descriptions;
+    } else if (typeof descriptions === 'string') {
+      descriptionsArray = [descriptions];
+    }
+  }
+  
+  // Pad descriptions array if needed
+  while (descriptionsArray.length < files.length) {
+    descriptionsArray.push('');
+  }
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
+      console.log(`📁 [uploadDocumentsWithRetry] Attempt ${attempt} of ${maxRetries}`);
+      
       const uploads = await uploadMultipleToCloudinary(files, "registry_evidence");
-      const descArr = Array.isArray(descriptions)
-        ? descriptions
-        : descriptions
-          ? [descriptions]
-          : [];
+      
+      console.log(`✅ [uploadDocumentsWithRetry] Uploaded ${uploads.length} files successfully`);
 
       return uploads.map((upload, i) => ({
         url: upload.secure_url,
         public_id: upload.public_id,
         file_type: resolveFileType(upload.resource_type, files[i].mimetype),
         file_name: files[i].originalname,
-        description: (descArr[i] ?? "").slice(0, MAX_DESCRIPTION_LENGTH),
+        description: (descriptionsArray[i] ?? "").slice(0, MAX_DESCRIPTION_LENGTH),
       }));
     } catch (error) {
       lastError = error as Error;
-      if (attempt < maxRetries)
-        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+      console.error(`❌ [uploadDocumentsWithRetry] Attempt ${attempt} failed:`, lastError.message);
+      if (attempt < maxRetries) {
+        const delay = 1000 * attempt;
+        console.log(`⏳ [uploadDocumentsWithRetry] Retrying in ${delay}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
     }
   }
 
@@ -318,6 +338,36 @@ const USER_INDICATOR_BASE_QUERY = `
   LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
 `;
 
+// ─── Helper to get submission with documents ──────────────────────────────────
+
+async function getSubmissionWithDocuments(
+  client: PoolClient,
+  submissionId: string,
+): Promise<any> {
+  const { rows } = await client.query(
+    `SELECT s.*, 
+            json_agg(
+              json_build_object(
+                'id', d.id,
+                'evidenceUrl', d.evidence_url,
+                'evidencePublicId', d.evidence_public_id,
+                'fileType', d.file_type,
+                'fileName', d.file_name,
+                'description', d.description,
+                'status', d.status,
+                'rejectionReason', d.rejection_reason,
+                'uploadedAt', d.uploaded_at
+              )
+            ) FILTER (WHERE d.id IS NOT NULL) AS documents
+     FROM submissions s
+     LEFT JOIN submission_documents d ON d.submission_id = s.id AND d.deleted_at IS NULL
+     WHERE s.id = $1
+     GROUP BY s.id`,
+    [submissionId],
+  );
+  return rows[0] || null;
+}
+
 // ─── Controller ───────────────────────────────────────────────────────────────
 
 interface IUserIndicatorController {
@@ -381,9 +431,7 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ SUBMIT PROGRESS - First-time submission
-   * - Allows submission even if indicator is 100% complete
-   * - Creates a brand new submission with status 'Pending'
+   * ✅ SUBMIT PROGRESS - First-time submission with improved logging and verification
    */
   submitProgress: asyncHandler(async (req: Request, res: Response) => {
     const { id } = req.params;
@@ -391,13 +439,28 @@ export const UserIndicatorController: IUserIndicatorController = {
     const files = (req.files ?? []) as Express.Multer.File[];
     const user = getAuthUser(req);
 
+    console.log(`📝 [submitProgress] START for indicator ${id}`, {
+      quarter,
+      year,
+      achievedValue,
+      notes: notes ? notes.substring(0, 50) : null,
+      filesCount: files.length,
+    });
+
     if (!quarter || !year) {
       throw new AppError("Both quarter and year are required for submission.", 400);
     }
 
     const validated = validateSubmissionInput(notes, achievedValue);
-    
-    if (files.length > 0) validateFiles(files);
+    console.log(`📝 [submitProgress] Validated input:`, {
+      notes: validated.notes ? validated.notes.substring(0, 50) : null,
+      achievedValue: validated.achievedValue,
+    });
+
+    if (files.length > 0) {
+      console.log(`📁 [submitProgress] Validating ${files.length} files`);
+      validateFiles(files);
+    }
 
     const quarterNum = parseInt(String(quarter), 10);
     const yearNum = parseInt(String(year), 10);
@@ -428,7 +491,11 @@ export const UserIndicatorController: IUserIndicatorController = {
       const requestId = idempotencyKey || generateIdempotencyKey();
       if (await checkIdempotency(client, requestId)) {
         await client.query("ROLLBACK");
-        res.status(200).json({ success: true, message: "This submission has already been processed.", idempotent: true });
+        res.status(200).json({ 
+          success: true, 
+          message: "This submission has already been processed.", 
+          idempotent: true 
+        });
         return;
       }
 
@@ -449,6 +516,8 @@ export const UserIndicatorController: IUserIndicatorController = {
          FOR UPDATE`,
         [id, quarterNum, yearNum],
       );
+
+      console.log(`📝 [submitProgress] Existing submissions:`, existingSubmissions.rows.length);
 
       if (existingSubmissions.rows.length > 0) {
         const existing = existingSubmissions.rows[0] as { review_status: string };
@@ -483,23 +552,36 @@ export const UserIndicatorController: IUserIndicatorController = {
       );
 
       const submissionId = (inserted[0] as { id: string }).id;
+      console.log(`✅ [submitProgress] Created submission ID: ${submissionId}`);
 
       // Upload documents with descriptions
       if (files.length > 0) {
-        const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
-        for (const doc of uploadedDocs) {
-          await client.query(
-            `INSERT INTO submission_documents
-               (submission_id, evidence_url, evidence_public_id,
-                file_type, file_name, description, status)
-             VALUES ($1, $2, $3, $4, $5, $6, 'Pending')`,
-            [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+        console.log(`📁 [submitProgress] Uploading ${files.length} files...`);
+        
+        try {
+          const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
+          console.log(`✅ [submitProgress] Uploaded ${uploadedDocs.length} documents`);
+
+          for (const doc of uploadedDocs) {
+            await client.query(
+              `INSERT INTO submission_documents
+                 (submission_id, evidence_url, evidence_public_id,
+                  file_type, file_name, description, status)
+               VALUES ($1, $2, $3, $4, $5, $6, 'Pending')`,
+              [submissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+            );
+          }
+          console.log(`✅ [submitProgress] Saved ${uploadedDocs.length} documents to DB`);
+        } catch (uploadError) {
+          console.error(`❌ [submitProgress] Upload failed:`, uploadError);
+          throw new AppError(
+            `Failed to upload documents: ${(uploadError as Error).message}`,
+            500
           );
         }
       }
 
-      // ✅ FIX: Don't change indicator status to "Awaiting Admin Approval" if already 100%
-      // Only update status if not already completed
+      // Update indicator status if not already completed
       if (indicator.status !== "Completed") {
         await client.query(
           `UPDATE indicators SET status = 'Awaiting Admin Approval', updated_at = NOW() WHERE id = $1`,
@@ -507,22 +589,46 @@ export const UserIndicatorController: IUserIndicatorController = {
         );
       }
 
+      // Verify the submission was saved correctly
+      const verifyResult = await client.query(
+        `SELECT id, quarter, year, review_status FROM submissions WHERE id = $1`,
+        [submissionId],
+      );
+      console.log(`✅ [submitProgress] Verification:`, verifyResult.rows[0]);
+
+      // Verify documents were saved
+      const docVerify = await client.query(
+        `SELECT COUNT(*) FROM submission_documents WHERE submission_id = $1 AND deleted_at IS NULL`,
+        [submissionId],
+      );
+      console.log(`✅ [submitProgress] Documents in DB:`, docVerify.rows[0].count);
+
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
 
-      console.log(`✅ [submitProgress] Submission for ${quarterDisplay(quarterNum, yearNum)}`);
+      console.log(`✅ [submitProgress] COMPLETE for ${quarterDisplay(quarterNum, yearNum)}`);
 
+      // Send alerts
       UserIndicatorController._sendAlerts(
         user, indicator, quarterNum, yearNum,
         validated.achievedValue, "submitted",
       ).catch((err: Error) => console.error("[submitProgress] Mail Error:", err));
 
+      // Get full submission data for response
+      const fullSubmission = await getSubmissionWithDocuments(client, submissionId);
+
       res.status(201).json({
         success: true,
         message: `Your submission for ${quarterDisplay(quarterNum, yearNum)} has been received and is pending admin review.`,
-        data: { submissionId, quarter: quarterNum, year: yearNum },
+        data: { 
+          submissionId, 
+          quarter: quarterNum, 
+          year: yearNum,
+          submission: fullSubmission
+        },
       });
     } catch (error) {
+      console.error(`❌ [submitProgress] ERROR:`, error);
       await client.query("ROLLBACK");
       throw error;
     } finally {
@@ -531,13 +637,20 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ RESUBMIT PROGRESS - For rejected submissions
+   * ✅ RESUBMIT PROGRESS - For rejected submissions with improved logging
    */
   resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
     const { id: indicatorId } = req.params;
     const { notes, achievedValue, descriptions, idempotencyKey, quarter, year } = req.body;
     const files = (req.files ?? []) as Express.Multer.File[];
     const user = getAuthUser(req);
+
+    console.log(`📝 [resubmitProgress] START for indicator ${indicatorId}`, {
+      quarter,
+      year,
+      achievedValue,
+      filesCount: files.length,
+    });
 
     if (!quarter || !year) {
       throw new AppError("Quarter and year are required for resubmission.", 400);
@@ -558,7 +671,11 @@ export const UserIndicatorController: IUserIndicatorController = {
       const requestId = idempotencyKey || generateIdempotencyKey();
       if (await checkIdempotency(client, requestId)) {
         await client.query("ROLLBACK");
-        res.status(200).json({ success: true, message: "This resubmission has already been processed.", idempotent: true });
+        res.status(200).json({ 
+          success: true, 
+          message: "This resubmission has already been processed.", 
+          idempotent: true 
+        });
         return;
       }
 
@@ -607,21 +724,33 @@ export const UserIndicatorController: IUserIndicatorController = {
       );
 
       const newSubmissionId = (updated[0] as { id: string }).id;
+      console.log(`✅ [resubmitProgress] Updated submission ID: ${newSubmissionId}`);
 
       if (files.length > 0) {
-        const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
-        for (const doc of uploadedDocs) {
-          await client.query(
-            `INSERT INTO submission_documents
-               (submission_id, evidence_url, evidence_public_id,
-                file_type, file_name, description, status)
-             VALUES ($1, $2, $3, $4, $5, $6, 'Pending')`,
-            [newSubmissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+        console.log(`📁 [resubmitProgress] Uploading ${files.length} files...`);
+        
+        try {
+          const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
+          console.log(`✅ [resubmitProgress] Uploaded ${uploadedDocs.length} documents`);
+
+          for (const doc of uploadedDocs) {
+            await client.query(
+              `INSERT INTO submission_documents
+                 (submission_id, evidence_url, evidence_public_id,
+                  file_type, file_name, description, status)
+               VALUES ($1, $2, $3, $4, $5, $6, 'Pending')`,
+              [newSubmissionId, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+            );
+          }
+        } catch (uploadError) {
+          console.error(`❌ [resubmitProgress] Upload failed:`, uploadError);
+          throw new AppError(
+            `Failed to upload documents: ${(uploadError as Error).message}`,
+            500
           );
         }
       }
 
-      // ✅ FIX: Don't change indicator status if already 100%
       if (indicator.status !== "Completed") {
         await client.query(
           `UPDATE indicators SET status = 'Awaiting Admin Approval', updated_at = NOW() WHERE id = $1`,
@@ -632,18 +761,26 @@ export const UserIndicatorController: IUserIndicatorController = {
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
 
-      console.log(`✅ [resubmitProgress] Resubmission for rejected ${quarterDisplay(quarterNum, yearNum)}`);
+      console.log(`✅ [resubmitProgress] COMPLETE for ${quarterDisplay(quarterNum, yearNum)}`);
 
       UserIndicatorController._sendAlerts(
         user, indicator, quarterNum, yearNum, validated.achievedValue, "resubmitted",
       ).catch((err: Error) => console.error("[resubmitProgress] Mail Error:", err));
 
+      // Get full submission data for response
+      const fullSubmission = await getSubmissionWithDocuments(client, newSubmissionId);
+
       res.status(200).json({
         success: true,
         message: `Your resubmission for ${quarterDisplay(quarterNum, yearNum)} has been sent for review.`,
-        data: { submissionId: newSubmissionId, resubmissionCount: newResubmissionCount },
+        data: { 
+          submissionId: newSubmissionId, 
+          resubmissionCount: newResubmissionCount,
+          submission: fullSubmission
+        },
       });
     } catch (error) {
+      console.error(`❌ [resubmitProgress] ERROR:`, error);
       await client.query("ROLLBACK");
       throw error;
     } finally {
@@ -652,14 +789,18 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ ADD DOCUMENTS - For pending submissions
-   * - Allows adding documents even if indicator is 100% complete
+   * ✅ ADD DOCUMENTS - For pending submissions with improved logging
    */
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const { id } = req.params;
     const { quarter, descriptions, idempotencyKey } = req.body;
     const files = (req.files ?? []) as Express.Multer.File[];
+
+    console.log(`📝 [addDocuments] START for indicator ${id}`, {
+      quarter,
+      filesCount: files.length,
+    });
 
     if (!files.length) throw new AppError("Please select at least one file to upload.", 400);
     validateFiles(files);
@@ -673,7 +814,11 @@ export const UserIndicatorController: IUserIndicatorController = {
       const requestId = idempotencyKey || generateIdempotencyKey();
       if (await checkIdempotency(client, requestId)) {
         await client.query("ROLLBACK");
-        res.status(200).json({ success: true, message: "This request was already processed.", idempotent: true });
+        res.status(200).json({ 
+          success: true, 
+          message: "This request was already processed.", 
+          idempotent: true 
+        });
         return;
       }
 
@@ -704,29 +849,55 @@ export const UserIndicatorController: IUserIndicatorController = {
       }
 
       const submission = pendingSubmission.rows[0] as { id: string; review_status: string };
+      console.log(`📁 [addDocuments] Found pending submission: ${submission.id}`);
 
-      const newDocs = await uploadDocumentsWithRetry(files, descriptions || []);
-      for (const doc of newDocs) {
-        await client.query(
-          `INSERT INTO submission_documents
-             (submission_id, evidence_url, evidence_public_id,
-              file_type, file_name, description, status)
-           VALUES ($1, $2, $3, $4, $5, $6, 'Pending')`,
-          [submission.id, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+      try {
+        const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
+        console.log(`✅ [addDocuments] Uploaded ${uploadedDocs.length} documents`);
+
+        for (const doc of uploadedDocs) {
+          await client.query(
+            `INSERT INTO submission_documents
+               (submission_id, evidence_url, evidence_public_id,
+                file_type, file_name, description, status)
+             VALUES ($1, $2, $3, $4, $5, $6, 'Pending')`,
+            [submission.id, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+          );
+        }
+      } catch (uploadError) {
+        console.error(`❌ [addDocuments] Upload failed:`, uploadError);
+        throw new AppError(
+          `Failed to upload documents: ${(uploadError as Error).message}`,
+          500
         );
       }
+
+      // Verify documents were saved
+      const docVerify = await client.query(
+        `SELECT COUNT(*) FROM submission_documents WHERE submission_id = $1 AND deleted_at IS NULL`,
+        [submission.id],
+      );
+      console.log(`✅ [addDocuments] Documents in DB:`, docVerify.rows[0].count);
 
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
 
       console.log(`✅ [addDocuments] Added ${files.length} document(s) to pending submission`);
 
+      // Get full submission data for response
+      const fullSubmission = await getSubmissionWithDocuments(client, submission.id);
+
       res.status(200).json({
         success: true,
         message: `${files.length} document(s) successfully added to your pending submission.`,
-        data: { submissionId: submission.id, documentsAdded: files.length },
+        data: { 
+          submissionId: submission.id, 
+          documentsAdded: files.length,
+          submission: fullSubmission
+        },
       });
     } catch (error) {
+      console.error(`❌ [addDocuments] ERROR:`, error);
       await client.query("ROLLBACK");
       throw error;
     } finally {
@@ -735,11 +906,13 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ UPDATE SUBMISSION - Smart router
+   * ✅ UPDATE SUBMISSION - Smart router with improved handling
    */
   updateSubmission: asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
     const { quarter, year } = req.body;
+    
+    console.log(`📝 [updateSubmission] START for indicator ${id}`, { quarter, year });
     
     const quarterNum = quarterToInt(quarter);
     const yearNum = parseInt(String(year), 10);
@@ -752,18 +925,22 @@ export const UserIndicatorController: IUserIndicatorController = {
     );
     
     if (submissionCheck.rows.length === 0) {
+      console.log(`📝 [updateSubmission] No submission found, routing to submitProgress`);
       await UserIndicatorController.submitProgress(req, res, next);
       return;
     }
     
     const status = submissionCheck.rows[0].review_status;
+    console.log(`📝 [updateSubmission] Found submission with status: ${status}`);
     
     if (status === "Rejected") {
+      console.log(`📝 [updateSubmission] Routing to resubmitProgress`);
       await UserIndicatorController.resubmitProgress(req, res, next);
       return;
     }
     
     if (status === "Pending") {
+      console.log(`📝 [updateSubmission] Routing to addDocuments`);
       await UserIndicatorController.addDocuments(req, res, next);
       return;
     }
@@ -920,6 +1097,8 @@ export const UserIndicatorController: IUserIndicatorController = {
     const { docId } = req.params;
     const { description, idempotencyKey } = req.body;
 
+    console.log(`📝 [updateDocumentDescription] START for doc ${docId}`);
+
     if (description === undefined) {
       throw new AppError("Please provide a description for the document.", 400);
     }
@@ -1001,6 +1180,8 @@ export const UserIndicatorController: IUserIndicatorController = {
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
 
+      console.log(`✅ [updateDocumentDescription] Updated document ${docId}`);
+
       res.status(200).json({
         success: true,
         message: `Description for "${document.file_name}" has been updated successfully.`,
@@ -1010,6 +1191,7 @@ export const UserIndicatorController: IUserIndicatorController = {
         },
       });
     } catch (error) {
+      console.error(`❌ [updateDocumentDescription] ERROR:`, error);
       await client.query("ROLLBACK");
       throw error;
     } finally {
@@ -1080,6 +1262,8 @@ export const UserIndicatorController: IUserIndicatorController = {
     const user = getAuthUser(req);
     const { submissionId } = req.params;
     const { documents, idempotencyKey } = req.body;
+
+    console.log(`📝 [updateDocumentDescriptions] START for submission ${submissionId}`);
 
     if (!documents || !Array.isArray(documents) || documents.length === 0) {
       throw new AppError("Documents array is required with at least one document.", 400);
@@ -1158,12 +1342,22 @@ export const UserIndicatorController: IUserIndicatorController = {
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
 
+      console.log(`✅ [updateDocumentDescriptions] Updated ${updatedDocuments.length} documents`);
+
+      // Get full submission data for response
+      const fullSubmission = await getSubmissionWithDocuments(client, submission.id);
+
       res.status(200).json({
         success: true,
         message: `${updatedDocuments.length} document(s) updated successfully.`,
-        data: { submissionId: submission.id, updatedDocuments },
+        data: { 
+          submissionId: submission.id, 
+          updatedDocuments,
+          submission: fullSubmission
+        },
       });
     } catch (error) {
+      console.error(`❌ [updateDocumentDescriptions] ERROR:`, error);
       await client.query("ROLLBACK");
       throw error;
     } finally {
@@ -1174,6 +1368,8 @@ export const UserIndicatorController: IUserIndicatorController = {
   deleteDocument: asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const user = getAuthUser(req);
     const { docId } = req.params;
+
+    console.log(`🗑️ [deleteDocument] START — docId: ${docId} | user: ${user.id}`);
 
     const teamIds = await getUserTeamIds(user.id);
 
