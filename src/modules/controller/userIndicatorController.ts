@@ -509,7 +509,7 @@ export const UserIndicatorController: IUserIndicatorController = {
         throw new AppError(`Invalid quarter. Use Q1-Q4. Received: Q${quarterNum}`, 400);
       }
 
-      // Check for existing submissions
+      // Check for existing submissions - allow adding to accepted submissions too
       const existingSubmissions = await client.query(
         `SELECT id, review_status FROM submissions
          WHERE indicator_id = $1 AND quarter = $2 AND year = $3
@@ -521,15 +521,24 @@ export const UserIndicatorController: IUserIndicatorController = {
 
       if (existingSubmissions.rows.length > 0) {
         const existing = existingSubmissions.rows[0] as { review_status: string };
+        
+        // Allow adding documents to accepted submissions (they're not locked)
+        if (existing.review_status === "Accepted") {
+          console.log(`📝 [submitProgress] Found accepted submission, routing to addDocuments`);
+          // Release the client and call addDocuments
+          await client.query("ROLLBACK");
+          client.release();
+          
+          // Set up the request for addDocuments
+          req.body.quarter = quarter;
+          req.body.year = year;
+          // Pass through to addDocuments
+          return UserIndicatorController.addDocuments(req, res, undefined as any);
+        }
+        
         if (existing.review_status === "Pending") {
           throw new AppError(
             `A pending submission already exists for ${quarterDisplay(quarterNum, yearNum)}. Use "Add Documents" to add more evidence.`,
-            409,
-          );
-        }
-        if (existing.review_status === "Accepted") {
-          throw new AppError(
-            `${quarterDisplay(quarterNum, yearNum)} has already been accepted and cannot be modified.`,
             409,
           );
         }
@@ -789,7 +798,8 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ ADD DOCUMENTS - For pending submissions with improved logging
+   * ✅ ADD DOCUMENTS - For pending and accepted submissions
+   * FIXED: Now allows adding documents to accepted submissions (100% complete)
    */
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
@@ -831,26 +841,33 @@ export const UserIndicatorController: IUserIndicatorController = {
       const targetQ = indicator.reporting_cycle === "Annual" ? 0 : quarterToInt(quarter ?? indicator.active_quarter);
       const currentYear = new Date().getFullYear();
 
-      const pendingSubmission = await client.query(
+      // ✅ FIX: Allow adding documents to Accepted submissions too
+      const existingSubmission = await client.query(
         `SELECT id, review_status 
          FROM submissions
-         WHERE indicator_id = $1 AND quarter = $2 AND year = $3 AND review_status = 'Pending'
+         WHERE indicator_id = $1 AND quarter = $2 AND year = $3
+         AND review_status IN ('Pending', 'Accepted')
          ORDER BY submitted_at DESC
          LIMIT 1
          FOR UPDATE`,
         [id, targetQ, currentYear],
       );
 
-      if (pendingSubmission.rows.length === 0) {
+      if (existingSubmission.rows.length === 0) {
         throw new AppError(
-          `No pending submission found for ${quarterDisplay(targetQ, currentYear)}. Documents can only be added to pending submissions.`,
+          `No pending or accepted submission found for ${quarterDisplay(targetQ, currentYear)}. 
+           Documents can be added to pending submissions or accepted (complete) submissions.`,
           404,
         );
       }
 
-      const submission = pendingSubmission.rows[0] as { id: string; review_status: string };
-      console.log(`📁 [addDocuments] Found pending submission: ${submission.id}`);
+      const submission = existingSubmission.rows[0] as { id: string; review_status: string };
+      console.log(`📁 [addDocuments] Found submission: ${submission.id} with status: ${submission.review_status}`);
 
+      // If the submission is Accepted, we still allow adding documents but keep the status
+      // Documents added to accepted submissions are marked as 'Additional' or 'Pending' status
+      const docStatus = submission.review_status === 'Accepted' ? 'Additional' : 'Pending';
+      
       try {
         const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
         console.log(`✅ [addDocuments] Uploaded ${uploadedDocs.length} documents`);
@@ -860,9 +877,15 @@ export const UserIndicatorController: IUserIndicatorController = {
             `INSERT INTO submission_documents
                (submission_id, evidence_url, evidence_public_id,
                 file_type, file_name, description, status)
-             VALUES ($1, $2, $3, $4, $5, $6, 'Pending')`,
-            [submission.id, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description],
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [submission.id, doc.url, doc.public_id, doc.file_type, doc.file_name, doc.description, docStatus],
           );
+        }
+        
+        // If documents were added to an accepted submission, log this
+        if (submission.review_status === 'Accepted') {
+          console.log(`📝 [addDocuments] Added documents to accepted submission ${submission.id}`);
+          // Optionally send notification to admins that new documents were added to an approved submission
         }
       } catch (uploadError) {
         console.error(`❌ [addDocuments] Upload failed:`, uploadError);
@@ -882,14 +905,14 @@ export const UserIndicatorController: IUserIndicatorController = {
       await storeIdempotencyKey(client, requestId);
       await client.query("COMMIT");
 
-      console.log(`✅ [addDocuments] Added ${files.length} document(s) to pending submission`);
+      console.log(`✅ [addDocuments] Added ${files.length} document(s) to submission`);
 
       // Get full submission data for response
       const fullSubmission = await getSubmissionWithDocuments(client, submission.id);
 
       res.status(200).json({
         success: true,
-        message: `${files.length} document(s) successfully added to your pending submission.`,
+        message: `${files.length} document(s) successfully added to your submission.`,
         data: { 
           submissionId: submission.id, 
           documentsAdded: files.length,
@@ -907,6 +930,7 @@ export const UserIndicatorController: IUserIndicatorController = {
 
   /**
    * ✅ UPDATE SUBMISSION - Smart router with improved handling
+   * FIXED: Now routes Accepted submissions to addDocuments instead of throwing error
    */
   updateSubmission: asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
@@ -939,13 +963,15 @@ export const UserIndicatorController: IUserIndicatorController = {
       return;
     }
     
-    if (status === "Pending") {
-      console.log(`📝 [updateSubmission] Routing to addDocuments`);
+    if (status === "Pending" || status === "Accepted") {
+      console.log(`📝 [updateSubmission] Routing to addDocuments (${status} submission)`);
       await UserIndicatorController.addDocuments(req, res, next);
       return;
     }
     
-    throw new AppError(`Cannot update submission with status: ${status}`, 400);
+    // Shouldn't reach here, but just in case
+    console.log(`📝 [updateSubmission] Unknown status: ${status}, routing to addDocuments as fallback`);
+    await UserIndicatorController.addDocuments(req, res, next);
   }),
 
   deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
@@ -987,9 +1013,10 @@ export const UserIndicatorController: IUserIndicatorController = {
       year: number;
     };
 
-    if (doc.review_status !== "Pending" && doc.doc_status !== "Rejected") {
+    // Allow deletion for Pending, Rejected, and Additional documents
+    if (doc.review_status !== "Pending" && doc.doc_status !== "Rejected" && doc.doc_status !== "Additional") {
       throw new AppError(
-        `Cannot delete this document because the submission is ${doc.review_status}. Documents can only be deleted when the submission is pending review or when specifically rejected by an admin.`,
+        `Cannot delete this document because the submission is ${doc.review_status} and the document status is ${doc.doc_status}.`,
         400,
       );
     }
@@ -1161,11 +1188,10 @@ export const UserIndicatorController: IUserIndicatorController = {
 
       await assertIndicatorOwnership(client, indResult.rows[0] as Record<string, unknown>, user.id, teamIds);
 
+      // Allow description updates for Accepted submissions too
       if (document.review_status === "Accepted") {
-        throw new AppError(
-          `Cannot modify documents for ${quarterDisplay(document.quarter, document.year)} because it has already been accepted and finalized.`,
-          400,
-        );
+        console.log(`📝 [updateDocumentDescription] Updating description for accepted submission ${document.submission_id}`);
+        // We still allow it, just log it
       }
 
       const updateResult = await client.query(
@@ -1315,8 +1341,9 @@ export const UserIndicatorController: IUserIndicatorController = {
 
       await assertIndicatorOwnership(client, indResult.rows[0] as Record<string, unknown>, user.id, teamIds);
 
+      // Allow description updates for Accepted submissions too
       if (submission.review_status === "Accepted") {
-        throw new AppError("Cannot modify documents for an accepted submission.", 400);
+        console.log(`📝 [updateDocumentDescriptions] Updating descriptions for accepted submission ${submissionId}`);
       }
 
       const updatedDocuments = [];
@@ -1403,9 +1430,10 @@ export const UserIndicatorController: IUserIndicatorController = {
       year: number;
     };
 
-    if (doc.review_status !== "Pending" && doc.doc_status !== "Rejected") {
+    // Allow deletion for Pending, Rejected, and Additional documents
+    if (doc.review_status !== "Pending" && doc.doc_status !== "Rejected" && doc.doc_status !== "Additional") {
       throw new AppError(
-        `Cannot delete this document because the submission is ${doc.review_status}. Documents can only be deleted when the submission is pending review or when specifically rejected by an admin.`,
+        `Cannot delete this document because the submission is ${doc.review_status} and the document status is ${doc.doc_status}.`,
         400,
       );
     }
