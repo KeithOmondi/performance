@@ -91,13 +91,22 @@ function ownershipClause(
   const params = [...baseParams, userId];
   const userIdx = params.length;
 
-  let clause = `(${tableAlias}.assignee_id = $${userIdx} AND ${tableAlias}.assignee_model = 'User'`;
+  let clause = `(
+    (${tableAlias}.assignee_id = $${userIdx} AND ${tableAlias}.assignee_model = 'User')
+  `;
 
   if (teamIds.length > 0) {
     params.push(teamIds);
     const teamIdx = params.length;
     clause += ` OR (${tableAlias}.assignee_id = ANY($${teamIdx}::uuid[]) AND ${tableAlias}.assignee_model = 'Team')`;
   }
+
+  // ✅ Also allow access if user is listed in indicator_assignees (secondary assignee)
+  clause += ` OR EXISTS (
+    SELECT 1 FROM indicator_assignees ia
+    WHERE ia.indicator_id = ${tableAlias}.id
+      AND ia.user_id = $${userIdx}
+  )`;
 
   clause += ")";
   return { clause, params };
@@ -109,29 +118,34 @@ async function assertIndicatorOwnership(
   userId: string,
   teamIds: string[],
 ): Promise<void> {
-  const { assignee_id, assignee_model } = indicator;
+  const { assignee_id, assignee_model, id } = indicator;
 
+  // 1. Check primary assignee (User or Team)
   if (assignee_model === "User") {
-    if (assignee_id !== userId)
-      throw new AppError("You don't have permission to access this indicator. It is assigned to another user.", 403);
-    return;
-  }
-
-  if (assignee_model === "Team") {
+    if (assignee_id === userId) return;
+  } else if (assignee_model === "Team") {
     if (teamIds.includes(assignee_id as string)) return;
     const memberCheck = await client.query(
       `SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2 LIMIT 1`,
       [assignee_id, userId],
     );
-    if (memberCheck.rowCount === 0)
-      throw new AppError(
-        "You don't have permission to access this indicator. You are not a member of the assigned team.",
-        403,
-      );
-    return;
+    // ✅ Safe null check
+    if ((memberCheck.rowCount ?? 0) > 0) return;
   }
 
-  throw new AppError("Unable to verify your permission for this indicator. Please contact support.", 403);
+  // 2. If not primary, check if user is a secondary assignee
+  const assigneeCheck = await client.query(
+    `SELECT 1 FROM indicator_assignees WHERE indicator_id = $1 AND user_id = $2 LIMIT 1`,
+    [id, userId],
+  );
+  // ✅ Safe null check
+  if ((assigneeCheck.rowCount ?? 0) > 0) return;
+
+  // 3. No permission
+  throw new AppError(
+    "You don't have permission to access this indicator.",
+    403,
+  );
 }
 
 function validateSubmissionInput(
