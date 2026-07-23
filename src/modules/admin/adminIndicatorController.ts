@@ -338,7 +338,7 @@ export const getIndicatorByIdAdmin = asyncHandler(
 // ─────────────────────────────────────────────────────────────────────────────
 //  3. Approve Submission (Admin)
 // ─────────────────────────────────────────────────────────────────────────────
-
+// ✅ FIX: Recalculate indicator status instead of forcing "Awaiting Super Admin"
 export const approveSubmission = asyncHandler(
   async (req: Request, res: Response) => {
     const id           = req.params.id as string;
@@ -373,7 +373,8 @@ export const approveSubmission = asyncHandler(
         }
       }
 
-      const newStatus = "Awaiting Super Admin";
+      // ✅ FIX: Use recalcIndicatorStatus to get the correct overall status
+      const newStatus = await recalcIndicatorStatus(client, id);
       await client.query(
         `UPDATE indicators
          SET status                 = $1,
@@ -391,30 +392,33 @@ export const approveSubmission = asyncHandler(
 
       await client.query("COMMIT");
 
-      // Notify super admins (fire-and-forget)
-      const taskTitle = indicator.instructions || "Performance Indicator";
-      const year      = new Date().getFullYear();
-      const { rows: superAdmins } = await pool.query(
-        `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`,
-      );
-      superAdmins.forEach(({ email }: { email: string }) => {
-        sendMail({
-          to:      email,
-          subject: "Submission Ready for Final Approval",
-          html:    superAdminReviewNeededTemplate(
-            taskTitle,
-            indicator.name,
-            adminName,
-            indicator.reporting_cycle,
-            indicator.active_quarter,
-            year,
-          ),
-        }).catch(console.error);
-      });
+      // Notify super admins only if the whole indicator is now fully approved
+      if (newStatus === "Awaiting Super Admin") {
+        const taskTitle = indicator.instructions || "Performance Indicator";
+        const year      = new Date().getFullYear();
+        const { rows: superAdmins } = await pool.query(
+          `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`,
+        );
+        superAdmins.forEach(({ email }: { email: string }) => {
+          sendMail({
+            to:      email,
+            subject: "Submission Ready for Final Approval",
+            html:    superAdminReviewNeededTemplate(
+              taskTitle,
+              indicator.name,
+              adminName,
+              indicator.reporting_cycle,
+              indicator.active_quarter,
+              year,
+            ),
+          }).catch(console.error);
+        });
+      }
 
       res.status(200).json({
         success: true,
-        message: "Submission approved and forwarded to Super Admin.",
+        message: "Submission(s) approved.",
+        data: { indicatorStatus: newStatus },
       });
     } catch (error) {
       await client.query("ROLLBACK");
@@ -793,7 +797,7 @@ export const deleteSubmission = asyncHandler(
 
       await client.query("COMMIT");
 
-      // ✅ FIX: Cloudinary cleanup is now wired up (was commented out before)
+      // Cloudinary cleanup
       if (publicIds.length > 0) {
         publicIds.forEach((pid: string) =>
           deleteFromCloudinary(pid).catch((err: Error) =>
@@ -809,6 +813,81 @@ export const deleteSubmission = asyncHandler(
         success: true,
         message: "Submission and associated documents have been deleted.",
         data: { indicatorStatus: newStatus },
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  10. NEW: Admin soft‑deletes (marks as 'Deleted') a single document with a reason
+//     The document remains visible to the user with status 'Deleted' and reason.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const deleteDocumentAdmin = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { documentId, reason } = req.body;
+    const adminId = (req as any).user.id;
+
+    if (!documentId) throw new AppError("documentId is required.", 400);
+    if (!reason?.trim()) throw new AppError("A deletion reason is required.", 400);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Verify document exists and belongs to an indicator (with row lock on indicator)
+      const { rows: docRows } = await client.query(
+        `SELECT sd.id, sd.submission_id, s.indicator_id
+         FROM submission_documents sd
+         JOIN submissions s ON s.id = sd.submission_id
+         WHERE sd.id = $1
+           AND sd.deleted_at IS NULL
+         FOR UPDATE OF s`,
+        [documentId],
+      );
+
+      if (docRows.length === 0) {
+        throw new AppError("Document not found or already deleted.", 404);
+      }
+
+      const doc = docRows[0];
+      const indicatorId = doc.indicator_id;
+
+      // Lock the indicator
+      await fetchAndLockIndicator(client, indicatorId);
+
+      // Mark document as 'Deleted' with reason (no soft delete, just status change)
+      await client.query(
+        `UPDATE submission_documents
+         SET status = 'Deleted',
+             rejection_reason = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [reason.trim(), documentId],
+      );
+
+      // (Optional) Check if all documents in this submission are now Deleted?
+      // If yes, you might want to update submission status to 'Rejected' or similar.
+      // We'll leave the submission status unchanged; admin can manually reject if needed.
+
+      // Audit log
+      await client.query(
+        `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Document Deleted', $2, 'admin', $3)`,
+        [indicatorId, `Document ${documentId} deleted: ${reason.trim()}`, adminId],
+      );
+
+      await client.query("COMMIT");
+
+      res.status(200).json({
+        success: true,
+        message: "Document marked as deleted. The user will see the reason.",
+        data: { documentId, status: 'Deleted', reason: reason.trim() },
       });
     } catch (error) {
       await client.query("ROLLBACK");

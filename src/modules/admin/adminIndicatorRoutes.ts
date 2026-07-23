@@ -7,7 +7,8 @@ import {
   fetchResubmittedIndicators,
   getAdminApprovedIndicators,
   rejectDocument,
-  deleteSubmission,                // ← new import
+  deleteSubmission,
+  deleteDocumentAdmin,          // ← NEW import
 } from "../admin/adminIndicatorController";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 import { getCalendarEvents, getIndicatorCalendarEvents, getUpcomingDeadlines } from "../calendar/calendarcontroller";
@@ -35,10 +36,16 @@ router.patch("/:id/approve",           approveSubmission);
 router.patch("/:id/reject",            rejectSubmission);        // overall rejection
 router.patch("/:id/reject-document",   rejectDocument);          // single document rejection
 
-// ─── Delete submission ─────────────────────────────────────────────────────
+// ─── Delete submission (hard delete) ──────────────────────────────────────
 router.delete(
   "/:indicatorId/submissions/:submissionId",
   deleteSubmission
+);
+
+// ─── NEW: Admin soft‑delete a single document (with reason) ──────────────
+router.patch(
+  "/:indicatorId/delete-document",
+  deleteDocumentAdmin
 );
 
 export default router;
