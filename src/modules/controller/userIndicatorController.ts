@@ -129,7 +129,6 @@ async function assertIndicatorOwnership(
       `SELECT 1 FROM team_members WHERE team_id = $1 AND user_id = $2 LIMIT 1`,
       [assignee_id, userId],
     );
-    // ✅ Safe null check
     if ((memberCheck.rowCount ?? 0) > 0) return;
   }
 
@@ -138,7 +137,6 @@ async function assertIndicatorOwnership(
     `SELECT 1 FROM indicator_assignees WHERE indicator_id = $1 AND user_id = $2 LIMIT 1`,
     [id, userId],
   );
-  // ✅ Safe null check
   if ((assigneeCheck.rowCount ?? 0) > 0) return;
 
   // 3. No permission
@@ -660,7 +658,7 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ RESUBMIT PROGRESS - For rejected submissions with improved logging
+   * ✅ RESUBMIT PROGRESS - For rejected or correction-needed submissions
    */
   resubmitProgress: asyncHandler(async (req: Request, res: Response) => {
     const { id: indicatorId } = req.params;
@@ -708,27 +706,29 @@ export const UserIndicatorController: IUserIndicatorController = {
       const indicator = indRes.rows[0] as IndicatorWithActivity;
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
-      const rejectedSubmission = await client.query(
+      // ✅ Allow resubmission for both 'Rejected' and 'Correction Needed'
+      const previousSubmission = await client.query(
         `SELECT id, review_status, resubmission_count, admin_comment
          FROM submissions
-         WHERE indicator_id = $1 AND quarter = $2 AND year = $3 AND review_status = 'Rejected'
+         WHERE indicator_id = $1 AND quarter = $2 AND year = $3
+         AND review_status IN ('Rejected', 'Correction Needed')
          ORDER BY submitted_at DESC
          LIMIT 1
          FOR UPDATE`,
         [indicatorId, quarterNum, yearNum],
       );
 
-      if (rejectedSubmission.rows.length === 0) {
+      if (previousSubmission.rows.length === 0) {
         throw new AppError(
-          `No rejected submission found for ${quarterDisplay(quarterNum, yearNum)}. Only rejected submissions can be resubmitted.`,
+          `No rejected or correction-needed submission found for ${quarterDisplay(quarterNum, yearNum)}. Only those can be resubmitted.`,
           404,
         );
       }
 
-      const latestSubmission = rejectedSubmission.rows[0] as Submission;
+      const latestSubmission = previousSubmission.rows[0] as Submission;
       const newResubmissionCount = latestSubmission.resubmission_count + 1;
 
-      // Update the rejected row
+      // Update the existing row
       const { rows: updated } = await client.query(
         `UPDATE submissions
          SET achieved_value            = $1,
@@ -812,8 +812,8 @@ export const UserIndicatorController: IUserIndicatorController = {
   }),
 
   /**
-   * ✅ ADD DOCUMENTS - For pending and accepted submissions
-   * FIXED: Now allows adding documents to accepted submissions (100% complete)
+   * ✅ ADD DOCUMENTS - For any existing submission (Pending, Correction Needed, Rejected, Accepted)
+   * FIXED: Allows adding documents regardless of submission status.
    */
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
@@ -855,12 +855,11 @@ export const UserIndicatorController: IUserIndicatorController = {
       const targetQ = indicator.reporting_cycle === "Annual" ? 0 : quarterToInt(quarter ?? indicator.active_quarter);
       const currentYear = new Date().getFullYear();
 
-      // ✅ FIX: Allow adding documents to Accepted submissions too
+      // ✅ Find the latest submission for this indicator/quarter/year regardless of status
       const existingSubmission = await client.query(
         `SELECT id, review_status 
          FROM submissions
          WHERE indicator_id = $1 AND quarter = $2 AND year = $3
-         AND review_status IN ('Pending', 'Accepted')
          ORDER BY submitted_at DESC
          LIMIT 1
          FOR UPDATE`,
@@ -869,8 +868,7 @@ export const UserIndicatorController: IUserIndicatorController = {
 
       if (existingSubmission.rows.length === 0) {
         throw new AppError(
-          `No pending or accepted submission found for ${quarterDisplay(targetQ, currentYear)}. 
-           Documents can be added to pending submissions or accepted (complete) submissions.`,
+          `No submission found for ${quarterDisplay(targetQ, currentYear)}. Please submit first.`,
           404,
         );
       }
@@ -878,8 +876,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       const submission = existingSubmission.rows[0] as { id: string; review_status: string };
       console.log(`📁 [addDocuments] Found submission: ${submission.id} with status: ${submission.review_status}`);
 
-      // If the submission is Accepted, we still allow adding documents but keep the status
-      // Documents added to accepted submissions are marked as 'Additional' or 'Pending' status
+      // Set document status: 'Additional' if submission is already Accepted, else 'Pending'
       const docStatus = submission.review_status === 'Accepted' ? 'Additional' : 'Pending';
       
       try {
@@ -896,10 +893,8 @@ export const UserIndicatorController: IUserIndicatorController = {
           );
         }
         
-        // If documents were added to an accepted submission, log this
         if (submission.review_status === 'Accepted') {
           console.log(`📝 [addDocuments] Added documents to accepted submission ${submission.id}`);
-          // Optionally send notification to admins that new documents were added to an approved submission
         }
       } catch (uploadError) {
         console.error(`❌ [addDocuments] Upload failed:`, uploadError);
@@ -944,7 +939,7 @@ export const UserIndicatorController: IUserIndicatorController = {
 
   /**
    * ✅ UPDATE SUBMISSION - Smart router with improved handling
-   * FIXED: Now routes Accepted submissions to addDocuments instead of throwing error
+   * FIXED: Routes 'Correction Needed' to resubmitProgress
    */
   updateSubmission: asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
@@ -971,7 +966,7 @@ export const UserIndicatorController: IUserIndicatorController = {
     const status = submissionCheck.rows[0].review_status;
     console.log(`📝 [updateSubmission] Found submission with status: ${status}`);
     
-    if (status === "Rejected") {
+    if (status === "Rejected" || status === "Correction Needed") {
       console.log(`📝 [updateSubmission] Routing to resubmitProgress`);
       await UserIndicatorController.resubmitProgress(req, res, next);
       return;
@@ -983,7 +978,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       return;
     }
     
-    // Shouldn't reach here, but just in case
+    // Fallback: treat as addDocuments
     console.log(`📝 [updateSubmission] Unknown status: ${status}, routing to addDocuments as fallback`);
     await UserIndicatorController.addDocuments(req, res, next);
   }),
@@ -997,10 +992,17 @@ export const UserIndicatorController: IUserIndicatorController = {
     const teamIds = await getUserTeamIds(user.id);
     console.log(`👥 [deletePendingDocument] teamIds for user ${user.id}:`, teamIds);
 
-    const ownershipFilter = teamIds.length > 0
-      ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
-           OR i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')`
-      : `AND i.assignee_id = $2 AND i.assignee_model = 'User'`;
+    // ✅ Include secondary assignee check
+    const ownershipCondition = `
+      AND (
+        (i.assignee_id = $2 AND i.assignee_model = 'User')
+        OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
+        OR EXISTS (
+          SELECT 1 FROM indicator_assignees ia
+          WHERE ia.indicator_id = i.id AND ia.user_id = $2
+        )
+      )
+    `;
 
     const checkParams: unknown[] = teamIds.length > 0 ? [docId, user.id, teamIds] : [docId, user.id];
 
@@ -1010,7 +1012,7 @@ export const UserIndicatorController: IUserIndicatorController = {
        FROM submission_documents d
        JOIN submissions s ON d.submission_id = s.id
        JOIN indicators i ON s.indicator_id = i.id
-       WHERE d.id = $1 AND d.deleted_at IS NULL ${ownershipFilter}`,
+       WHERE d.id = $1 AND d.deleted_at IS NULL ${ownershipCondition}`,
       checkParams,
     );
 
@@ -1027,8 +1029,10 @@ export const UserIndicatorController: IUserIndicatorController = {
       year: number;
     };
 
-    // Allow deletion for Pending, Rejected, and Additional documents
-    if (doc.review_status !== "Pending" && doc.doc_status !== "Rejected" && doc.doc_status !== "Additional") {
+    // ✅ Allow deletion if submission is Pending or Correction Needed,
+    //    or if document status is Rejected or Additional.
+    if (doc.review_status !== "Pending" && doc.review_status !== "Correction Needed" &&
+        doc.doc_status !== "Rejected" && doc.doc_status !== "Additional") {
       throw new AppError(
         `Cannot delete this document because the submission is ${doc.review_status} and the document status is ${doc.doc_status}.`,
         400,
@@ -1205,7 +1209,6 @@ export const UserIndicatorController: IUserIndicatorController = {
       // Allow description updates for Accepted submissions too
       if (document.review_status === "Accepted") {
         console.log(`📝 [updateDocumentDescription] Updating description for accepted submission ${document.submission_id}`);
-        // We still allow it, just log it
       }
 
       const updateResult = await client.query(
@@ -1263,11 +1266,17 @@ export const UserIndicatorController: IUserIndicatorController = {
       isAuthorized = rows.length > 0;
     } else {
       const teamIds = await getUserTeamIds(user.id);
-      const ownershipFilter = teamIds.length > 0
-        ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
-             OR i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')`
-        : `AND i.assignee_id = $2 AND i.assignee_model = 'User'`;
-
+      // ✅ Include secondary assignee check
+      const ownershipFilter = `
+        AND (
+          (i.assignee_id = $2 AND i.assignee_model = 'User')
+          OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
+          OR EXISTS (
+            SELECT 1 FROM indicator_assignees ia
+            WHERE ia.indicator_id = i.id AND ia.user_id = $2
+          )
+        )
+      `;
       const checkParams = teamIds.length > 0 ? [url, user.id, teamIds] : [url, user.id];
 
       const { rows } = await pool.query(
@@ -1355,7 +1364,6 @@ export const UserIndicatorController: IUserIndicatorController = {
 
       await assertIndicatorOwnership(client, indResult.rows[0] as Record<string, unknown>, user.id, teamIds);
 
-      // Allow description updates for Accepted submissions too
       if (submission.review_status === "Accepted") {
         console.log(`📝 [updateDocumentDescriptions] Updating descriptions for accepted submission ${submissionId}`);
       }
@@ -1385,7 +1393,6 @@ export const UserIndicatorController: IUserIndicatorController = {
 
       console.log(`✅ [updateDocumentDescriptions] Updated ${updatedDocuments.length} documents`);
 
-      // Get full submission data for response
       const fullSubmission = await getSubmissionWithDocuments(client, submission.id);
 
       res.status(200).json({
@@ -1414,10 +1421,17 @@ export const UserIndicatorController: IUserIndicatorController = {
 
     const teamIds = await getUserTeamIds(user.id);
 
-    const ownershipFilter = teamIds.length > 0
-      ? `AND (i.assignee_id = $2 AND i.assignee_model = 'User'
-         OR i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')`
-      : `AND i.assignee_id = $2 AND i.assignee_model = 'User'`;
+    // ✅ Include secondary assignee check
+    const ownershipFilter = `
+      AND (
+        (i.assignee_id = $2 AND i.assignee_model = 'User')
+        OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
+        OR EXISTS (
+          SELECT 1 FROM indicator_assignees ia
+          WHERE ia.indicator_id = i.id AND ia.user_id = $2
+        )
+      )
+    `;
 
     const checkParams: unknown[] = teamIds.length > 0 ? [docId, user.id, teamIds] : [docId, user.id];
 
@@ -1444,8 +1458,10 @@ export const UserIndicatorController: IUserIndicatorController = {
       year: number;
     };
 
-    // Allow deletion for Pending, Rejected, and Additional documents
-    if (doc.review_status !== "Pending" && doc.doc_status !== "Rejected" && doc.doc_status !== "Additional") {
+    // ✅ Allow deletion if submission is Pending or Correction Needed,
+    //    or if document status is Rejected or Additional.
+    if (doc.review_status !== "Pending" && doc.review_status !== "Correction Needed" &&
+        doc.doc_status !== "Rejected" && doc.doc_status !== "Additional") {
       throw new AppError(
         `Cannot delete this document because the submission is ${doc.review_status} and the document status is ${doc.doc_status}.`,
         400,
