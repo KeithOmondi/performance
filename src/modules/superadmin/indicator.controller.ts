@@ -643,7 +643,8 @@ export const superAdminReviewProcess = asyncHandler(
          FROM submissions
          WHERE indicator_id = $1 AND quarter = $2 AND year = $3
          ORDER BY submitted_at DESC
-         LIMIT 1`,
+         LIMIT 1
+         FOR UPDATE`,
         [id, targetQuarter, targetYear]
       );
 
@@ -697,6 +698,7 @@ export const superAdminReviewProcess = asyncHandler(
             approvalMessage = `Partially approved: +${approvedAmount}%. Current total: ${newProgress}%. Remaining: ${100 - newProgress}%`;
           }
           
+          // scoped to the specific submission row (submission.id)
           await client.query(
             `UPDATE submissions
              SET review_status = 'Partially Approved', 
@@ -704,30 +706,22 @@ export const superAdminReviewProcess = asyncHandler(
                  admin_comment = $1,
                  approved_amount = $2,
                  reviewed_at = NOW()
-             WHERE indicator_id = $3 AND quarter = $4 AND year = $5`,
-            [approvalMessage, approvedAmount, id, targetQuarter, targetYear]
+             WHERE id = $3`,
+            [approvalMessage, approvedAmount, submission.id]
           );
         } else {
-          if (currentTotal > 0 && currentTotal < indicator.target) {
-            const remainingNeeded = indicator.target - currentTotal;
-            if (approvedAmount !== remainingNeeded) {
-              throw new AppError(
-                `You have ${currentTotal}% already approved. You need to approve ${remainingNeeded}% to reach 100%.`,
-                400
-              );
-            }
-            newTotal = indicator.target;
-            newProgress = 100;
-          } else {
-            newTotal = approvedAmount;
-            newProgress = indicator.target > 0 
-              ? Math.min(Math.round((newTotal / indicator.target) * 100), 100)
-              : 0;
-          }
-          
+          // OVERRIDE: a full/final approval always completes the indicator
+          // to its target (100%), regardless of progressOverride sent by the
+          // client and regardless of currentTotal. The old strict check
+          // (throwing unless approvedAmount exactly matched the remaining
+          // gap) has been removed.
+          newTotal = indicator.target;
+          newProgress = 100;
+
           newStatus = "Completed";
           approvalMessage = `Fully approved: ${newProgress}% complete`;
-          
+
+          // scoped to the specific submission row (submission.id)
           await client.query(
             `UPDATE submissions
              SET review_status = 'Accepted', 
@@ -735,8 +729,8 @@ export const superAdminReviewProcess = asyncHandler(
                  admin_comment = $1,
                  approved_amount = $2,
                  reviewed_at = NOW()
-             WHERE indicator_id = $3 AND quarter = $4 AND year = $5`,
-            [reason || approvalMessage, newTotal - currentTotal, id, targetQuarter, targetYear]
+             WHERE id = $3`,
+            [reason || approvalMessage, newTotal - currentTotal, submission.id]
           );
         }
         
@@ -769,14 +763,15 @@ export const superAdminReviewProcess = asyncHandler(
       } else {
         newStatus = "Rejected by Super Admin";
         
+        // scoped to the specific submission row (submission.id)
         await client.query(
           `UPDATE submissions
            SET review_status = 'Rejected', 
                is_reviewed = true, 
                admin_comment = $1,
                reviewed_at = NOW()
-           WHERE indicator_id = $2 AND quarter = $3 AND year = $4`,
-          [reason || "No specific reason provided", id, targetQuarter, targetYear]
+           WHERE id = $2`,
+          [reason || "No specific reason provided", submission.id]
         );
         
         await client.query(

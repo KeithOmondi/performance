@@ -102,12 +102,14 @@ function buildWhereClause(query: Request["query"]): {
     params.push(query.perspective as string);
     where += ` AND sp.perspective = $${params.length}`;
   }
-  
-  if (query.status) {
+
+  if (query.status === "Incomplete") {
+    where += ` AND i.status != 'Completed'`;
+  } else if (query.status) {
     params.push(query.status as string);
     where += ` AND i.status = $${params.length}`;
   }
-  
+
   if (query.assigneeId) {
     params.push(query.assigneeId as string);
     where += ` AND i.assignee_id = $${params.length}`;
@@ -126,7 +128,6 @@ function buildWhereClause(query: Request["query"]): {
     )`;
   }
 
-  // Filter for indicators that have at least one submission
   if (query.hasSubmission === 'true') {
     where += ` AND EXISTS (
       SELECT 1 FROM submissions s
@@ -134,7 +135,6 @@ function buildWhereClause(query: Request["query"]): {
     )`;
   }
 
-  // Filter for indicators that only have submissions with specific statuses
   if (query.submissionStatus) {
     const statuses = (query.submissionStatus as string).split(',');
     const statusPlaceholders = statuses.map((_, idx) => `$${params.length + idx + 1}`).join(', ');
@@ -275,25 +275,128 @@ function groupByPerspective(rows: IndicatorRow[]): GroupedPerspective[] {
   }));
 }
 
-/* ─── HELPER: draw a table row in pdfkit ─────────────────────────────────── */
-const COL_WIDTHS  = [160, 40, 150, 110, 200, 110];
-const ROW_PADDING = 6;
-const FONT_SIZE   = 7.5;
-const LINE_HEIGHT  = FONT_SIZE * 1.35;
+/* ─── HELPER: Format evidence for PDF (matches UI display) ── */
+function formatEvidenceForPdf(submissions: SubmissionRow[]): string {
+  if (!submissions || submissions.length === 0) {
+    return "";
+  }
 
+  const latestSubmission = submissions.reduce((latest, current) => {
+    const latestDate = new Date(latest.submittedAt);
+    const currentDate = new Date(current.submittedAt);
+    return currentDate > latestDate ? current : latest;
+  });
+
+  const documentsWithDescriptions = latestSubmission.documents?.filter(
+    (doc) => doc.description?.trim()
+  ) || [];
+
+  const hasNotes = latestSubmission.notes?.trim();
+  const hasDocuments = documentsWithDescriptions.length > 0;
+
+  if (!hasNotes && !hasDocuments) {
+    return "";
+  }
+
+  let evidenceText = "";
+  if (hasNotes) {
+    evidenceText += latestSubmission.notes;
+  }
+  if (hasDocuments) {
+    if (hasNotes) evidenceText += "\n\n";
+    documentsWithDescriptions.forEach((doc, index) => {
+      if (index > 0) evidenceText += "\n";
+      evidenceText += "❖ " + doc.description;
+    });
+  }
+
+  return evidenceText.trim();
+}
+
+/**
+ * Returns the raw evidence lines (without the ❖ prefix already baked in) so
+ * the caller can render the diamond marker and the text in different colors,
+ * matching the UI's gold-diamond / dark-text bullet style.
+ */
+function getEvidenceLines(submissions: SubmissionRow[]): { isBullet: boolean; text: string }[] {
+  if (!submissions || submissions.length === 0) return [];
+
+  const latestSubmission = submissions.reduce((latest, current) => {
+    const latestDate = new Date(latest.submittedAt);
+    const currentDate = new Date(current.submittedAt);
+    return currentDate > latestDate ? current : latest;
+  });
+
+  const documentsWithDescriptions = latestSubmission.documents?.filter(
+    (doc) => doc.description?.trim()
+  ) || [];
+
+  const lines: { isBullet: boolean; text: string }[] = [];
+
+  if (latestSubmission.notes?.trim()) {
+    lines.push({ isBullet: false, text: latestSubmission.notes.trim() });
+  }
+
+  documentsWithDescriptions.forEach((doc) => {
+    lines.push({ isBullet: true, text: doc.description!.trim() });
+  });
+
+  return lines;
+}
+
+/* ─── UI-matched color palette ──────────────────────────────────────────── */
+const UI_COLORS = {
+  darkGreen:      "#1d3331",
+  gold:           "#c2a336",
+  borderLight:    "#e2e8f0", // slate-200
+  headerText:     "#334155", // slate-700
+  bodyText:       "#1a2c2c",
+  mutedText:      "#64748b", // slate-500
+  perspectiveBg:  "#eef1f0", // ≈ dark green at 5% opacity over white
+  perspectiveText:"#1d3331",
+  completeBg:     "#d1fae5", // emerald-100
+  completeText:   "#047857", // emerald-700
+  completeBorder: "#a7f3d0", // emerald-200
+  pendingBg:      "#fef3c7", // amber-100
+  pendingText:    "#b45309", // amber-700
+  pendingBorder:  "#fde68a", // amber-200
+  rowAlt:         "#fcfcf7",
+};
+
+/* ─── HELPER: draw a table row in pdfkit with UI styling ── */
+const COL_WIDTHS = [140, 50, 150, 110, 200, 90];
+const ROW_PADDING = 6;
+const FONT_SIZE = 7.5;
+const LINE_HEIGHT = FONT_SIZE * 1.35;
+const EVIDENCE_COL_INDEX = 4;
+const STATUS_COL_INDEX = 5;
+
+/**
+ * Draws borders + optional fill for every column, and plain text for every
+ * column EXCEPT those listed in `skipTextColumns` (used for the Evidence and
+ * Status columns, which get custom-rendered content drawn on top afterward).
+ */
 function drawTableRow(
   doc: InstanceType<typeof PDFDocument>,
   cells: string[],
   x: number,
   y: number,
-  opts: { bold?: boolean; fillColor?: string } = {}
+  opts: {
+    bold?: boolean;
+    fillColor?: string;
+    textColor?: string;
+    isHeader?: boolean;
+    skipTextColumns?: number[];
+  } = {}
 ): number {
+  const skip = new Set(opts.skipTextColumns ?? []);
+
   let maxLines = 1;
   cells.forEach((text, i) => {
-    const w        = COL_WIDTHS[i] - ROW_PADDING * 2;
+    const w = COL_WIDTHS[i] - ROW_PADDING * 2;
     const approxCh = Math.floor(w / (FONT_SIZE * 0.52));
-    const words    = text.split(/\n/);
-    let lines      = 0;
+    const words = text.split(/\n/);
+    let lines = 0;
     words.forEach((line) => {
       lines += Math.max(1, Math.ceil(line.length / approxCh));
     });
@@ -303,31 +406,132 @@ function drawTableRow(
   const rowHeight = maxLines * LINE_HEIGHT + ROW_PADDING * 2;
 
   if (opts.fillColor) {
-    doc.save().rect(x, y, COL_WIDTHS.reduce((a, b) => a + b, 0), rowHeight)
-       .fill(opts.fillColor).restore();
+    doc.save()
+      .rect(x, y, COL_WIDTHS.reduce((a, b) => a + b, 0), rowHeight)
+      .fill(opts.fillColor)
+      .restore();
   }
 
   let cx = x;
   COL_WIDTHS.forEach((w) => {
-    doc.save().rect(cx, y, w, rowHeight).stroke("#d1d5db").restore();
+    doc.save()
+      .rect(cx, y, w, rowHeight)
+      .stroke(UI_COLORS.borderLight)
+      .restore();
     cx += w;
   });
 
   cx = x;
   cells.forEach((text, i) => {
-    doc
-      .font(opts.bold ? "Helvetica-Bold" : "Helvetica")
-      .fontSize(FONT_SIZE)
-      .fillColor("#1f2937")
-      .text(text, cx + ROW_PADDING, y + ROW_PADDING, {
-        width:    COL_WIDTHS[i] - ROW_PADDING * 2,
-        height:   rowHeight - ROW_PADDING,
-        ellipsis: false,
-      });
+    if (!skip.has(i)) {
+      const color = opts.textColor || (opts.isHeader ? UI_COLORS.headerText : UI_COLORS.bodyText);
+      doc
+        .font(opts.bold ? "Helvetica-Bold" : "Helvetica")
+        .fontSize(opts.isHeader ? 7 : FONT_SIZE)
+        .fillColor(color)
+        .text(text, cx + ROW_PADDING, y + ROW_PADDING, {
+          width: COL_WIDTHS[i] - ROW_PADDING * 2,
+          height: rowHeight - ROW_PADDING,
+          ellipsis: false,
+          align: i === 1 ? "center" : "left",
+        });
+    }
     cx += COL_WIDTHS[i];
   });
 
   return rowHeight;
+}
+
+/** Draws a rounded pill badge for the Status column, matching the UI's StatusBadge. */
+function drawStatusPill(
+  doc: InstanceType<typeof PDFDocument>,
+  status: string,
+  colX: number,
+  rowY: number,
+  rowHeight: number
+): void {
+  const isCompleted = status === "Completed";
+  const label = isCompleted ? "COMPLETE" : "INCOMPLETE";
+  const bg = isCompleted ? UI_COLORS.completeBg : UI_COLORS.pendingBg;
+  const border = isCompleted ? UI_COLORS.completeBorder : UI_COLORS.pendingBorder;
+  const text = isCompleted ? UI_COLORS.completeText : UI_COLORS.pendingText;
+
+  const colWidth = COL_WIDTHS[STATUS_COL_INDEX];
+  const pillFontSize = 6.5;
+  doc.font("Helvetica-Bold").fontSize(pillFontSize);
+  const textWidth = doc.widthOfString(label);
+
+  const pillPaddingX = 8;
+  const pillHeight = 14;
+  const pillWidth = Math.min(colWidth - 12, textWidth + pillPaddingX * 2);
+
+  const pillX = colX + (colWidth - pillWidth) / 2;
+  const pillY = rowY + (rowHeight - pillHeight) / 2;
+
+  doc.save()
+    .roundedRect(pillX, pillY, pillWidth, pillHeight, pillHeight / 2)
+    .fillAndStroke(bg, border)
+    .restore();
+
+  doc
+    .font("Helvetica-Bold")
+    .fontSize(pillFontSize)
+    .fillColor(text)
+    .text(label, pillX, pillY + (pillHeight - pillFontSize) / 2 - 1, {
+      width: pillWidth,
+      align: "center",
+    });
+}
+
+/** Draws the Evidence column's bullet lines with a gold diamond marker and dark text, matching the UI's EvidenceCell. */
+function drawEvidenceCell(
+  doc: InstanceType<typeof PDFDocument>,
+  submissions: SubmissionRow[],
+  colX: number,
+  rowY: number,
+  rowHeight: number
+): void {
+  const lines = getEvidenceLines(submissions);
+  if (lines.length === 0) return;
+
+  const colWidth = COL_WIDTHS[EVIDENCE_COL_INDEX];
+  const innerX = colX + ROW_PADDING;
+  const innerWidth = colWidth - ROW_PADDING * 2;
+  const diamondWidth = 10;
+
+  let cy = rowY + ROW_PADDING;
+
+  for (const line of lines) {
+    if (line.isBullet) {
+      doc
+        .font("Helvetica")
+        .fontSize(FONT_SIZE)
+        .fillColor(UI_COLORS.gold)
+        .text("❖", innerX, cy, { width: diamondWidth, lineBreak: false });
+
+      const textHeight = doc.heightOfString(line.text, {
+        width: innerWidth - diamondWidth,
+      });
+
+      doc
+        .font("Helvetica-Bold")
+        .fontSize(FONT_SIZE)
+        .fillColor(UI_COLORS.bodyText)
+        .text(line.text, innerX + diamondWidth, cy, {
+          width: innerWidth - diamondWidth,
+        });
+
+      cy += Math.max(textHeight, LINE_HEIGHT) + 2;
+    } else {
+      const textHeight = doc.heightOfString(line.text, { width: innerWidth });
+      doc
+        .font("Helvetica-Oblique")
+        .fontSize(FONT_SIZE)
+        .fillColor(UI_COLORS.mutedText)
+        .text(line.text, innerX, cy, { width: innerWidth });
+      cy += textHeight + 4;
+    }
+  }
 }
 
 /* ─── 1. GET FULL TRACKER REPORT ──────────────────────────────────────────── */
@@ -448,9 +652,10 @@ export const getTrackerPdf = asyncHandler(
     const logoBuffer = await fetchLogoBuffer(LOGO_URL);
 
     const doc = new PDFDocument({
-      size:    "A4",
-      layout:  "landscape",
+      size: "A4",
+      layout: "landscape",
       margins: { top: 50, bottom: 40, left: 20, right: 20 },
+      bufferPages: true,
     });
 
     res.setHeader("Content-Type", "application/pdf");
@@ -461,12 +666,13 @@ export const getTrackerPdf = asyncHandler(
     doc.pipe(res);
 
     const PAGE_WIDTH = doc.page.width;
-    const LOGO_SIZE   = 60;
+    const LOGO_SIZE = 60;
 
+    // ── HEADER with UI styling ──
     if (logoBuffer) {
       try {
         doc.image(logoBuffer, (PAGE_WIDTH - LOGO_SIZE) / 2, doc.y, {
-          width:  LOGO_SIZE,
+          width: LOGO_SIZE,
           height: LOGO_SIZE,
         });
         doc.moveDown(LOGO_SIZE / doc.currentLineHeight() + 1);
@@ -477,94 +683,85 @@ export const getTrackerPdf = asyncHandler(
 
     doc
       .font("Helvetica-Bold")
-      .fontSize(11)
-      .fillColor("#1f2937")
-      .text("OFFICE OF THE REGISTRAR HIGH COURT", { align: "center" })
-      .moveDown(0.3);
+      .fontSize(14)
+      .fillColor(UI_COLORS.darkGreen)
+      .text("RHC 2025/2026 PMMU 1ST JULY 2025 TO 30TH JUNE 2026", {
+        align: "center",
+        characterSpacing: 0.5,
+      })
+      .moveDown(0.2);
 
     doc
       .font("Helvetica-Bold")
       .fontSize(10)
-      .fillColor("#374151")
-      .text(
-        "RHC 2025/2026 PMMU 1ST JULY 2025 TO 30TH JUNE 2026",
-        { align: "center" }
-      )
-      .text(
-        "IMPLEMENTATION AND EVALUATION TRACKER",
-        { align: "center" }
-      )
-      .moveDown(0.5);
+      .fillColor(UI_COLORS.gold)
+      .text("Implementation and Evaluation Tracker", {
+        align: "center",
+        characterSpacing: 2,
+      })
+      .moveDown(0.8);
 
-    doc
-      .font("Helvetica")
-      .fontSize(8)
-      .fillColor("#6b7280")
-      .text(`Generated: ${new Date().toLocaleDateString("en-KE")}`, { align: "right" })
-      .moveDown(0.5);
-
-    const TABLE_X      = doc.page.margins.left;
+    const TABLE_X = doc.page.margins.left;
     const HEADER_CELLS = [
-      "INDICATORS", "Unit", "Explanatory Notes",
-      "Responsibility", "Evidence", "Status",
+      "INDICATORS",
+      "UNIT OF MEASURE",
+      "EXPLANATORY NOTES",
+      "RESPONSIBILITY",
+      "EVIDENCE",
+      "STATUS",
     ];
 
     let cursorY = doc.y;
 
-    const headerHeight = drawTableRow(doc, HEADER_CELLS, TABLE_X, cursorY, {
-      bold:      true,
-      fillColor: "#bbf7d0",
-    });
+    // ── Header row: white background, dark bold uppercase text (matches UI) ──
+    const drawHeaderRow = () =>
+      drawTableRow(doc, HEADER_CELLS, TABLE_X, cursorY, {
+        bold: true,
+        isHeader: true,
+      });
+
+    const headerHeight = drawHeaderRow();
     cursorY += headerHeight;
 
-    const PAGE_BOTTOM  = doc.page.height - doc.page.margins.bottom - 20;
-    const TABLE_WIDTH  = COL_WIDTHS.reduce((a, b) => a + b, 0);
+    const PAGE_BOTTOM = doc.page.height - doc.page.margins.bottom - 20;
+    const TABLE_WIDTH = COL_WIDTHS.reduce((a, b) => a + b, 0);
+
+    let rowIndex = 0;
 
     for (const persp of grouped) {
-      if (cursorY + 20 > PAGE_BOTTOM) {
+      if (cursorY + 25 > PAGE_BOTTOM) {
         doc.addPage();
         cursorY = doc.page.margins.top;
+        cursorY += drawHeaderRow();
       }
 
+      // ── Perspective banner: light tinted background, dark green text (matches UI) ──
       doc.save()
-         .rect(TABLE_X, cursorY, TABLE_WIDTH, 18)
-         .fill("#d1fae5")
-         .restore();
+        .rect(TABLE_X, cursorY, TABLE_WIDTH, 20)
+        .fill(UI_COLORS.perspectiveBg)
+        .restore();
 
       doc
         .font("Helvetica-Bold")
         .fontSize(8)
-        .fillColor("#14532d")
-        .text(persp.perspective, TABLE_X + ROW_PADDING, cursorY + 4, {
+        .fillColor(UI_COLORS.perspectiveText)
+        .text(persp.perspective, TABLE_X + ROW_PADDING, cursorY + 5, {
           width: TABLE_WIDTH - ROW_PADDING * 2,
+          characterSpacing: 0.5,
         });
 
-      doc.save().rect(TABLE_X, cursorY, TABLE_WIDTH, 18).stroke("#d1d5db").restore();
-      cursorY += 18;
+      doc.save()
+        .rect(TABLE_X, cursorY, TABLE_WIDTH, 20)
+        .stroke(UI_COLORS.borderLight)
+        .restore();
+      cursorY += 20;
 
       let lastObjectiveId: string | null = null;
 
       for (const obj of persp.objectives) {
         for (const act of obj.activities) {
           for (const ind of act.indicators) {
-            const evidenceLines: string[] = [];
-            if (ind.submissions?.length > 0) {
-              for (const sub of ind.submissions) {
-                const period = sub.quarter === 0 ? "Annual" : `Q${sub.quarter}`;
-                evidenceLines.push(`${period} ${sub.year}`);
-                if (sub.notes) evidenceLines.push(`  ${sub.notes}`);
-                if (sub.documents) {
-                  for (const doc of sub.documents) {
-                    const desc = doc.description?.trim();
-                    if (desc) {
-                      evidenceLines.push(`  * ${desc}`);
-                    }
-                  }
-                }
-              }
-            } else {
-              evidenceLines.push("No submissions yet");
-            }
+            const evidenceText = formatEvidenceForPdf(ind.submissions || []);
 
             const isFirstForObjective = obj.id !== lastObjectiveId;
             lastObjectiveId = obj.id;
@@ -572,21 +769,22 @@ export const getTrackerPdf = asyncHandler(
             const indicatorLabel = obj.title?.trim() || act.description;
             const indicatorCell = isFirstForObjective ? indicatorLabel : "";
 
-            const statusDisplay = ind.status === "Completed" ? "Complete" : "";
-
+            // Text used only for row-height estimation; actual rendering of
+            // Evidence and Status columns is skipped in drawTableRow and
+            // done separately below via drawEvidenceCell / drawStatusPill.
             const cells = [
               indicatorCell,
               ind.unit || "%",
               act.description + (ind.instructions ? `\n${ind.instructions}` : ""),
               ind.assigneeDisplayName || "Unassigned",
-              evidenceLines.join("\n"),
-              statusDisplay,
+              evidenceText,
+              ind.status === "Completed" ? "COMPLETE" : "INCOMPLETE",
             ];
 
             const estLines = cells.reduce((max, text, i) => {
-              const w        = COL_WIDTHS[i] - ROW_PADDING * 2;
+              const w = COL_WIDTHS[i] - ROW_PADDING * 2;
               const approxCh = Math.floor(w / (FONT_SIZE * 0.52));
-              const lines    = text.split("\n").reduce((s, l) => s + Math.max(1, Math.ceil(l.length / approxCh)), 0);
+              const lines = text.split("\n").reduce((s, l) => s + Math.max(1, Math.ceil(l.length / approxCh)), 0);
               return Math.max(max, lines);
             }, 1);
             const estHeight = estLines * LINE_HEIGHT + ROW_PADDING * 2;
@@ -594,32 +792,57 @@ export const getTrackerPdf = asyncHandler(
             if (cursorY + estHeight > PAGE_BOTTOM) {
               doc.addPage();
               cursorY = doc.page.margins.top;
-
-              const h = drawTableRow(doc, HEADER_CELLS, TABLE_X, cursorY, {
-                bold:      true,
-                fillColor: "#bbf7d0",
-              });
-              cursorY += h;
+              cursorY += drawHeaderRow();
             }
 
-            const rowH = drawTableRow(doc, cells, TABLE_X, cursorY);
+            const bgColor = rowIndex % 2 === 0 ? UI_COLORS.rowAlt : "#ffffff";
+
+            const rowH = drawTableRow(doc, cells, TABLE_X, cursorY, {
+              fillColor: bgColor,
+              skipTextColumns: [EVIDENCE_COL_INDEX, STATUS_COL_INDEX],
+            });
+
+            // Column x-offset for Evidence and Status columns
+            const evidenceColX = TABLE_X + COL_WIDTHS.slice(0, EVIDENCE_COL_INDEX).reduce((a, b) => a + b, 0);
+            const statusColX = TABLE_X + COL_WIDTHS.slice(0, STATUS_COL_INDEX).reduce((a, b) => a + b, 0);
+
+            drawEvidenceCell(doc, ind.submissions || [], evidenceColX, cursorY, rowH);
+            drawStatusPill(doc, ind.status, statusColX, cursorY, rowH);
+
             cursorY += rowH;
+            rowIndex++;
           }
         }
       }
     }
 
-    const totalPages = (doc as any)._pageBuffer?.length ?? 1;
-    doc
-      .font("Helvetica")
-      .fontSize(8)
-      .fillColor("#9ca3af")
-      .text(
-        `Page 1 of ${totalPages}  ·  Generated ${new Date().toLocaleDateString("en-KE")}`,
-        TABLE_X,
-        doc.page.height - doc.page.margins.bottom,
-        { align: "center", width: TABLE_WIDTH }
-      );
+    // ── Footer with UI styling (applied to all pages) ──
+    const totalPages = doc.bufferedPageRange().count || 1;
+
+    for (let i = 0; i < totalPages; i++) {
+      doc.switchToPage(i);
+
+      doc
+        .font("Helvetica")
+        .fontSize(7)
+        .fillColor(UI_COLORS.mutedText)
+        .text(
+          `RHC PMMU Tracker · FY 2024/2025 · Generated ${new Date().toLocaleDateString("en-KE", {
+            day: "numeric",
+            month: "long",
+            year: "numeric",
+          })}`,
+          TABLE_X,
+          doc.page.height - doc.page.margins.bottom,
+          { align: "center", width: TABLE_WIDTH }
+        )
+        .text(
+          `Page ${i + 1} of ${totalPages}`,
+          TABLE_X + TABLE_WIDTH - 60,
+          doc.page.height - doc.page.margins.bottom,
+          { width: 60, align: "right" }
+        );
+    }
 
     doc.end();
   }
