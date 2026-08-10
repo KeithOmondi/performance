@@ -151,6 +151,7 @@ function buildWhereClause(query: Request["query"]): {
 
 /* ─── INTERFACES ──────────────────────────────────────────────────────────── */
 interface IndicatorRow {
+  planId:               string;
   perspective:          string;
   objectiveId:          string;
   objectiveTitle:       string;
@@ -212,64 +213,72 @@ interface GroupedPerspective {
 /* ─── HELPER: group flat rows → nested perspective/objective/activity ─────── */
 function groupByPerspective(rows: IndicatorRow[]): GroupedPerspective[] {
   const map: Record<string, {
+    planId: string;
     perspective: string;
-    objectives:  Record<string, {
-      id:         string;
-      title:      string;
+    objectives: Record<string, {
+      id: string;
+      title: string;
       activities: Record<string, {
-        id:          string;
+        id: string;
         description: string;
-        indicators:  IndicatorRow[];
+        indicators: IndicatorRow[];
       }>;
     }>;
   }> = {};
 
   for (const row of rows) {
-    const p = row.perspective;
+    const key = `${row.planId}-${row.perspective}`;
 
-    if (!map[p]) map[p] = { perspective: p, objectives: {} };
+    if (!map[key]) {
+      map[key] = {
+        planId: row.planId,
+        perspective: row.perspective,
+        objectives: {},
+      };
+    }
 
     const objKey = row.objectiveId;
-    if (!map[p].objectives[objKey]) {
-      map[p].objectives[objKey] = {
-        id:         row.objectiveId,
-        title:      row.objectiveTitle,
+    if (!map[key].objectives[objKey]) {
+      map[key].objectives[objKey] = {
+        id: row.objectiveId,
+        title: row.objectiveTitle || row.perspective,
         activities: {},
       };
     }
 
     const actKey = row.activityId;
-    if (!map[p].objectives[objKey].activities[actKey]) {
-      map[p].objectives[objKey].activities[actKey] = {
-        id:          row.activityId,
+    if (!map[key].objectives[objKey].activities[actKey]) {
+      map[key].objectives[objKey].activities[actKey] = {
+        id: row.activityId,
         description: row.activityDescription,
-        indicators:  [],
+        indicators: [],
       };
     }
 
-    map[p].objectives[objKey].activities[actKey].indicators.push({
-      indicatorId:          row.indicatorId,
-      status:               row.status,
-      weight:               row.weight,
-      unit:                 row.unit,
-      target:               row.target,
-      progress:             row.progress,
-      deadline:             row.deadline,
-      instructions:         row.instructions,
-      reportingCycle:       row.reportingCycle,
-      activeQuarter:        row.activeQuarter,
+    map[key].objectives[objKey].activities[actKey].indicators.push({
+      indicatorId: row.indicatorId,
+      status: row.status,
+      weight: row.weight,
+      unit: row.unit,
+      target: row.target,
+      progress: row.progress,
+      deadline: row.deadline,
+      instructions: row.instructions,
+      reportingCycle: row.reportingCycle,
+      activeQuarter: row.activeQuarter,
       currentTotalAchieved: row.currentTotalAchieved,
-      assignmentType:       row.assignmentType,
-      assigneeId:           row.assigneeId,
-      assigneeDisplayName:  row.assigneeDisplayName,
-      submissions:          row.submissions,
+      assignmentType: row.assignmentType,
+      assigneeId: row.assigneeId,
+      assigneeDisplayName: row.assigneeDisplayName,
+      submissions: row.submissions,
     } as IndicatorRow);
   }
 
   return Object.values(map).map((p) => ({
-    ...p,
+    perspective: p.perspective,
     objectives: Object.values(p.objectives).map((o) => ({
-      ...o,
+      id: o.id,
+      title: o.title,
       activities: Object.values(o.activities),
     })),
   }));
@@ -281,7 +290,15 @@ function formatEvidenceForPdf(submissions: SubmissionRow[]): string {
     return "";
   }
 
-  const latestSubmission = submissions.reduce((latest, current) => {
+  const validSubmissions = submissions.filter(
+    (s) => s.reviewStatus !== 'Rejected'
+  );
+
+  if (validSubmissions.length === 0) {
+    return "";
+  }
+
+  const latestSubmission = validSubmissions.reduce((latest, current) => {
     const latestDate = new Date(latest.submittedAt);
     const currentDate = new Date(current.submittedAt);
     return currentDate > latestDate ? current : latest;
@@ -313,15 +330,16 @@ function formatEvidenceForPdf(submissions: SubmissionRow[]): string {
   return evidenceText.trim();
 }
 
-/**
- * Returns the raw evidence lines (without the ❖ prefix already baked in) so
- * the caller can render the diamond marker and the text in different colors,
- * matching the UI's gold-diamond / dark-text bullet style.
- */
 function getEvidenceLines(submissions: SubmissionRow[]): { isBullet: boolean; text: string }[] {
   if (!submissions || submissions.length === 0) return [];
 
-  const latestSubmission = submissions.reduce((latest, current) => {
+  const validSubmissions = submissions.filter(
+    (s) => s.reviewStatus !== 'Rejected'
+  );
+
+  if (validSubmissions.length === 0) return [];
+
+  const latestSubmission = validSubmissions.reduce((latest, current) => {
     const latestDate = new Date(latest.submittedAt);
     const currentDate = new Date(current.submittedAt);
     return currentDate > latestDate ? current : latest;
@@ -348,34 +366,29 @@ function getEvidenceLines(submissions: SubmissionRow[]): { isBullet: boolean; te
 const UI_COLORS = {
   darkGreen:      "#1d3331",
   gold:           "#c2a336",
-  borderLight:    "#e2e8f0", // slate-200
-  headerText:     "#334155", // slate-700
+  borderLight:    "#e2e8f0",
+  headerText:     "#334155",
   bodyText:       "#1a2c2c",
-  mutedText:      "#64748b", // slate-500
-  perspectiveBg:  "#eef1f0", // ≈ dark green at 5% opacity over white
+  mutedText:      "#64748b",
+  perspectiveBg:  "#eef1f0",
   perspectiveText:"#1d3331",
-  completeBg:     "#d1fae5", // emerald-100
-  completeText:   "#047857", // emerald-700
-  completeBorder: "#a7f3d0", // emerald-200
-  pendingBg:      "#fef3c7", // amber-100
-  pendingText:    "#b45309", // amber-700
-  pendingBorder:  "#fde68a", // amber-200
+  completeBg:     "#d1fae5",
+  completeText:   "#047857",
+  completeBorder: "#a7f3d0",
+  pendingBg:      "#fef3c7",
+  pendingText:    "#b45309",
+  pendingBorder:  "#fde68a",
   rowAlt:         "#fcfcf7",
 };
 
 /* ─── HELPER: draw a table row in pdfkit with UI styling ── */
-const COL_WIDTHS = [140, 50, 150, 110, 200, 90];
+const COL_WIDTHS = [140, 50, 150, 110, 280, 90];
 const ROW_PADDING = 6;
 const FONT_SIZE = 7.5;
 const LINE_HEIGHT = FONT_SIZE * 1.35;
 const EVIDENCE_COL_INDEX = 4;
 const STATUS_COL_INDEX = 5;
 
-/**
- * Draws borders + optional fill for every column, and plain text for every
- * column EXCEPT those listed in `skipTextColumns` (used for the Evidence and
- * Status columns, which get custom-rendered content drawn on top afterward).
- */
 function drawTableRow(
   doc: InstanceType<typeof PDFDocument>,
   cells: string[],
@@ -442,7 +455,6 @@ function drawTableRow(
   return rowHeight;
 }
 
-/** Draws a rounded pill badge for the Status column, matching the UI's StatusBadge. */
 function drawStatusPill(
   doc: InstanceType<typeof PDFDocument>,
   status: string,
@@ -483,7 +495,6 @@ function drawStatusPill(
     });
 }
 
-/** Draws the Evidence column's bullet lines with a gold diamond marker and dark text, matching the UI's EvidenceCell. */
 function drawEvidenceCell(
   doc: InstanceType<typeof PDFDocument>,
   submissions: SubmissionRow[],
@@ -509,26 +520,32 @@ function drawEvidenceCell(
         .fillColor(UI_COLORS.gold)
         .text("❖", innerX, cy, { width: diamondWidth, lineBreak: false });
 
-      const textHeight = doc.heightOfString(line.text, {
+      const textOptions = {
         width: innerWidth - diamondWidth,
-      });
+        align: 'left' as const,
+      };
 
       doc
         .font("Helvetica-Bold")
         .fontSize(FONT_SIZE)
         .fillColor(UI_COLORS.bodyText)
-        .text(line.text, innerX + diamondWidth, cy, {
-          width: innerWidth - diamondWidth,
-        });
+        .text(line.text, innerX + diamondWidth, cy, textOptions);
 
+      const textHeight = doc.heightOfString(line.text, textOptions);
       cy += Math.max(textHeight, LINE_HEIGHT) + 2;
     } else {
-      const textHeight = doc.heightOfString(line.text, { width: innerWidth });
+      const textOptions = {
+        width: innerWidth,
+        align: 'left' as const,
+      };
+
       doc
         .font("Helvetica-Oblique")
         .fontSize(FONT_SIZE)
         .fillColor(UI_COLORS.mutedText)
-        .text(line.text, innerX, cy, { width: innerWidth });
+        .text(line.text, innerX, cy, textOptions);
+
+      const textHeight = doc.heightOfString(line.text, textOptions);
       cy += textHeight + 4;
     }
   }
@@ -541,7 +558,7 @@ export const getTrackerReport = asyncHandler(
 
     const { rows } = await pool.query(
       `${REPORT_SELECT} ${REPORT_JOINS} ${where}
-       ORDER BY sp.perspective ASC, so.title ASC, sa.description ASC`,
+       ORDER BY sp.id ASC, so.id ASC, sa.id ASC, i.id ASC`,
       params
     );
 
@@ -562,7 +579,7 @@ export const getReportByPlanId = asyncHandler(
     const { rows } = await pool.query(
       `${REPORT_SELECT} ${REPORT_JOINS}
        WHERE sp.id = $1 AND i.deleted_at IS NULL
-       ORDER BY so.title ASC, sa.description ASC`,
+       ORDER BY sp.id ASC, so.id ASC, sa.id ASC, i.id ASC`,
       [planId]
     );
 
@@ -584,6 +601,7 @@ export const getReportSummary = asyncHandler(
   async (_req: Request, res: Response) => {
     const { rows } = await pool.query(`
       SELECT
+        sp.id,
         sp.perspective,
         COUNT(DISTINCT i.id)::int                                           AS "totalIndicators",
         COUNT(DISTINCT i.id) FILTER (WHERE i.status = 'Completed')::int    AS "completed",
@@ -615,8 +633,8 @@ export const getReportSummary = asyncHandler(
       JOIN strategic_activities sa  ON sa.objective_id = so.id
       JOIN indicators i             ON i.activity_id   = sa.id
       WHERE i.deleted_at IS NULL
-      GROUP BY sp.perspective
-      ORDER BY sp.perspective ASC
+      GROUP BY sp.id, sp.perspective
+      ORDER BY sp.id ASC
     `);
 
     res.status(200).json({ success: true, data: rows });
@@ -643,7 +661,7 @@ export const getTrackerPdf = asyncHandler(
 
     const { rows } = await pool.query(
       `${REPORT_SELECT} ${REPORT_JOINS} ${where}
-       ORDER BY sp.perspective ASC, so.title ASC, sa.description ASC`,
+       ORDER BY sp.id ASC, so.id ASC, sa.id ASC, i.id ASC`,
       params
     );
 
@@ -668,7 +686,6 @@ export const getTrackerPdf = asyncHandler(
     const PAGE_WIDTH = doc.page.width;
     const LOGO_SIZE = 60;
 
-    // ── HEADER with UI styling ──
     if (logoBuffer) {
       try {
         doc.image(logoBuffer, (PAGE_WIDTH - LOGO_SIZE) / 2, doc.y, {
@@ -713,7 +730,6 @@ export const getTrackerPdf = asyncHandler(
 
     let cursorY = doc.y;
 
-    // ── Header row: white background, dark bold uppercase text (matches UI) ──
     const drawHeaderRow = () =>
       drawTableRow(doc, HEADER_CELLS, TABLE_X, cursorY, {
         bold: true,
@@ -729,13 +745,13 @@ export const getTrackerPdf = asyncHandler(
     let rowIndex = 0;
 
     for (const persp of grouped) {
+      // ── Perspective header ──
       if (cursorY + 25 > PAGE_BOTTOM) {
         doc.addPage();
         cursorY = doc.page.margins.top;
         cursorY += drawHeaderRow();
       }
 
-      // ── Perspective banner: light tinted background, dark green text (matches UI) ──
       doc.save()
         .rect(TABLE_X, cursorY, TABLE_WIDTH, 20)
         .fill(UI_COLORS.perspectiveBg)
@@ -756,28 +772,37 @@ export const getTrackerPdf = asyncHandler(
         .restore();
       cursorY += 20;
 
-      let lastObjectiveId: string | null = null;
-
+      // ── Iterate through objectives ──
       for (const obj of persp.objectives) {
+        // Show objective as the main indicator row
+        const isFirstObjective = true;
+        let firstActivity = true;
+
         for (const act of obj.activities) {
           for (const ind of act.indicators) {
             const evidenceText = formatEvidenceForPdf(ind.submissions || []);
 
-            const isFirstForObjective = obj.id !== lastObjectiveId;
-            lastObjectiveId = obj.id;
+            // For the first activity of each objective, show the objective title
+            // as the indicator name, otherwise leave it blank (for subsequent activities)
+            let indicatorCell = "";
+            if (firstActivity) {
+              indicatorCell = obj.title?.trim() || act.description;
+              firstActivity = false;
+            }
 
-            const indicatorLabel = obj.title?.trim() || act.description;
-            const indicatorCell = isFirstForObjective ? indicatorLabel : "";
+            const evidenceLines = getEvidenceLines(ind.submissions || []);
+            let evidenceDisplayText = "";
+            for (const line of evidenceLines) {
+              evidenceDisplayText += (line.isBullet ? "❖ " : "") + line.text + "\n";
+            }
+            evidenceDisplayText = evidenceDisplayText.trim();
 
-            // Text used only for row-height estimation; actual rendering of
-            // Evidence and Status columns is skipped in drawTableRow and
-            // done separately below via drawEvidenceCell / drawStatusPill.
             const cells = [
               indicatorCell,
               ind.unit || "%",
               act.description + (ind.instructions ? `\n${ind.instructions}` : ""),
               ind.assigneeDisplayName || "Unassigned",
-              evidenceText,
+              evidenceDisplayText || "",
               ind.status === "Completed" ? "COMPLETE" : "INCOMPLETE",
             ];
 
@@ -802,7 +827,6 @@ export const getTrackerPdf = asyncHandler(
               skipTextColumns: [EVIDENCE_COL_INDEX, STATUS_COL_INDEX],
             });
 
-            // Column x-offset for Evidence and Status columns
             const evidenceColX = TABLE_X + COL_WIDTHS.slice(0, EVIDENCE_COL_INDEX).reduce((a, b) => a + b, 0);
             const statusColX = TABLE_X + COL_WIDTHS.slice(0, STATUS_COL_INDEX).reduce((a, b) => a + b, 0);
 
@@ -816,7 +840,6 @@ export const getTrackerPdf = asyncHandler(
       }
     }
 
-    // ── Footer with UI styling (applied to all pages) ──
     const totalPages = doc.bufferedPageRange().count || 1;
 
     for (let i = 0; i < totalPages; i++) {
