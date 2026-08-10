@@ -37,7 +37,7 @@ const DOCUMENTS_SUBQUERY = `
     )
     FROM submission_documents d
     WHERE d.submission_id = s.id
-      AND d.deleted_at IS NULL     -- ✅ FIX: exclude soft-deleted documents
+      AND d.deleted_at IS NULL
   ) AS documents
 `;
 
@@ -96,9 +96,11 @@ function groupSubmissionsByPeriod(
  * Rules (in priority order):
  *   1. Any Pending                           → "Awaiting Admin Approval"
  *   2. Any "Correction Needed"               → "Correction Needed"
- *   3. All Rejected                          → "Rejected by Admin"
- *   4. Any Verified (and nothing above)      → "Awaiting Super Admin"
- *   5. No submissions                        → keep current status
+ *   3. Any "Partially Approved"              → "Partially Approved"
+ *   4. Any "Verified"                        → "Awaiting Super Admin"
+ *   5. All Approved                          → "Completed"
+ *   6. All Rejected                          → "Rejected by Admin"
+ *   7. No submissions                        → keep current status
  */
 async function recalcIndicatorStatus(
   client: any,
@@ -118,15 +120,20 @@ async function recalcIndicatorStatus(
   }
 
   const statuses: string[] = rows.map((r: any) => r.review_status);
-  const hasPending    = statuses.includes("Pending");
+  const hasPending = statuses.includes("Pending");
   const hasCorrection = statuses.includes("Correction Needed");
-  const hasVerified   = statuses.includes("Verified");
-  const allRejected   = statuses.every((s: string) => s === "Rejected");
+  const hasPartiallyApproved = statuses.includes("Partially Approved");
+  const hasVerified = statuses.includes("Verified");
+  const hasAccepted = statuses.includes("Accepted");
+  const allRejected = statuses.every((s: string) => s === "Rejected");
+  const allAccepted = statuses.every((s: string) => s === "Accepted");
 
-  if (hasPending)    return "Awaiting Admin Approval";
+  if (hasPending) return "Awaiting Admin Approval";
   if (hasCorrection) return "Correction Needed";
-  if (allRejected)   return "Rejected by Admin";
-  if (hasVerified)   return "Awaiting Super Admin";
+  if (hasPartiallyApproved) return "Partially Approved";
+  if (allAccepted) return "Completed";
+  if (hasVerified) return "Awaiting Super Admin";
+  if (allRejected) return "Rejected by Admin";
 
   return "Awaiting Admin Approval";
 }
@@ -158,6 +165,7 @@ async function fetchAndLockIndicator(client: any, id: string) {
     "Awaiting Admin Approval",
     "Correction Needed",
     "Rejected by Admin",
+    "Partially Approved",
   ];
   if (!allowedStatuses.includes(indicator.status)) {
     throw new AppError(
@@ -307,7 +315,6 @@ export const getIndicatorByIdAdmin = asyncHandler(
 
     if (!indicators[0]) throw new AppError("Indicator not found.", 404);
 
-    // Fetch submissions for this single indicator
     const { rows: submissions } = await pool.query(
       `${SUBMISSIONS_SELECT}
        WHERE s.indicator_id = $1
@@ -315,7 +322,6 @@ export const getIndicatorByIdAdmin = asyncHandler(
       [id],
     );
 
-    // Fetch review history
     const { rows: reviewHistory } = await pool.query(
       `SELECT h.*,
               h.reviewer_role AS "reviewerRole",
@@ -328,7 +334,7 @@ export const getIndicatorByIdAdmin = asyncHandler(
     );
 
     const indicator = indicators[0];
-    indicator.submissions  = groupSubmissionsByPeriod(submissions, indicator.reportingCycle);
+    indicator.submissions = groupSubmissionsByPeriod(submissions, indicator.reportingCycle);
     indicator.reviewHistory = reviewHistory;
 
     res.status(200).json({ success: true, data: indicator });
@@ -336,14 +342,279 @@ export const getIndicatorByIdAdmin = asyncHandler(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  3. Approve Submission (Admin)
+//  3. Approve Individual Document (Admin)
 // ─────────────────────────────────────────────────────────────────────────────
-// ✅ FIX: Recalculate indicator status instead of forcing "Awaiting Super Admin"
+
+export const approveDocument = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { documentId, submissionId, adminComment } = req.body;
+    const adminId = (req as any).user.id;
+
+    if (!documentId) throw new AppError("documentId is required.", 400);
+    if (!submissionId) throw new AppError("submissionId is required.", 400);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Get the submission first to check its current status
+      const { rows: submissionRows } = await client.query(
+        `SELECT id, review_status, indicator_id
+         FROM submissions
+         WHERE id = $1
+         FOR UPDATE`,
+        [submissionId],
+      );
+
+      if (submissionRows.length === 0) {
+        throw new AppError("Submission not found.", 404);
+      }
+
+      const submission = submissionRows[0];
+
+      // Verify document belongs to the given submission and indicator
+      const { rows: ownership } = await client.query(
+        `SELECT sd.id, s.indicator_id, s.quarter, s.year
+         FROM submission_documents sd
+         JOIN submissions s ON s.id = sd.submission_id
+         WHERE sd.id = $1
+           AND s.id = $2
+           AND sd.deleted_at IS NULL
+         FOR UPDATE OF s`,
+        [documentId, submissionId],
+      );
+
+      if (!ownership.length) {
+        throw new AppError("Document not found for this submission.", 404);
+      }
+
+      const indicatorId = ownership[0].indicator_id;
+
+      // Lock the indicator
+      await fetchAndLockIndicator(client, indicatorId);
+
+      // Approve the document
+      await client.query(
+        `UPDATE submission_documents
+         SET status = 'Approved',
+             rejection_reason = NULL,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [documentId],
+      );
+
+      // Check if all documents in this submission are now Approved
+      const { rows: allDocs } = await client.query(
+        `SELECT status
+         FROM submission_documents
+         WHERE submission_id = $1
+           AND deleted_at IS NULL`,
+        [submissionId],
+      );
+
+      const allApproved = allDocs.length > 0 && allDocs.every((d: any) => d.status === 'Approved');
+      const hasRejected = allDocs.some((d: any) => d.status === 'Rejected');
+      const hasResubmitted = allDocs.some((d: any) => d.status === 'Resubmitted');
+      const hasPending = allDocs.some((d: any) => d.status === 'Pending' || !d.status);
+
+      // Determine submission status based on document statuses
+      let newSubmissionStatus = submission.review_status || 'Pending';
+      
+      if (allApproved) {
+        newSubmissionStatus = 'Accepted';
+      } else if (hasRejected) {
+        newSubmissionStatus = 'Correction Needed';
+      } else if (hasResubmitted) {
+        newSubmissionStatus = 'Pending'; // Waiting for review of resubmitted docs
+      } else if (hasPending) {
+        newSubmissionStatus = 'Pending';
+      } else {
+        newSubmissionStatus = 'Partially Approved';
+      }
+
+      await client.query(
+        `UPDATE submissions
+         SET review_status = $1,
+             admin_comment = COALESCE($2, admin_comment),
+             is_reviewed = $3,
+             updated_at = NOW()
+         WHERE id = $4`,
+        [newSubmissionStatus, adminComment?.trim(), allApproved, submissionId],
+      );
+
+      // Recalculate indicator status
+      const newIndicatorStatus = await recalcIndicatorStatus(client, indicatorId);
+      await client.query(
+        `UPDATE indicators
+         SET status = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [newIndicatorStatus, indicatorId],
+      );
+
+      await client.query(
+        `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Document Approved', $2, 'admin', $3)`,
+        [indicatorId, adminComment?.trim() || 'Document approved by admin.', adminId],
+      );
+
+      await client.query("COMMIT");
+
+      // If all documents approved, notify super admins
+      if (newIndicatorStatus === 'Awaiting Super Admin') {
+        const { rows: superAdmins } = await pool.query(
+          `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`,
+        );
+        // Get indicator details for email
+        const indResult = await pool.query(
+          `SELECT name, instructions, reporting_cycle, active_quarter FROM indicators WHERE id = $1`,
+          [indicatorId],
+        );
+        const indicator = indResult.rows[0];
+        const taskTitle = indicator?.instructions || 'Performance Indicator';
+        const year = new Date().getFullYear();
+
+        superAdmins.forEach(({ email }: { email: string }) => {
+          sendMail({
+            to: email,
+            subject: 'Submission Ready for Final Approval',
+            html: superAdminReviewNeededTemplate(
+              taskTitle,
+              indicator?.name || 'Indicator',
+              (req as any).user.name,
+              indicator?.reporting_cycle || 'Quarterly',
+              indicator?.active_quarter || 1,
+              year,
+            ),
+          }).catch(console.error);
+        });
+      }
+
+      res.status(200).json({
+        success: true,
+        message: 'Document approved successfully.',
+        data: {
+          documentId,
+          submissionId,
+          submissionStatus: newSubmissionStatus,
+          indicatorStatus: newIndicatorStatus,
+          allDocumentsApproved: allApproved,
+        },
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  4. Reject Individual Document (Admin)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const rejectDocument = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { documentId, submissionId, reason } = req.body;
+    const adminId = (req as any).user.id;
+
+    if (!documentId) throw new AppError("documentId is required.", 400);
+    if (!submissionId) throw new AppError("submissionId is required.", 400);
+    if (!reason?.trim()) throw new AppError("A rejection reason is required.", 400);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Verify document belongs to the given submission and indicator
+      const { rows: ownership } = await client.query(
+        `SELECT sd.id, s.indicator_id, s.quarter, s.year
+         FROM submission_documents sd
+         JOIN submissions s ON s.id = sd.submission_id
+         WHERE sd.id = $1
+           AND s.id = $2
+           AND sd.deleted_at IS NULL
+         FOR UPDATE OF s`,
+        [documentId, submissionId],
+      );
+
+      if (!ownership.length) {
+        throw new AppError("Document not found for this submission.", 404);
+      }
+
+      const indicatorId = ownership[0].indicator_id;
+
+      // Lock the indicator
+      await fetchAndLockIndicator(client, indicatorId);
+
+      // Reject the document
+      await client.query(
+        `UPDATE submission_documents
+         SET status = 'Rejected',
+             rejection_reason = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [reason.trim(), documentId],
+      );
+
+      // Update submission status to Correction Needed
+      await client.query(
+        `UPDATE submissions
+         SET review_status = 'Correction Needed',
+             admin_comment = COALESCE(admin_comment, 'One or more documents require corrections.'),
+             is_reviewed = true,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [submissionId],
+      );
+
+      // Recalculate indicator status
+      const newIndicatorStatus = await recalcIndicatorStatus(client, indicatorId);
+      await client.query(
+        `UPDATE indicators
+         SET status = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [newIndicatorStatus, indicatorId],
+      );
+
+      await client.query(
+        `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
+         VALUES ($1, 'Document Rejected', $2, 'admin', $3)`,
+        [indicatorId, `Document ${documentId}: ${reason.trim()}`, adminId],
+      );
+
+      await client.query("COMMIT");
+
+      res.status(200).json({
+        success: true,
+        message: "Document rejected and submission flagged for correction.",
+        data: {
+          documentId,
+          submissionId,
+          submissionStatus: 'Correction Needed',
+          indicatorStatus: newIndicatorStatus,
+        },
+      });
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  5. Overall Approve Submission (Admin)
+// ─────────────────────────────────────────────────────────────────────────────
+
 export const approveSubmission = asyncHandler(
   async (req: Request, res: Response) => {
-    const id           = req.params.id as string;
+    const id = req.params.id as string;
     const { submissionUpdates, adminOverallComments } = req.body;
-    const adminId   = (req as any).user.id;
+    const adminId = (req as any).user.id;
     const adminName = (req as any).user.name;
 
     const client = await pool.connect();
@@ -360,10 +631,10 @@ export const approveSubmission = asyncHandler(
             `UPDATE submissions
              SET review_status = 'Verified',
                  admin_comment = COALESCE($1, $2),
-                 is_reviewed   = true,
-                 updated_at    = NOW()
+                 is_reviewed = true,
+                 updated_at = NOW()
              WHERE id = $3
-               AND review_status IN ('Pending', 'Correction Needed')`,
+               AND review_status IN ('Pending', 'Correction Needed', 'Partially Approved')`,
             [
               update.adminComment?.trim(),
               adminOverallComments?.trim() || "Approved.",
@@ -373,13 +644,12 @@ export const approveSubmission = asyncHandler(
         }
       }
 
-      // ✅ FIX: Use recalcIndicatorStatus to get the correct overall status
       const newStatus = await recalcIndicatorStatus(client, id);
       await client.query(
         `UPDATE indicators
-         SET status                 = $1,
+         SET status = $1,
              admin_overall_comments = $2,
-             updated_at             = NOW()
+             updated_at = NOW()
          WHERE id = $3`,
         [newStatus, adminOverallComments?.trim() || "Approved by admin.", id],
       );
@@ -395,15 +665,15 @@ export const approveSubmission = asyncHandler(
       // Notify super admins only if the whole indicator is now fully approved
       if (newStatus === "Awaiting Super Admin") {
         const taskTitle = indicator.instructions || "Performance Indicator";
-        const year      = new Date().getFullYear();
+        const year = new Date().getFullYear();
         const { rows: superAdmins } = await pool.query(
           `SELECT email FROM users WHERE role = 'superadmin' AND is_active = true`,
         );
         superAdmins.forEach(({ email }: { email: string }) => {
           sendMail({
-            to:      email,
+            to: email,
             subject: "Submission Ready for Final Approval",
-            html:    superAdminReviewNeededTemplate(
+            html: superAdminReviewNeededTemplate(
               taskTitle,
               indicator.name,
               adminName,
@@ -430,7 +700,7 @@ export const approveSubmission = asyncHandler(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  4. Overall Reject Submission (Admin)
+//  6. Overall Reject Submission (Admin)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const rejectSubmission = asyncHandler(
@@ -459,10 +729,10 @@ export const rejectSubmission = asyncHandler(
             `UPDATE submissions
              SET review_status = 'Rejected',
                  admin_comment = $1,
-                 is_reviewed   = true,
-                 updated_at    = NOW()
+                 is_reviewed = true,
+                 updated_at = NOW()
              WHERE id = $2
-               AND review_status IN ('Pending', 'Correction Needed')`,
+               AND review_status IN ('Pending', 'Correction Needed', 'Partially Approved')`,
             [
               update.adminComment?.trim() || adminOverallComments,
               update.submissionId,
@@ -474,9 +744,9 @@ export const rejectSubmission = asyncHandler(
       const newStatus = await recalcIndicatorStatus(client, id);
       await client.query(
         `UPDATE indicators
-         SET status                 = $1,
+         SET status = $1,
              admin_overall_comments = $2,
-             updated_at             = NOW()
+             updated_at = NOW()
          WHERE id = $3`,
         [newStatus, adminOverallComments, id],
       );
@@ -491,11 +761,11 @@ export const rejectSubmission = asyncHandler(
 
       // Notify assignee
       const taskTitle = indicator.instructions || "Performance Indicator";
-      const year      = new Date().getFullYear();
+      const year = new Date().getFullYear();
       sendMail({
-        to:      indicator.assignee_email,
+        to: indicator.assignee_email,
         subject: "Submission Returned for Correction",
-        html:    submissionRejectedTemplate(
+        html: submissionRejectedTemplate(
           indicator.name,
           taskTitle,
           indicator.reporting_cycle,
@@ -521,110 +791,14 @@ export const rejectSubmission = asyncHandler(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  5. Reject Single Document (Admin)
-// ─────────────────────────────────────────────────────────────────────────────
-
-export const rejectDocument = asyncHandler(
-  async (req: Request, res: Response) => {
-    const id = req.params.id as string;
-    const { documentId, submissionId, reason } = req.body;
-    const adminId = (req as any).user.id;
-
-    if (!documentId)    throw new AppError("documentId is required.", 400);
-    if (!submissionId)  throw new AppError("submissionId is required.", 400);
-    if (!reason?.trim()) throw new AppError("A rejection reason is required.", 400);
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-
-      // Verify document belongs to the given submission and indicator
-      const { rows: ownership } = await client.query(
-        `SELECT sd.id
-         FROM submission_documents sd
-         JOIN submissions  s ON s.id  = sd.submission_id
-         JOIN indicators   i ON i.id  = s.indicator_id
-         WHERE sd.id = $1
-           AND s.id  = $2
-           AND i.id  = $3
-           AND sd.deleted_at IS NULL     -- ✅ FIX: ignore soft-deleted docs
-         FOR UPDATE OF i`,
-        [documentId, submissionId, id],
-      );
-      if (!ownership.length) {
-        throw new AppError("Document not found for this indicator.", 404);
-      }
-
-      // Reject the document
-      await client.query(
-        `UPDATE submission_documents
-         SET status = 'Rejected', rejection_reason = $1
-         WHERE id = $2`,
-        [reason.trim(), documentId],
-      );
-
-      // ✅ FIX: exclude soft-deleted docs when determining submission status
-      const { rows: allDocs } = await client.query(
-        `SELECT status
-         FROM submission_documents
-         WHERE submission_id = $1
-           AND deleted_at IS NULL`,     // ✅ FIX
-        [submissionId],
-      );
-
-      const allRejected =
-        allDocs.length > 0 && allDocs.every((d: any) => d.status === "Rejected");
-      const newSubmissionStatus = allRejected ? "Rejected" : "Correction Needed";
-
-      await client.query(
-        `UPDATE submissions
-         SET review_status = $1,
-             is_reviewed   = true,
-             updated_at    = NOW()
-         WHERE id = $2`,
-        [newSubmissionStatus, submissionId],
-      );
-
-      const newIndicatorStatus = await recalcIndicatorStatus(client, id);
-      await client.query(
-        `UPDATE indicators SET status = $1, updated_at = NOW() WHERE id = $2`,
-        [newIndicatorStatus, id],
-      );
-
-      await client.query(
-        `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
-         VALUES ($1, 'Document Rejected', $2, 'admin', $3)`,
-        [id, `Document ${documentId}: ${reason.trim()}`, adminId],
-      );
-
-      await client.query("COMMIT");
-
-      res.status(200).json({
-        success: true,
-        message: "Document rejected and submission flagged for correction.",
-        data: {
-          indicatorStatus:  newIndicatorStatus,
-          submissionStatus: newSubmissionStatus,
-        },
-      });
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
-  },
-);
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  6. Fetch Resubmitted Indicators (pending resubmissions)
+//  7. Fetch Resubmitted Indicators (pending resubmissions)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const fetchResubmittedIndicators = asyncHandler(
   async (_req: Request, res: Response) => {
     const { rows } = await pool.query(
       `SELECT DISTINCT i.id
-       FROM indicators  i
+       FROM indicators i
        JOIN submissions s ON s.indicator_id = i.id
        WHERE s.resubmission_count > 0
          AND s.review_status = 'Pending'`,
@@ -640,13 +814,13 @@ export const fetchResubmittedIndicators = asyncHandler(
       [ids],
     );
 
-    const data  = await attachSubmissionsToIndicators(indicators);
+    const data = await attachSubmissionsToIndicators(indicators);
     res.status(200).json({ success: true, count: data.length, data });
   },
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  7. Get Submissions for an Indicator
+//  8. Get Submissions for an Indicator
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const getIndicatorSubmissions = asyncHandler(
@@ -665,7 +839,7 @@ export const getIndicatorSubmissions = asyncHandler(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  8. Get Admin-Approved Indicators
+//  9. Get Admin-Approved Indicators
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const getAdminApprovedIndicators = asyncHandler(
@@ -692,12 +866,12 @@ export const getAdminApprovedIndicators = asyncHandler(
          jsonb_build_object('title',       so.title)       AS objective,
          jsonb_build_object('description', sa.description) AS activity
        FROM indicators i
-       JOIN review_history rh             ON rh.indicator_id = i.id
-       LEFT JOIN users u                  ON i.assignee_id = u.id  AND i.assignee_model = 'User'
-       LEFT JOIN teams t                  ON i.assignee_id = t.id  AND i.assignee_model = 'Team'
-       LEFT JOIN strategic_plans sp       ON i.strategic_plan_id = sp.id
-       LEFT JOIN strategic_objectives so  ON i.objective_id = so.id
-       LEFT JOIN strategic_activities sa  ON i.activity_id = sa.id
+       JOIN review_history rh ON rh.indicator_id = i.id
+       LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+       LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+       LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
+       LEFT JOIN strategic_objectives so ON i.objective_id = so.id
+       LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
        WHERE rh.action = 'Verified'
          AND rh.reviewer_role = 'admin'
        ORDER BY i.updated_at DESC`,
@@ -716,12 +890,12 @@ export const getAdminApprovedIndicators = asyncHandler(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  9. Delete a Single Submission (Admin — hard delete)
+//  10. Delete a Single Submission (Admin — hard delete)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const deleteSubmission = asyncHandler(
   async (req: Request, res: Response) => {
-    const indicatorId  = req.params.indicatorId as string;
+    const indicatorId = req.params.indicatorId as string;
     const submissionId = req.params.submissionId as string;
 
     if (Array.isArray(indicatorId) || Array.isArray(submissionId)) {
@@ -734,10 +908,8 @@ export const deleteSubmission = asyncHandler(
     try {
       await client.query("BEGIN");
 
-      // Lock and verify the indicator exists and is in a reviewable state
       await fetchAndLockIndicator(client, indicatorId);
 
-      // Check submission exists and is deletable
       const { rows: subRows } = await client.query(
         `SELECT id, review_status, resubmission_count
          FROM submissions
@@ -757,7 +929,6 @@ export const deleteSubmission = asyncHandler(
         );
       }
 
-      // Collect all Cloudinary public IDs before deleting
       const { rows: docRows } = await client.query(
         `SELECT evidence_public_id
          FROM submission_documents
@@ -768,7 +939,6 @@ export const deleteSubmission = asyncHandler(
         .map((r: any) => r.evidence_public_id)
         .filter(Boolean);
 
-      // Hard-delete documents then submission
       await client.query(
         `DELETE FROM submission_documents WHERE submission_id = $1`,
         [submissionId],
@@ -777,14 +947,12 @@ export const deleteSubmission = asyncHandler(
         submissionId,
       ]);
 
-      // Recalculate indicator status
       const newStatus = await recalcIndicatorStatus(client, indicatorId);
       await client.query(
         `UPDATE indicators SET status = $1, updated_at = NOW() WHERE id = $2`,
         [newStatus, indicatorId],
       );
 
-      // Audit log
       await client.query(
         `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
          VALUES ($1, 'Submission Deleted', $2, 'admin', $3)`,
@@ -797,7 +965,6 @@ export const deleteSubmission = asyncHandler(
 
       await client.query("COMMIT");
 
-      // Cloudinary cleanup
       if (publicIds.length > 0) {
         publicIds.forEach((pid: string) =>
           deleteFromCloudinary(pid).catch((err: Error) =>
@@ -824,8 +991,7 @@ export const deleteSubmission = asyncHandler(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  10. NEW: Admin soft‑deletes (marks as 'Deleted') a single document with a reason
-//     The document remains visible to the user with status 'Deleted' and reason.
+//  11. NEW: Admin soft-deletes (marks as 'Deleted') a single document with a reason
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const deleteDocumentAdmin = asyncHandler(
@@ -840,7 +1006,6 @@ export const deleteDocumentAdmin = asyncHandler(
     try {
       await client.query("BEGIN");
 
-      // Verify document exists and belongs to an indicator (with row lock on indicator)
       const { rows: docRows } = await client.query(
         `SELECT sd.id, sd.submission_id, s.indicator_id
          FROM submission_documents sd
@@ -858,10 +1023,8 @@ export const deleteDocumentAdmin = asyncHandler(
       const doc = docRows[0];
       const indicatorId = doc.indicator_id;
 
-      // Lock the indicator
       await fetchAndLockIndicator(client, indicatorId);
 
-      // Mark document as 'Deleted' with reason (no soft delete, just status change)
       await client.query(
         `UPDATE submission_documents
          SET status = 'Deleted',
@@ -871,11 +1034,6 @@ export const deleteDocumentAdmin = asyncHandler(
         [reason.trim(), documentId],
       );
 
-      // (Optional) Check if all documents in this submission are now Deleted?
-      // If yes, you might want to update submission status to 'Rejected' or similar.
-      // We'll leave the submission status unchanged; admin can manually reject if needed.
-
-      // Audit log
       await client.query(
         `INSERT INTO review_history (indicator_id, action, reason, reviewer_role, reviewed_by)
          VALUES ($1, 'Document Deleted', $2, 'admin', $3)`,
