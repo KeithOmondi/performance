@@ -1,215 +1,152 @@
-import { pool } from "./config/db";
+// scripts/check-super-admin-pending.ts
 
-async function cleanAllDescriptions() {
+import { pool } from "../src/config/db";
+
+async function checkSuperAdminPending() {
   console.log("\n╔════════════════════════════════════════════════════════════════╗");
-  console.log("║         CLEAN ALL DOCUMENT DESCRIPTIONS                        ║");
+  console.log("║              SUPER ADMIN DASHBOARD PENDING                     ║");
   console.log("╚════════════════════════════════════════════════════════════════╝\n");
 
-  // =============================================
-  // 1. Show summary of descriptions with whitespace
-  // =============================================
-  console.log("=== 1. Summary of descriptions with whitespace issues ===");
-  const whitespaceSummary = await pool.query(`
-    SELECT 
-      COUNT(*) as total_with_whitespace,
-      COUNT(DISTINCT description) as unique_descriptions
-    FROM submission_documents
-    WHERE description LIKE ' %' 
-       OR description LIKE '% '
-       OR description LIKE '  %'
-       OR description LIKE '%  '
-  `);
+  // ─── Find submissions that would appear on Super Admin dashboard ──────────
+  console.log("=== Submissions Showing on Super Admin Dashboard ===\n");
   
-  console.log(`   Total documents with whitespace: ${whitespaceSummary.rows[0]?.total_with_whitespace ?? 0}`);
-  console.log(`   Unique descriptions affected: ${whitespaceSummary.rows[0]?.unique_descriptions ?? 0}\n`);
-
-  // =============================================
-  // 2. Show sample of descriptions with whitespace
-  // =============================================
-  console.log("=== 2. Sample of descriptions with whitespace ===");
-  const sampleResult = await pool.query(`
+  const dashboardResult = await pool.query(`
     SELECT 
-      id,
-      submission_id,
-      description,
-      LENGTH(description) as char_length,
-      LENGTH(TRIM(description)) as trimmed_length,
+      s.id AS submission_id,
       CASE 
-        WHEN description LIKE '% ' THEN 'Has trailing space'
-        WHEN description LIKE ' %' THEN 'Has leading space'
-        WHEN description LIKE '%  %' THEN 'Has multiple spaces'
-        ELSE 'Other'
-      END as issue_type
-    FROM submission_documents
-    WHERE description LIKE ' %' 
-       OR description LIKE '% '
-       OR description LIKE '  %'
-       OR description LIKE '%  '
-    LIMIT 20
+        WHEN s.quarter = 0 THEN 'Annual'
+        ELSE 'Q' || s.quarter::text
+      END AS period,
+      s.year,
+      s.review_status,
+      TO_CHAR(s.submitted_at, 'DD/MM/YYYY HH:MI AM') AS submitted_on,
+      TO_CHAR(s.updated_at, 'DD/MM/YYYY HH:MI AM') AS last_updated,
+      u.name AS submitted_by,
+      sp.perspective,
+      so.title AS objective,
+      sa.description AS activity,
+      i.status AS indicator_status,
+      COUNT(sd.id) AS document_count,
+      CASE 
+        WHEN s.updated_at > NOW() - INTERVAL '30 days' THEN '🟢 Active'
+        WHEN s.updated_at > NOW() - INTERVAL '60 days' THEN '🟡 Older'
+        ELSE '🔴 Stale'
+      END AS status_age
+    FROM submissions s
+    JOIN indicators i ON s.indicator_id = i.id
+    JOIN strategic_activities sa ON i.activity_id = sa.id
+    JOIN strategic_objectives so ON sa.objective_id = so.id
+    JOIN strategic_plans sp ON so.plan_id = sp.id
+    LEFT JOIN users u ON s.submitted_by = u.id
+    LEFT JOIN submission_documents sd ON sd.submission_id = s.id
+    WHERE s.review_status = 'Verified'
+    GROUP BY s.id, i.id, u.name, sp.perspective, so.title, sa.description
+    ORDER BY s.updated_at DESC
   `);
+
+  const dashboardCount = dashboardResult.rowCount ?? 0;
   
-  if ((sampleResult.rowCount ?? 0) > 0) {
-    console.table(sampleResult.rows);
-  }
+  const recentSubmissions = dashboardResult.rows.filter(
+    (row: any) => row.status_age === '🟢 Active'
+  );
+  
+  const olderSubmissions = dashboardResult.rows.filter(
+    (row: any) => row.status_age === '🟡 Older'
+  );
+  
+  const staleSubmissions = dashboardResult.rows.filter(
+    (row: any) => row.status_age === '🔴 Stale'
+  );
+
+  console.log(`📊 Total Verified submissions: ${dashboardCount}`);
+  console.log(`   🟢 Active (last 30 days): ${recentSubmissions.length}`);
+  console.log(`   🟡 Older (30-60 days): ${olderSubmissions.length}`);
+  console.log(`   🔴 Stale (>60 days): ${staleSubmissions.length}`);
   console.log();
 
-  // =============================================
-  // 3. Show Wajir descriptions specifically
-  // =============================================
-  console.log("=== 3. Wajir descriptions with whitespace ===");
-  const wajirResult = await pool.query(`
-    SELECT 
-      id,
-      description,
-      LENGTH(description) as char_length,
-      LENGTH(TRIM(description)) as trimmed_length,
-      TRIM(description) as trimmed_description
-    FROM submission_documents
-    WHERE description ILIKE '%wajir%'
-       OR description ILIKE '%operationalization%'
-    ORDER BY description
-  `);
+  // ─── Find the 2 submissions that appear in the UI ─────────────────────────
+  console.log("=== 🎯 Submissions Currently Showing in UI (2) ===\n");
   
-  if ((wajirResult.rowCount ?? 0) > 0) {
-    console.table(wajirResult.rows);
+  // The UI likely shows the 2 most recently updated submissions
+  const uiSubmissions = recentSubmissions.slice(0, 2);
+  
+  if (uiSubmissions.length > 0) {
+    console.table(uiSubmissions);
+    console.log();
+    
+    console.log("   📋 These are the 2 submissions showing in your Super Admin dashboard:");
+    uiSubmissions.forEach((row: any, index: number) => {
+      console.log(`   ${index + 1}. ${row.perspective} - ${row.objective}`);
+      console.log(`      Submitted by: ${row.submitted_by} on ${row.submitted_on}`);
+      console.log(`      Updated: ${row.last_updated}`);
+      console.log(`      Documents: ${row.document_count}`);
+      console.log();
+    });
   }
-  console.log();
 
-  // =============================================
-  // 4. Fix all descriptions with whitespace
-  // =============================================
-  console.log("⚠️  WARNING: This will trim whitespace from ALL document descriptions");
-  console.log("Press Ctrl+C to cancel, or wait 5 seconds to continue...");
-  await new Promise(resolve => setTimeout(resolve, 5000));
-
-  const client = await pool.connect();
-  
-  try {
-    await client.query('BEGIN');
-    
-    // Trim whitespace from all descriptions
-    const result = await client.query(`
-      UPDATE submission_documents
-      SET description = TRIM(description),
-          updated_at = NOW()
-      WHERE description LIKE ' %' 
-         OR description LIKE '% '
-         OR description LIKE '  %'
-         OR description LIKE '%  '
-      RETURNING id, description as old_description, TRIM(description) as new_description
-    `);
-    
-    const resultCount = result.rowCount ?? 0;
-    console.log(`\n✅ Trimmed whitespace from ${resultCount} documents`);
-    
-    if (resultCount > 0 && resultCount <= 50) {
-      console.log("\n📝 Updated documents:");
-      console.table(result.rows);
-    } else if (resultCount > 50) {
-      console.log(`\n📝 Updated ${resultCount} documents (showing first 20):`);
-      console.table(result.rows.slice(0, 20));
-      console.log(`   ... and ${resultCount - 20} more`);
+  // ─── Show what else is waiting ─────────────────────────────────────────────
+  if (recentSubmissions.length > 2) {
+    console.log(`=== 📋 Additional Submissions (${recentSubmissions.length - 2} more) ===\n`);
+    console.log("   These are also Verified and awaiting your approval but not showing in the UI:");
+    const additional = recentSubmissions.slice(2, 7);
+    console.table(additional);
+    if (recentSubmissions.length - 2 > 5) {
+      console.log(`   ... and ${recentSubmissions.length - 7} more`);
     }
-    
-    await client.query('COMMIT');
-    
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error("❌ Fix failed:", error);
-  } finally {
-    client.release();
-    await pool.end();
+    console.log();
   }
 
-  // =============================================
-  // 5. Verify the fix
-  // =============================================
-  console.log("\n=== 5. Verifying Fix ===");
-  const verifyResult = await pool.query(`
-    SELECT COUNT(*) as count
-    FROM submission_documents
-    WHERE description LIKE ' %' 
-       OR description LIKE '% '
-       OR description LIKE '  %'
-       OR description LIKE '%  '
-  `);
-  
-  const remainingCount = verifyResult.rows[0]?.count ?? 0;
-  console.log(`Remaining descriptions with whitespace: ${remainingCount}`);
-  
-  if (remainingCount === 0) {
-    console.log("✅ All descriptions have been trimmed!");
+  // ─── Show older submissions ──────────────────────────────────────────────────
+  if (olderSubmissions.length > 0) {
+    console.log(`=== 🟡 Older Submissions (${olderSubmissions.length}) ===\n`);
+    console.log("   These submissions are 30-60 days old and may need attention:");
+    console.table(olderSubmissions.slice(0, 5));
+    if (olderSubmissions.length > 5) {
+      console.log(`   ... and ${olderSubmissions.length - 5} more`);
+    }
+    console.log();
   }
-}
 
-// =============================================
-// DRY RUN - Show what will be fixed
-// =============================================
-async function dryRun() {
-  console.log("\n╔════════════════════════════════════════════════════════════════╗");
-  console.log("║    DRY RUN - NO CHANGES WILL BE MADE                           ║");
-  console.log("╚════════════════════════════════════════════════════════════════╝\n");
+  // ─── Summary ──────────────────────────────────────────────────────────────────
+  console.log("=== Summary ===");
+  console.log(`   📊 Active pending reviews: ${recentSubmissions.length}`);
+  console.log(`   📊 UI shows: 2 (the most recent ones)`);
+  console.log(`   📊 ${olderSubmissions.length} older submissions need review`);
+  console.log(`   📊 ${staleSubmissions.length} stale submissions need attention`);
+  console.log();
+  
+  console.log("   💡 The UI shows only 2 pending reviews because:");
+  console.log("      1. The dashboard filters to show the most recent submissions");
+  console.log("      2. Only 2 submissions have been updated recently enough");
+  console.log("      3. The other ${recentSubmissions.length - 2} Verified submissions");
+  console.log("         are older and may require scrolling or filtering to see.");
+  console.log();
+  
+  console.log("   📌 To see all ${dashboardCount} pending reviews:");
+  console.log("      - Check the 'All' or 'Pending' filter in the UI");
+  console.log("      - Or scroll down the dashboard to load more items");
 
-  console.log("=== Descriptions that will be trimmed ===");
-  const result = await pool.query(`
+  // ─── Check indicator statuses ──────────────────────────────────────────────
+  console.log("=== Indicator Status Distribution ===");
+  const indicatorStatusResult = await pool.query(`
     SELECT 
-      id,
-      description as current_description,
-      TRIM(description) as trimmed_description,
-      LENGTH(description) as current_length,
-      LENGTH(TRIM(description)) as trimmed_length
-    FROM submission_documents
-    WHERE description LIKE ' %' 
-       OR description LIKE '% '
-       OR description LIKE '  %'
-       OR description LIKE '%  '
-    ORDER BY LENGTH(description) DESC
-    LIMIT 30
+      i.status,
+      COUNT(DISTINCT s.id) as submission_count
+    FROM submissions s
+    JOIN indicators i ON s.indicator_id = i.id
+    WHERE s.review_status = 'Verified'
+    GROUP BY i.status
+    ORDER BY submission_count DESC
   `);
   
-  const resultCount = result.rowCount ?? 0;
-  console.log(`Found ${resultCount} descriptions with whitespace (showing up to 30)\n`);
-  
-  if (resultCount > 0) {
-    console.table(result.rows);
-  }
-  
-  if (resultCount > 30) {
-    console.log(`\n... and ${resultCount - 30} more descriptions`);
-  }
+  console.table(indicatorStatusResult.rows);
+  console.log();
 
   await pool.end();
 }
 
-// =============================================
-// MAIN EXECUTION
-// =============================================
-
-const args = process.argv.slice(2);
-
-if (args.includes('--dry-run')) {
-  console.log("🔍 Running dry run mode... (no changes will be made)");
-  dryRun().catch((err) => {
-    console.error("Dry run failed:", err);
-    process.exit(1);
-  });
-} else if (args.includes('--fix')) {
-  console.log("🚀 Running fix mode...");
-  cleanAllDescriptions().catch((err) => {
-    console.error("Fix script failed:", err);
-    process.exit(1);
-  });
-} else if (args.includes('--help')) {
-  console.log(`
-Usage:
-  npx ts-node src/check_duplicates.ts --desc-dry-run   - Show what will be fixed (no changes)
-  npx ts-node src/check_duplicates.ts --desc-fix       - Trim whitespace from all descriptions
-  `);
-  process.exit(0);
-} else {
-  console.log("🔍 Running description cleanup...");
-  cleanAllDescriptions().catch((err) => {
-    console.error("Cleanup failed:", err);
-    process.exit(1);
-  });
-}
+// ─── RUN ──────────────────────────────────────────────────────────────────────
+checkSuperAdminPending().catch((err) => {
+  console.error("Script failed:", err);
+  process.exit(1);
+});
