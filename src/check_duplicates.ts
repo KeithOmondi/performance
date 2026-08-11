@@ -1,152 +1,159 @@
-// scripts/check-super-admin-pending.ts
+// scripts/check-partial-approvals-history.ts
 
 import { pool } from "../src/config/db";
 
-async function checkSuperAdminPending() {
+async function checkPartialApprovalsHistory() {
   console.log("\n╔════════════════════════════════════════════════════════════════╗");
-  console.log("║              SUPER ADMIN DASHBOARD PENDING                     ║");
+  console.log("║              PARTIAL APPROVALS HISTORY CHECK                   ║");
   console.log("╚════════════════════════════════════════════════════════════════╝\n");
 
-  // ─── Find submissions that would appear on Super Admin dashboard ──────────
-  console.log("=== Submissions Showing on Super Admin Dashboard ===\n");
-  
-  const dashboardResult = await pool.query(`
+  // ─── 1. Check for partial approvals in review_history ─────────────────────
+  console.log("=== 1. Partial Approvals in Review History ===");
+  const partialResult = await pool.query(`
     SELECT 
-      s.id AS submission_id,
-      CASE 
-        WHEN s.quarter = 0 THEN 'Annual'
-        ELSE 'Q' || s.quarter::text
-      END AS period,
+      rh.id,
+      rh.indicator_id,
+      rh.action,
+      rh.reason,
+      rh.approved_amount AS "approvedAmount",
+      rh.quarter,
+      rh.year,
+      rh.is_partial AS "isPartial",
+      TO_CHAR(rh.at, 'DD/MM/YYYY HH:MI AM') AS approved_at,
+      u.name AS approved_by,
+      i.status AS indicator_status,
+      sa.description AS activity_description,
+      sp.perspective
+    FROM review_history rh
+    JOIN indicators i ON rh.indicator_id = i.id
+    LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+    LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
+    LEFT JOIN users u ON rh.reviewed_by = u.id
+    WHERE rh.is_partial = true
+       OR rh.action = 'Partially Approved'
+    ORDER BY rh.at DESC
+  `);
+
+  const partialCount = partialResult.rowCount ?? 0;
+  console.log(`📊 Found ${partialCount} partial approval record(s):\n`);
+
+  if (partialCount > 0) {
+    console.table(partialResult.rows);
+    console.log();
+  } else {
+    console.log("   ❌ No partial approval records found.\n");
+  }
+
+  // ─── 2. Check for submissions with 'Partially Approved' status ──────────
+  console.log("=== 2. Submissions with 'Partially Approved' Status ===");
+  const subResult = await pool.query(`
+    SELECT 
+      s.id,
+      s.indicator_id,
+      s.quarter,
       s.year,
       s.review_status,
-      TO_CHAR(s.submitted_at, 'DD/MM/YYYY HH:MI AM') AS submitted_on,
-      TO_CHAR(s.updated_at, 'DD/MM/YYYY HH:MI AM') AS last_updated,
-      u.name AS submitted_by,
-      sp.perspective,
-      so.title AS objective,
-      sa.description AS activity,
+      s.achieved_value,
+      s.admin_comment,
+      TO_CHAR(s.submitted_at, 'DD/MM/YYYY HH:MI AM') AS submitted_at,
       i.status AS indicator_status,
-      COUNT(sd.id) AS document_count,
-      CASE 
-        WHEN s.updated_at > NOW() - INTERVAL '30 days' THEN '🟢 Active'
-        WHEN s.updated_at > NOW() - INTERVAL '60 days' THEN '🟡 Older'
-        ELSE '🔴 Stale'
-      END AS status_age
+      sa.description AS activity_description
     FROM submissions s
     JOIN indicators i ON s.indicator_id = i.id
-    JOIN strategic_activities sa ON i.activity_id = sa.id
-    JOIN strategic_objectives so ON sa.objective_id = so.id
-    JOIN strategic_plans sp ON so.plan_id = sp.id
-    LEFT JOIN users u ON s.submitted_by = u.id
-    LEFT JOIN submission_documents sd ON sd.submission_id = s.id
-    WHERE s.review_status = 'Verified'
-    GROUP BY s.id, i.id, u.name, sp.perspective, so.title, sa.description
-    ORDER BY s.updated_at DESC
+    LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+    WHERE s.review_status = 'Partially Approved'
+    ORDER BY s.submitted_at DESC
   `);
 
-  const dashboardCount = dashboardResult.rowCount ?? 0;
-  
-  const recentSubmissions = dashboardResult.rows.filter(
-    (row: any) => row.status_age === '🟢 Active'
-  );
-  
-  const olderSubmissions = dashboardResult.rows.filter(
-    (row: any) => row.status_age === '🟡 Older'
-  );
-  
-  const staleSubmissions = dashboardResult.rows.filter(
-    (row: any) => row.status_age === '🔴 Stale'
-  );
+  const subCount = subResult.rowCount ?? 0;
+  console.log(`📊 Found ${subCount} submission(s) with 'Partially Approved' status:\n`);
 
-  console.log(`📊 Total Verified submissions: ${dashboardCount}`);
-  console.log(`   🟢 Active (last 30 days): ${recentSubmissions.length}`);
-  console.log(`   🟡 Older (30-60 days): ${olderSubmissions.length}`);
-  console.log(`   🔴 Stale (>60 days): ${staleSubmissions.length}`);
+  if (subCount > 0) {
+    console.table(subResult.rows);
+  } else {
+    console.log("   ❌ No submissions with 'Partially Approved' status.");
+  }
   console.log();
 
-  // ─── Find the 2 submissions that appear in the UI ─────────────────────────
-  console.log("=== 🎯 Submissions Currently Showing in UI (2) ===\n");
-  
-  // The UI likely shows the 2 most recently updated submissions
-  const uiSubmissions = recentSubmissions.slice(0, 2);
-  
-  if (uiSubmissions.length > 0) {
-    console.table(uiSubmissions);
-    console.log();
-    
-    console.log("   📋 These are the 2 submissions showing in your Super Admin dashboard:");
-    uiSubmissions.forEach((row: any, index: number) => {
-      console.log(`   ${index + 1}. ${row.perspective} - ${row.objective}`);
-      console.log(`      Submitted by: ${row.submitted_by} on ${row.submitted_on}`);
-      console.log(`      Updated: ${row.last_updated}`);
-      console.log(`      Documents: ${row.document_count}`);
-      console.log();
-    });
-  }
+  // ─── 3. Summary by indicator ──────────────────────────────────────────────
+  if (partialCount > 0) {
+    console.log("=== 3. Summary by Indicator ===");
+    const summaryResult = await pool.query(`
+      SELECT 
+        rh.indicator_id,
+        sa.description AS activity_description,
+        COUNT(*) as partial_count,
+        SUM(rh.approved_amount) AS total_approved,
+        MIN(rh.at) AS first_approval,
+        MAX(rh.at) AS last_approval,
+        i.current_total_achieved AS current_total,
+        i.target,
+        i.progress
+      FROM review_history rh
+      JOIN indicators i ON rh.indicator_id = i.id
+      LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+      WHERE rh.is_partial = true
+      GROUP BY rh.indicator_id, sa.description, i.current_total_achieved, i.target, i.progress
+      ORDER BY partial_count DESC
+    `);
 
-  // ─── Show what else is waiting ─────────────────────────────────────────────
-  if (recentSubmissions.length > 2) {
-    console.log(`=== 📋 Additional Submissions (${recentSubmissions.length - 2} more) ===\n`);
-    console.log("   These are also Verified and awaiting your approval but not showing in the UI:");
-    const additional = recentSubmissions.slice(2, 7);
-    console.table(additional);
-    if (recentSubmissions.length - 2 > 5) {
-      console.log(`   ... and ${recentSubmissions.length - 7} more`);
-    }
+    console.table(summaryResult.rows);
     console.log();
   }
 
-  // ─── Show older submissions ──────────────────────────────────────────────────
-  if (olderSubmissions.length > 0) {
-    console.log(`=== 🟡 Older Submissions (${olderSubmissions.length}) ===\n`);
-    console.log("   These submissions are 30-60 days old and may need attention:");
-    console.table(olderSubmissions.slice(0, 5));
-    if (olderSubmissions.length > 5) {
-      console.log(`   ... and ${olderSubmissions.length - 5} more`);
-    }
-    console.log();
-  }
-
-  // ─── Summary ──────────────────────────────────────────────────────────────────
-  console.log("=== Summary ===");
-  console.log(`   📊 Active pending reviews: ${recentSubmissions.length}`);
-  console.log(`   📊 UI shows: 2 (the most recent ones)`);
-  console.log(`   📊 ${olderSubmissions.length} older submissions need review`);
-  console.log(`   📊 ${staleSubmissions.length} stale submissions need attention`);
-  console.log();
-  
-  console.log("   💡 The UI shows only 2 pending reviews because:");
-  console.log("      1. The dashboard filters to show the most recent submissions");
-  console.log("      2. Only 2 submissions have been updated recently enough");
-  console.log("      3. The other ${recentSubmissions.length - 2} Verified submissions");
-  console.log("         are older and may require scrolling or filtering to see.");
-  console.log();
-  
-  console.log("   📌 To see all ${dashboardCount} pending reviews:");
-  console.log("      - Check the 'All' or 'Pending' filter in the UI");
-  console.log("      - Or scroll down the dashboard to load more items");
-
-  // ─── Check indicator statuses ──────────────────────────────────────────────
-  console.log("=== Indicator Status Distribution ===");
-  const indicatorStatusResult = await pool.query(`
+  // ─── 4. Total approved amounts ────────────────────────────────────────────
+  console.log("=== 4. Total Approved Amounts ===");
+  const totalResult = await pool.query(`
     SELECT 
-      i.status,
-      COUNT(DISTINCT s.id) as submission_count
-    FROM submissions s
-    JOIN indicators i ON s.indicator_id = i.id
-    WHERE s.review_status = 'Verified'
-    GROUP BY i.status
-    ORDER BY submission_count DESC
+      COUNT(*) as total_partial_approvals,
+      SUM(approved_amount) as total_approved_amount,
+      AVG(approved_amount) as avg_approved_amount,
+      MIN(approved_amount) as min_approved,
+      MAX(approved_amount) as max_approved
+    FROM review_history
+    WHERE is_partial = true
   `);
-  
-  console.table(indicatorStatusResult.rows);
+
+  console.log(`   📊 Total Partial Approvals: ${totalResult.rows[0]?.total_partial_approvals ?? 0}`);
+  console.log(`   📊 Total Approved Amount: ${totalResult.rows[0]?.total_approved_amount ?? 0}%`);
+  console.log(`   📊 Average Approval: ${Math.round(totalResult.rows[0]?.avg_approved_amount ?? 0)}%`);
+  console.log(`   📊 Min Approval: ${totalResult.rows[0]?.min_approved ?? 0}%`);
+  console.log(`   📊 Max Approval: ${totalResult.rows[0]?.max_approved ?? 0}%`);
   console.log();
+
+  // ─── 5. Progress progression ──────────────────────────────────────────────
+  if (partialCount > 0) {
+    console.log("=== 5. Progress Progression (by indicator) ===");
+    const progressionResult = await pool.query(`
+      SELECT 
+        rh.indicator_id,
+        sa.description AS activity_description,
+        rh.approved_amount,
+        rh.at,
+        rh.is_partial,
+        i.progress,
+        i.target,
+        i.current_total_achieved
+      FROM review_history rh
+      JOIN indicators i ON rh.indicator_id = i.id
+      LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+      WHERE rh.is_partial = true
+      ORDER BY rh.indicator_id, rh.at ASC
+    `);
+
+    console.table(progressionResult.rows);
+    console.log();
+  }
+
+  console.log("╔════════════════════════════════════════════════════════════════╗");
+  console.log("║                       REPORT COMPLETE                          ║");
+  console.log("╚════════════════════════════════════════════════════════════════╝\n");
 
   await pool.end();
 }
 
 // ─── RUN ──────────────────────────────────────────────────────────────────────
-checkSuperAdminPending().catch((err) => {
+checkPartialApprovalsHistory().catch((err) => {
   console.error("Script failed:", err);
   process.exit(1);
 });

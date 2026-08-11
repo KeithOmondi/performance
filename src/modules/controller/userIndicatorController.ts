@@ -998,77 +998,81 @@ export const UserIndicatorController: IUserIndicatorController = {
     await UserIndicatorController.addDocuments(req, res, next);
   }),
 
+
   /**
-   * ✅ DELETE PENDING DOCUMENT - Delete a document from a pending submission
-   */
-  deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
-    const { docId } = req.params;
+ * ✅ DELETE PENDING DOCUMENT - Delete a document from a pending submission
+ */
+deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
+  const user = getAuthUser(req);
+  const { docId } = req.params;
 
-    console.log(`🗑️ [deletePendingDocument] START — docId: ${docId} | user: ${user.id}`);
+  console.log(`🗑️ [deletePendingDocument] START — docId: ${docId} | user: ${user.id}`);
 
-    const teamIds = await getUserTeamIds(user.id);
+  const teamIds = await getUserTeamIds(user.id);
 
-    const ownershipCondition = `
-      AND (
-        (i.assignee_id = $2 AND i.assignee_model = 'User')
-        OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
-        OR EXISTS (
-          SELECT 1 FROM indicator_assignees ia
-          WHERE ia.indicator_id = i.id AND ia.user_id = $2
-        )
+  const ownershipCondition = `
+    AND (
+      (i.assignee_id = $2 AND i.assignee_model = 'User')
+      OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
+      OR EXISTS (
+        SELECT 1 FROM indicator_assignees ia
+        WHERE ia.indicator_id = i.id AND ia.user_id = $2
       )
-    `;
+    )
+  `;
 
-    const checkParams: unknown[] = teamIds.length > 0 ? [docId, user.id, teamIds] : [docId, user.id];
+  // ✅ FIX: Always include teamIds in params, even if empty
+  const checkParams: unknown[] = [docId, user.id, teamIds.length > 0 ? teamIds : null];
 
-    const { rows } = await pool.query(
-      `SELECT d.id, d.evidence_public_id, d.file_name, d.status AS doc_status, 
-              s.review_status, s.quarter, s.year
-       FROM submission_documents d
-       JOIN submissions s ON d.submission_id = s.id
-       JOIN indicators i ON s.indicator_id = i.id
-       WHERE d.id = $1 AND d.deleted_at IS NULL ${ownershipCondition}`,
-      checkParams,
+  const { rows } = await pool.query(
+    `SELECT d.id, d.evidence_public_id, d.file_name, d.status AS doc_status, 
+            s.review_status, s.quarter, s.year
+     FROM submission_documents d
+     JOIN submissions s ON d.submission_id = s.id
+     JOIN indicators i ON s.indicator_id = i.id
+     WHERE d.id = $1 AND d.deleted_at IS NULL ${ownershipCondition}`,
+    checkParams,
+  );
+
+  if (rows.length === 0) {
+    throw new AppError("Document not found or you don't have permission to delete it.", 404);
+  }
+
+  const doc = rows[0] as {
+    evidence_public_id: string;
+    file_name: string;
+    doc_status: string;
+    review_status: string;
+    quarter: number;
+    year: number;
+  };
+
+  // Allow deletion if document is Pending, Rejected, Resubmitted, or Additional
+  if (doc.doc_status === 'Approved') {
+    throw new AppError("Cannot delete an approved document.", 400);
+  }
+
+  await pool.query(
+    `UPDATE submission_documents 
+     SET deleted_at = NOW(), deleted_by = $1
+     WHERE id = $2`,
+    [user.id, docId],
+  );
+
+  if (doc.evidence_public_id) {
+    deleteFromCloudinary(doc.evidence_public_id).catch((err: Error) =>
+      console.error("[deletePendingDocument] Cloudinary cleanup failed:", err),
     );
+  }
 
-    if (rows.length === 0) {
-      throw new AppError("Document not found or you don't have permission to delete it.", 404);
-    }
+  const quarterDisplayText = doc.quarter === 0 ? "Annual" : `Q${doc.quarter}`;
+  res.status(200).json({
+    success: true,
+    message: `Document "${doc.file_name}" has been removed from your ${quarterDisplayText} ${doc.year} submission.`,
+  });
+}),
 
-    const doc = rows[0] as {
-      evidence_public_id: string;
-      file_name: string;
-      doc_status: string;
-      review_status: string;
-      quarter: number;
-      year: number;
-    };
 
-    // Allow deletion if document is Pending, Rejected, Resubmitted, or Additional
-    if (doc.doc_status === 'Approved') {
-      throw new AppError("Cannot delete an approved document.", 400);
-    }
-
-    await pool.query(
-      `UPDATE submission_documents 
-       SET deleted_at = NOW(), deleted_by = $1
-       WHERE id = $2`,
-      [user.id, docId],
-    );
-
-    if (doc.evidence_public_id) {
-      deleteFromCloudinary(doc.evidence_public_id).catch((err: Error) =>
-        console.error("[deletePendingDocument] Cloudinary cleanup failed:", err),
-      );
-    }
-
-    const quarterDisplayText = doc.quarter === 0 ? "Annual" : `Q${doc.quarter}`;
-    res.status(200).json({
-      success: true,
-      message: `Document "${doc.file_name}" has been removed from your ${quarterDisplayText} ${doc.year} submission.`,
-    });
-  }),
 
   /**
    * ✅ GET REJECTED SUBMISSIONS - Get all indicators with rejected submissions
