@@ -59,6 +59,8 @@ const REPORT_SELECT = `
             'notes',         s.notes,
             'reviewStatus',  s.review_status,
             'submittedAt',   s.submitted_at,
+            'adminComment',  s.admin_comment,
+            'resubmissionCount', s.resubmission_count,
             'documents',     COALESCE(
               (
                 SELECT json_agg(json_build_object(
@@ -70,13 +72,15 @@ const REPORT_SELECT = `
                 ))
                 FROM submission_documents sd
                 WHERE sd.submission_id = s.id
+                  AND sd.status != 'Deleted'
               ), '[]'::json
             )
           )
-          ORDER BY s.year ASC, s.quarter ASC
+          ORDER BY s.year ASC, s.quarter ASC, s.submitted_at DESC
         )
         FROM submissions s
         WHERE s.indicator_id = i.id
+          AND s.review_status NOT IN ('Rejected', 'Correction Needed')
       ), '[]'::json
     )                        AS "submissions"
 `;
@@ -103,9 +107,20 @@ function buildWhereClause(query: Request["query"]): {
     where += ` AND sp.perspective = $${params.length}`;
   }
 
-  if (query.status === "Incomplete") {
-    where += ` AND i.status != 'Completed'`;
-  } else if (query.status) {
+  // ✅ Only include: Completed, Partially Approved, and indicators with no submissions
+  where += ` AND (
+    i.status = 'Completed' 
+    OR i.status = 'Partially Approved' 
+    OR i.status = 'Awaiting Super Admin'
+    OR NOT EXISTS (
+      SELECT 1 FROM submissions s WHERE s.indicator_id = i.id
+    )
+  )`;
+
+  // Exclude rejected/returned statuses
+  where += ` AND i.status NOT IN ('Rejected by Admin', 'Rejected by Super Admin', 'Correction Needed', 'Awaiting Admin Approval')`;
+
+  if (query.status && query.status !== "all") {
     params.push(query.status as string);
     where += ` AND i.status = $${params.length}`;
   }
@@ -133,6 +148,11 @@ function buildWhereClause(query: Request["query"]): {
       SELECT 1 FROM submissions s
       WHERE s.indicator_id = i.id
     )`;
+  } else if (query.hasSubmission === 'false') {
+    where += ` AND NOT EXISTS (
+      SELECT 1 FROM submissions s
+      WHERE s.indicator_id = i.id
+    )`;
   }
 
   if (query.submissionStatus) {
@@ -150,6 +170,27 @@ function buildWhereClause(query: Request["query"]): {
 }
 
 /* ─── INTERFACES ──────────────────────────────────────────────────────────── */
+interface DocumentRow {
+  fileName:    string;
+  fileType:    string;
+  evidenceUrl: string;
+  description: string;
+  status:      string;
+}
+
+interface SubmissionRow {
+  submissionId:  string;
+  quarter:       number;
+  year:          number;
+  achievedValue: number;
+  notes:         string;
+  reviewStatus:  string;
+  submittedAt:   string;
+  adminComment?: string;
+  resubmissionCount?: number;
+  documents:     DocumentRow[];
+}
+
 interface IndicatorRow {
   planId:               string;
   perspective:          string;
@@ -172,25 +213,6 @@ interface IndicatorRow {
   assigneeId:           string;
   assigneeDisplayName:  string;
   submissions:          SubmissionRow[];
-}
-
-interface SubmissionRow {
-  submissionId:  string;
-  quarter:       number;
-  year:          number;
-  achievedValue: number;
-  notes:         string;
-  reviewStatus:  string;
-  submittedAt:   string;
-  documents:     DocumentRow[];
-}
-
-interface DocumentRow {
-  fileName:    string;
-  fileType:    string;
-  evidenceUrl: string;
-  description: string;
-  status:      string;
 }
 
 interface GroupedActivity {
@@ -284,31 +306,37 @@ function groupByPerspective(rows: IndicatorRow[]): GroupedPerspective[] {
   }));
 }
 
+/* ─── HELPER: Get the best submission to display ──────────────────────────── */
+function getBestSubmission(submissions: SubmissionRow[]): SubmissionRow | null {
+  if (!submissions || submissions.length === 0) return null;
+
+  // Priority order: Accepted > Verified > Partially Approved > Pending
+  const priorityOrder = ['Accepted', 'Verified', 'Partially Approved', 'Pending'];
+  
+  for (const status of priorityOrder) {
+    const found = submissions.find(s => s.reviewStatus === status);
+    if (found) return found;
+  }
+  
+  return submissions.reduce((latest, current) => {
+    return new Date(current.submittedAt) > new Date(latest.submittedAt) ? current : latest;
+  });
+}
+
 /* ─── HELPER: Format evidence for PDF (matches UI display) ── */
 function formatEvidenceForPdf(submissions: SubmissionRow[]): string {
   if (!submissions || submissions.length === 0) {
     return "";
   }
 
-  const validSubmissions = submissions.filter(
-    (s) => s.reviewStatus !== 'Rejected'
-  );
+  const bestSubmission = getBestSubmission(submissions);
+  if (!bestSubmission) return "";
 
-  if (validSubmissions.length === 0) {
-    return "";
-  }
-
-  const latestSubmission = validSubmissions.reduce((latest, current) => {
-    const latestDate = new Date(latest.submittedAt);
-    const currentDate = new Date(current.submittedAt);
-    return currentDate > latestDate ? current : latest;
-  });
-
-  const documentsWithDescriptions = latestSubmission.documents?.filter(
+  const documentsWithDescriptions = bestSubmission.documents?.filter(
     (doc) => doc.description?.trim()
   ) || [];
 
-  const hasNotes = latestSubmission.notes?.trim();
+  const hasNotes = bestSubmission.notes?.trim();
   const hasDocuments = documentsWithDescriptions.length > 0;
 
   if (!hasNotes && !hasDocuments) {
@@ -317,7 +345,7 @@ function formatEvidenceForPdf(submissions: SubmissionRow[]): string {
 
   let evidenceText = "";
   if (hasNotes) {
-    evidenceText += latestSubmission.notes;
+    evidenceText += bestSubmission.notes;
   }
   if (hasDocuments) {
     if (hasNotes) evidenceText += "\n\n";
@@ -333,26 +361,17 @@ function formatEvidenceForPdf(submissions: SubmissionRow[]): string {
 function getEvidenceLines(submissions: SubmissionRow[]): { isBullet: boolean; text: string }[] {
   if (!submissions || submissions.length === 0) return [];
 
-  const validSubmissions = submissions.filter(
-    (s) => s.reviewStatus !== 'Rejected'
-  );
+  const bestSubmission = getBestSubmission(submissions);
+  if (!bestSubmission) return [];
 
-  if (validSubmissions.length === 0) return [];
-
-  const latestSubmission = validSubmissions.reduce((latest, current) => {
-    const latestDate = new Date(latest.submittedAt);
-    const currentDate = new Date(current.submittedAt);
-    return currentDate > latestDate ? current : latest;
-  });
-
-  const documentsWithDescriptions = latestSubmission.documents?.filter(
+  const documentsWithDescriptions = bestSubmission.documents?.filter(
     (doc) => doc.description?.trim()
   ) || [];
 
   const lines: { isBullet: boolean; text: string }[] = [];
 
-  if (latestSubmission.notes?.trim()) {
-    lines.push({ isBullet: false, text: latestSubmission.notes.trim() });
+  if (bestSubmission.notes?.trim()) {
+    lines.push({ isBullet: false, text: bestSubmission.notes.trim() });
   }
 
   documentsWithDescriptions.forEach((doc) => {
@@ -378,6 +397,9 @@ const UI_COLORS = {
   pendingBg:      "#fef3c7",
   pendingText:    "#b45309",
   pendingBorder:  "#fde68a",
+  partialBg:      "#ede9fe",
+  partialText:    "#6d28d9",
+  partialBorder:  "#c4b5fd",
   rowAlt:         "#fcfcf7",
 };
 
@@ -462,11 +484,30 @@ function drawStatusPill(
   rowY: number,
   rowHeight: number
 ): void {
-  const isCompleted = status === "Completed";
-  const label = isCompleted ? "COMPLETE" : "INCOMPLETE";
-  const bg = isCompleted ? UI_COLORS.completeBg : UI_COLORS.pendingBg;
-  const border = isCompleted ? UI_COLORS.completeBorder : UI_COLORS.pendingBorder;
-  const text = isCompleted ? UI_COLORS.completeText : UI_COLORS.pendingText;
+  let isCompleted = status === "Completed";
+  let isPartiallyApproved = status === "Partially Approved" || status === "Awaiting Super Admin";
+  
+  let label: string;
+  let bg: string;
+  let border: string;
+  let text: string;
+  
+  if (isCompleted) {
+    label = "COMPLETE";
+    bg = UI_COLORS.completeBg;
+    border = UI_COLORS.completeBorder;
+    text = UI_COLORS.completeText;
+  } else if (isPartiallyApproved) {
+    label = "PARTIAL";
+    bg = UI_COLORS.partialBg;
+    border = UI_COLORS.partialBorder;
+    text = UI_COLORS.partialText;
+  } else {
+    label = "NO SUBMISSION";
+    bg = UI_COLORS.pendingBg;
+    border = UI_COLORS.pendingBorder;
+    text = UI_COLORS.pendingText;
+  }
 
   const colWidth = COL_WIDTHS[STATUS_COL_INDEX];
   const pillFontSize = 6.5;
@@ -774,16 +815,13 @@ export const getTrackerPdf = asyncHandler(
 
       // ── Iterate through objectives ──
       for (const obj of persp.objectives) {
-        // Show objective as the main indicator row
-        const isFirstObjective = true;
         let firstActivity = true;
 
         for (const act of obj.activities) {
           for (const ind of act.indicators) {
+            const bestSubmission = getBestSubmission(ind.submissions || []);
             const evidenceText = formatEvidenceForPdf(ind.submissions || []);
 
-            // For the first activity of each objective, show the objective title
-            // as the indicator name, otherwise leave it blank (for subsequent activities)
             let indicatorCell = "";
             if (firstActivity) {
               indicatorCell = obj.title?.trim() || act.description;
@@ -797,13 +835,38 @@ export const getTrackerPdf = asyncHandler(
             }
             evidenceDisplayText = evidenceDisplayText.trim();
 
+            let notesText = act.description;
+            if (bestSubmission) {
+              notesText += `\n[${bestSubmission.reviewStatus}]`;
+              if (bestSubmission.adminComment) {
+                notesText += `\nAdmin: ${bestSubmission.adminComment}`;
+              }
+              if (bestSubmission.resubmissionCount && bestSubmission.resubmissionCount > 0) {
+                notesText += `\nResubmission #${bestSubmission.resubmissionCount}`;
+              }
+            } else {
+              notesText += `\n[No Submission]`;
+            }
+            if (ind.instructions) {
+              notesText += `\n${ind.instructions}`;
+            }
+
+            const hasSubmission = ind.submissions && ind.submissions.length > 0;
+            let statusLabel = ind.status;
+            if (!hasSubmission) {
+              statusLabel = "NO SUBMISSION";
+            }
+
             const cells = [
               indicatorCell,
               ind.unit || "%",
-              act.description + (ind.instructions ? `\n${ind.instructions}` : ""),
+              notesText,
               ind.assigneeDisplayName || "Unassigned",
               evidenceDisplayText || "",
-              ind.status === "Completed" ? "COMPLETE" : "INCOMPLETE",
+              statusLabel === "NO SUBMISSION" ? "NO SUBMISSION" :
+              ind.status === "Completed" ? "COMPLETE" : 
+              ind.status === "Partially Approved" || ind.status === "Awaiting Super Admin" ? "PARTIAL" :
+              "NO SUBMISSION",
             ];
 
             const estLines = cells.reduce((max, text, i) => {
