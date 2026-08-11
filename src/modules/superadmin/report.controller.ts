@@ -1548,7 +1548,7 @@ function drawPerspectiveHeader(
 
 const LOGO_URL =
   process.env.TRACKER_LOGO_URL ||
-  "https://res.cloudinary.com/do0yflasl/image/upload/v1781759596/JOB_LOGO_ubls4m.jpg";
+  "https://res.cloudinary.com/do0yflasl/image/upload/v1784363826/ORHC_L_crclut.jpg";
 
 async function fetchLogoBuffer(
   url: string
