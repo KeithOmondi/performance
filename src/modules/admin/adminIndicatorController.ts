@@ -107,6 +107,7 @@ interface QuarterStatus {
   isPartial: boolean;
   isPending: boolean;
   isRejected: boolean;
+  isSentBack: boolean;
   documents: any[];
 }
 
@@ -159,6 +160,7 @@ async function getQuarterStatuses(
       isPartial: row.reviewStatus === 'Partially Approved',
       isPending: row.reviewStatus === 'Pending' || hasPending,
       isRejected: row.reviewStatus === 'Rejected' || hasRejected,
+      isSentBack: row.reviewStatus === 'Sent Back to Admin',
       documents: docs,
     };
   });
@@ -193,12 +195,15 @@ async function recalcIndicatorStatusFromQuarters(
   const hasPending = quarterStatuses.some(q => q.isPending);
   const hasRejected = quarterStatuses.some(q => q.isRejected);
   const hasPartial = quarterStatuses.some(q => q.isPartial);
+  const hasSentBack = quarterStatuses.some(q => q.isSentBack);
   const allComplete = quarterStatuses.every(q => q.isComplete);
   const anyComplete = quarterStatuses.some(q => q.isComplete);
 
   let indicatorStatus: string;
   if (allComplete) {
     indicatorStatus = "Completed";
+  } else if (hasSentBack) {
+    indicatorStatus = "Awaiting Admin Approval";
   } else if (hasRejected) {
     indicatorStatus = "Correction Needed";
   } else if (hasPending) {
@@ -741,8 +746,6 @@ export const approveQuarter = asyncHandler(
       );
       const indicator = indicatorRows[0];
 
-      // TODO: Create quarterApprovedTemplate function
-      // For now, use a simple email
       sendMail({
         to: indicator.assignee_email,
         subject: `✅ ${quarterLabel} ${submission.year} Approved`,
@@ -845,7 +848,6 @@ export const rejectQuarter = asyncHandler(
       );
       const indicator = indicatorRows[0];
 
-      // TODO: Create quarterRejectedTemplate function
       sendMail({
         to: indicator.assignee_email,
         subject: `❌ ${quarterLabel} ${submission.year} Rejected`,
@@ -1342,5 +1344,113 @@ export const rejectSubmission = asyncHandler(
     } finally {
       client.release();
     }
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  15. GET Indicators Sent Back to Admin (NEW)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const getSentBackIndicators = asyncHandler(
+  async (_req: Request, res: Response) => {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT 
+         i.id,
+         i.name,
+         i.status,
+         i.progress,
+         i.weight,
+         i.unit,
+         i.target,
+         i.reporting_cycle                 AS "reportingCycle",
+         i.active_quarter                  AS "activeQuarter",
+         i.deadline,
+         i.updated_at                      AS "updatedAt",
+         i.admin_overall_comments          AS "adminOverallComments",
+         i.instructions,
+         COALESCE(u.name,  t.name)         AS "assigneeName",
+         COALESCE(u.email, t.email)        AS "assigneeEmail",
+         u.pj_number                       AS "pjNumber",
+         sp.perspective,
+         jsonb_build_object('title',       so.title)       AS objective,
+         jsonb_build_object('description', sa.description) AS activity,
+         rh.at                             AS "sentBackAt",  -- ✅ Added to SELECT list for ORDER BY
+         rh.reason                         AS "sentBackReason" -- ✅ Added to SELECT list
+       FROM indicators i
+       JOIN review_history rh ON rh.indicator_id = i.id
+       LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+       LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+       LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
+       LEFT JOIN strategic_objectives so ON i.objective_id = so.id
+       LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+       WHERE rh.action = 'Sent Back to Admin'
+         AND i.status = 'Awaiting Admin Approval'
+       ORDER BY rh.at DESC`,
+    );
+
+    const ids = rows.map((r: any) => r.id);
+    if (ids.length === 0) {
+      return res.status(200).json({ success: true, count: 0, data: [] });
+    }
+
+    const data = await attachSubmissionsToIndicators(rows, {
+      includeReviewHistory: true,
+    });
+
+    res.status(200).json({ success: true, count: data.length, data });
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  16. GET Returned/Rejected Indicators (Admin)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const getReturnedIndicators = asyncHandler(
+  async (_req: Request, res: Response) => {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT 
+         i.id,
+         i.name,
+         i.status,
+         i.progress,
+         i.weight,
+         i.unit,
+         i.target,
+         i.reporting_cycle                 AS "reportingCycle",
+         i.active_quarter                  AS "activeQuarter",
+         i.deadline,
+         i.updated_at                      AS "updatedAt",
+         i.admin_overall_comments          AS "adminOverallComments",
+         i.instructions,
+         COALESCE(u.name,  t.name)         AS "assigneeName",
+         COALESCE(u.email, t.email)        AS "assigneeEmail",
+         u.pj_number                       AS "pjNumber",
+         sp.perspective,
+         jsonb_build_object('title',       so.title)       AS objective,
+         jsonb_build_object('description', sa.description) AS activity,
+         s.review_status                   AS "submissionReviewStatus",  -- ✅ Added to SELECT list
+         s.submitted_at                    AS "lastSubmittedAt"          -- ✅ Added to SELECT list
+       FROM indicators i
+       JOIN submissions s ON s.indicator_id = i.id
+       LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+       LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+       LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
+       LEFT JOIN strategic_objectives so ON i.objective_id = so.id
+       LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
+       WHERE s.review_status IN ('Rejected', 'Correction Needed')
+          OR i.status IN ('Correction Needed', 'Rejected by Admin')
+       ORDER BY s.submitted_at DESC`,
+    );
+
+    const ids = rows.map((r: any) => r.id);
+    if (ids.length === 0) {
+      return res.status(200).json({ success: true, count: 0, data: [] });
+    }
+
+    const data = await attachSubmissionsToIndicators(rows, {
+      includeReviewHistory: true,
+    });
+
+    res.status(200).json({ success: true, count: data.length, data });
   },
 );

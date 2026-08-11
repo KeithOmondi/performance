@@ -67,9 +67,19 @@ const INDICATOR_JOINS = `
 
 /* ─── HELPERS ─────────────────────────────────────────────────────────────── */
 
+/* ─── HELPERS ─────────────────────────────────────────────────────────────── */
+
 const isUUID = (val: any): boolean =>
   typeof val === "string" &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+
+// ✅ Safe ID extraction from route parameters
+const extractId = (id: string | string[]): string => {
+  if (Array.isArray(id)) {
+    return id[0];
+  }
+  return id;
+};
 
 async function resolveRecipients(
   assigneeId: string,
@@ -127,6 +137,45 @@ async function getCurrentQuarter(indicatorId: string): Promise<number> {
   return rows[0]?.active_quarter || 1;
 }
 
+async function getIndicatorAssignees(indicatorId: string): Promise<any[]> {
+  const { rows } = await pool.query(
+    `SELECT 
+       ia.user_id AS "userId",
+       ia.is_primary AS "isPrimary",
+       u.name,
+       u.email,
+       u.pj_number AS "pjNumber"
+     FROM indicator_assignees ia
+     JOIN users u ON ia.user_id = u.id
+     WHERE ia.indicator_id = $1
+     ORDER BY ia.is_primary DESC, u.name ASC`,
+    [indicatorId]
+  );
+  return rows;
+}
+
+// ✅ Filter deleted documents from submissions
+function filterDeletedDocuments(submissions: any[]): any[] {
+  return submissions.map((sub: any) => ({
+    ...sub,
+    documents: (sub.documents || []).filter((doc: any) => doc.status !== 'Deleted'),
+  }));
+}
+
+// ✅ Filter deleted documents from grouped submissions
+function filterGroupedSubmissions(submissions: Record<string, any[]>): Record<string, any[]> {
+  const result: Record<string, any[]> = {};
+  for (const [key, subs] of Object.entries(submissions)) {
+    result[key] = subs.map((sub: any) => ({
+      ...sub,
+      documents: (sub.documents || []).filter((doc: any) => doc.status !== 'Deleted'),
+    }));
+  }
+  return result;
+}
+
+
+
 /* ─── 1. CREATE INDICATOR ─────────────────────────────────────────────────── */
 
 export const createIndicator = asyncHandler(
@@ -144,17 +193,15 @@ export const createIndicator = asyncHandler(
       deadline,
       instructions,
       activeQuarter,
-      additionalAssignees = [], // NEW: Array of additional user IDs for multi-assignee
+      additionalAssignees = [],
     } = req.body;
 
     const adminId = (req as any).user?.id;
 
-    // Validate required fields
     if (!strategicPlanId || !objectiveId || !activityId) {
       throw new AppError("Strategic Plan, Objective, and Activity are required.", 400);
     }
 
-    // ✅ CHECK IF INDICATOR ALREADY EXISTS FOR THIS ACTIVITY
     const existingIndicator = await pool.query(
       `SELECT id, assignee_id, status, is_multi_assignee FROM indicators WHERE activity_id = $1 AND deleted_at IS NULL`,
       [activityId]
@@ -163,7 +210,6 @@ export const createIndicator = asyncHandler(
     if (existingIndicator.rows.length > 0) {
       const existing = existingIndicator.rows[0];
       
-      // Update the existing indicator
       await pool.query(
         `UPDATE indicators
          SET strategic_plan_id = COALESCE($1, strategic_plan_id),
@@ -195,20 +241,17 @@ export const createIndicator = asyncHandler(
           assignee && assignee !== "unassigned" ? assignee : null,
           assignmentType === "Team" ? "Team" : "User",
           adminId,
-          additionalAssignees.length > 0, // is_multi_assignee
+          additionalAssignees.length > 0,
           existing.id
         ]
       );
 
-      // Handle multi-assignee updates
       if (additionalAssignees.length > 0) {
-        // Clear existing additional assignees
         await pool.query(
           "DELETE FROM indicator_assignees WHERE indicator_id = $1 AND is_primary = false",
           [existing.id]
         );
         
-        // Add new additional assignees
         for (const userId of additionalAssignees) {
           await pool.query(
             `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
@@ -219,14 +262,17 @@ export const createIndicator = asyncHandler(
         }
       }
 
-      // Fetch and return the updated indicator
       const { rows: updatedRows } = await pool.query(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
         [existing.id]
       );
 
-      // Get all assignees for the response
       const allAssignees = await getIndicatorAssignees(existing.id);
+      
+      // ✅ Filter deleted documents
+      if (updatedRows[0]?.submissions) {
+        updatedRows[0].submissions = filterGroupedSubmissions(updatedRows[0].submissions);
+      }
 
       res.status(200).json({
         success: true,
@@ -236,7 +282,6 @@ export const createIndicator = asyncHandler(
       return;
     }
 
-    // ✅ No existing indicator - create new one
     const isMultiAssignee = additionalAssignees.length > 0;
     const primaryAssignee = assignee && assignee !== "unassigned" ? assignee : null;
     const assigneeModel = assignmentType === "Team" ? "Team" : "User";
@@ -286,16 +331,13 @@ export const createIndicator = asyncHandler(
 
     const indicatorId = newRows[0].id;
 
-    // Add additional assignees if multi-assignee
     if (isMultiAssignee && primaryAssignee) {
-      // Add primary as first assignee
       await pool.query(
         `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
          VALUES ($1, $2, true)`,
         [indicatorId, primaryAssignee]
       );
 
-      // Add additional assignees
       for (const userId of additionalAssignees) {
         if (userId !== primaryAssignee) {
           await pool.query(
@@ -313,8 +355,12 @@ export const createIndicator = asyncHandler(
       [indicatorId]
     );
 
-    // Get all assignees for the response
     const allAssignees = await getIndicatorAssignees(indicatorId);
+    
+    // ✅ Filter deleted documents
+    if (createdRows[0]?.submissions) {
+      createdRows[0].submissions = filterGroupedSubmissions(createdRows[0].submissions);
+    }
 
     res.status(201).json({
       success: true,
@@ -367,10 +413,14 @@ export const getAllIndicators = asyncHandler(
       params
     );
 
-    // Enrich with all assignees for multi-assignee indicators
+    // Enrich with all assignees and filter deleted documents
     for (const row of rows) {
       if (row.isMultiAssignee) {
         row.allAssignees = await getIndicatorAssignees(row.id);
+      }
+      // ✅ Filter out deleted documents
+      if (row.submissions) {
+        row.submissions = filterGroupedSubmissions(row.submissions);
       }
     }
 
@@ -392,7 +442,6 @@ export const getIndicatorById = asyncHandler(
 
     const indicator = rows[0];
 
-    // Get all assignees if multi-assignee
     if (indicator.isMultiAssignee) {
       indicator.allAssignees = await getIndicatorAssignees(id);
     }
@@ -432,7 +481,7 @@ export const getIndicatorById = asyncHandler(
                'rejectionReason',  sd.rejection_reason,
                'uploadedAt',       sd.uploaded_at
              )
-           ) FILTER (WHERE sd.id IS NOT NULL),
+           ) FILTER (WHERE sd.id IS NOT NULL AND sd.status != 'Deleted'), -- ✅ Filter out deleted documents
            '[]'::json
          ) AS "documents"
        FROM latest_submissions s
@@ -466,9 +515,30 @@ export const getIndicatorById = asyncHandler(
       [id]
     );
 
+    // ✅ Group submissions by period for consistency
+    const groupedSubmissions = submissions.reduce((acc: Record<string, any[]>, sub: any) => {
+      const key = sub.quarter === 0 ? `Annual_${sub.year}` : `Q${sub.quarter}_${sub.year}`;
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(sub);
+      return acc;
+    }, {});
+
+    // ✅ Filter out submissions with no documents after deletion filter
+    const filteredSubmissions: Record<string, any[]> = {};
+    for (const [key, subs] of Object.entries(groupedSubmissions)) {
+      const filtered = subs.filter((sub: any) => sub.documents && sub.documents.length > 0);
+      if (filtered.length > 0) {
+        filteredSubmissions[key] = filtered;
+      }
+    }
+
     res.status(200).json({
       success: true,
-      data: { ...indicator, submissions, reviewHistory },
+      data: { 
+        ...indicator, 
+        submissions: filteredSubmissions, 
+        reviewHistory 
+      },
     });
   }
 );
@@ -536,9 +606,13 @@ export const updateIndicator = asyncHandler(
         [id]
       );
 
-      // Get all assignees if multi-assignee
       if (rows[0]?.isMultiAssignee) {
         rows[0].allAssignees = await getIndicatorAssignees(id);
+      }
+
+      // ✅ Filter deleted documents
+      if (rows[0]?.submissions) {
+        rows[0].submissions = filterGroupedSubmissions(rows[0].submissions);
       }
 
       res.status(200).json({ success: true, data: rows[0] });
@@ -566,7 +640,6 @@ export const deleteIndicator = asyncHandler(
       throw new AppError("Cannot delete completed task.", 400);
     }
 
-    // Clean up indicator_assignees
     await pool.query("DELETE FROM indicator_assignees WHERE indicator_id = $1", [id]);
     await pool.query("DELETE FROM indicators WHERE id = $1", [id]);
     
@@ -587,6 +660,14 @@ export const getRejectedByAdmin = asyncHandler(
        )
        ORDER BY i.updated_at DESC`
     );
+
+    // ✅ Filter deleted documents
+    for (const row of rows) {
+      if (row.submissions) {
+        row.submissions = filterGroupedSubmissions(row.submissions);
+      }
+    }
+
     res.status(200).json({ success: true, count: rows.length, data: rows });
   }
 );
@@ -661,7 +742,6 @@ export const superAdminReviewProcess = asyncHandler(
         throw new AppError("This submission has already been approved.", 400);
       }
 
-      // Get assignee information
       if (indicator.is_multi_assignee) {
         const assignees = await getIndicatorAssignees(id);
         const userIds = assignees.map((a: any) => a.userId);
@@ -674,7 +754,6 @@ export const superAdminReviewProcess = asyncHandler(
         assigneeInfo = { emails, displayName };
       }
 
-      // Calculate new totals
       const currentTotal = indicator.current_total_achieved || 0;
       let newTotal: number;
       let newProgress: number;
@@ -698,7 +777,6 @@ export const superAdminReviewProcess = asyncHandler(
             approvalMessage = `Partially approved: +${approvedAmount}%. Current total: ${newProgress}%. Remaining: ${100 - newProgress}%`;
           }
           
-          // scoped to the specific submission row (submission.id)
           await client.query(
             `UPDATE submissions
              SET review_status = 'Partially Approved', 
@@ -710,18 +788,11 @@ export const superAdminReviewProcess = asyncHandler(
             [approvalMessage, approvedAmount, submission.id]
           );
         } else {
-          // OVERRIDE: a full/final approval always completes the indicator
-          // to its target (100%), regardless of progressOverride sent by the
-          // client and regardless of currentTotal. The old strict check
-          // (throwing unless approvedAmount exactly matched the remaining
-          // gap) has been removed.
           newTotal = indicator.target;
           newProgress = 100;
-
           newStatus = "Completed";
           approvalMessage = `Fully approved: ${newProgress}% complete`;
 
-          // scoped to the specific submission row (submission.id)
           await client.query(
             `UPDATE submissions
              SET review_status = 'Accepted', 
@@ -763,7 +834,6 @@ export const superAdminReviewProcess = asyncHandler(
       } else {
         newStatus = "Rejected by Super Admin";
         
-        // scoped to the specific submission row (submission.id)
         await client.query(
           `UPDATE submissions
            SET review_status = 'Rejected', 
@@ -797,7 +867,11 @@ export const superAdminReviewProcess = asyncHandler(
         [id]
       );
 
-      // Send email notifications
+      // ✅ Filter deleted documents
+      if (updatedRows[0]?.submissions) {
+        updatedRows[0].submissions = filterGroupedSubmissions(updatedRows[0].submissions);
+      }
+
       const activityRes = await pool.query(
         `SELECT sa.description AS "activityDescription"
          FROM strategic_activities sa
@@ -809,7 +883,6 @@ export const superAdminReviewProcess = asyncHandler(
       const periodYear = targetYear;
       const periodLabel = targetQuarter === 0 ? "Annual" : `Q${targetQuarter}`;
 
-      // Send emails based on assignee type
       if (indicator.is_multi_assignee && multiAssigneeInfo) {
         const emailPromises = multiAssigneeInfo.emails.map((email, index) => {
           const displayName = multiAssigneeInfo!.displayNames[index] || "Team Member";
@@ -1029,6 +1102,11 @@ export const reopenIndicator = asyncHandler(
         rows[0].allAssignees = await getIndicatorAssignees(id);
       }
 
+      // ✅ Filter deleted documents
+      if (rows[0]?.submissions) {
+        rows[0].submissions = filterGroupedSubmissions(rows[0].submissions);
+      }
+
       res.status(200).json({ success: true, data: rows[0] });
     } catch (e) {
       await client.query("ROLLBACK");
@@ -1039,7 +1117,7 @@ export const reopenIndicator = asyncHandler(
   }
 );
 
-/* ─── 10. GET ALL SUBMISSIONS ─────────────────────────────────────────────── */
+/* ─── 10. GET ALL SUBMISSIONS (QUEUE) ────────────────────────────────────── */
 
 export const getAllSubmissions = asyncHandler(
   async (_req: Request, res: Response) => {
@@ -1080,10 +1158,10 @@ export const getAllSubmissions = asyncHandler(
               'rejectionReason',  sd.rejection_reason,
               'uploadedAt',       sd.uploaded_at
             )
-          ) FILTER (WHERE sd.id IS NOT NULL),
+          ) FILTER (WHERE sd.id IS NOT NULL AND sd.status != 'Deleted'), -- ✅ Filter out deleted documents
           '[]'
         )                            AS "documents",
-        COUNT(sd.id)                 AS "documentsCount"
+        COUNT(sd.id) FILTER (WHERE sd.status != 'Deleted') AS "documentsCount" -- ✅ Only count non-deleted documents
 
       FROM submissions s
       JOIN    indicators i           ON s.indicator_id = i.id
@@ -1091,6 +1169,10 @@ export const getAllSubmissions = asyncHandler(
       LEFT JOIN teams t              ON i.assignee_id = t.id AND i.assignee_model = 'Team'
       LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
       LEFT JOIN submission_documents sd ON sd.submission_id = s.id
+
+      -- ✅ Only show submissions that need super admin attention
+      WHERE i.status = 'Awaiting Super Admin'
+         OR (i.status = 'Completed' AND s.review_status = 'Accepted')
 
       GROUP BY
         i.id, i.status, i.assignee_model, i.active_quarter, i.is_multi_assignee,
@@ -1105,7 +1187,7 @@ export const getAllSubmissions = asyncHandler(
     const queue = rows.map((row) => ({
       ...row,
       quarter: row.quarter,
-      documentsCount: parseInt(row.documentsCount, 10),
+      documentsCount: parseInt(row.documentsCount || '0', 10),
     }));
 
     res.status(200).json({ success: true, count: queue.length, data: queue });
@@ -1174,7 +1256,6 @@ export const unassignIndicator = asyncHandler(
       throw new AppError("Indicator is already unassigned.", 400);
     }
 
-    // Clean up indicator_assignees
     await pool.query(
       "DELETE FROM indicator_assignees WHERE indicator_id = $1",
       [id]
@@ -1197,6 +1278,11 @@ export const unassignIndicator = asyncHandler(
       `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
       [id]
     );
+
+    // ✅ Filter deleted documents
+    if (updated[0]?.submissions) {
+      updated[0].submissions = filterGroupedSubmissions(updated[0].submissions);
+    }
 
     res.status(200).json({ 
       success: true, 
@@ -1287,15 +1373,24 @@ export const getAssignedIndicators = asyncHandler(
        ORDER BY i.created_at DESC`
     );
 
-    const enrichedRows = await Promise.all(rows.map(async (row) => ({
-      ...row,
-      needsAction:
-        row.status === "Awaiting Admin Approval" ||
-        row.status === "Awaiting Super Admin",
-      isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
-      completionPercentage: row.progress || 0,
-      allAssignees: row.isMultiAssignee ? await getIndicatorAssignees(row.id) : undefined,
-    })));
+    const enrichedRows = await Promise.all(rows.map(async (row) => {
+      const enriched = {
+        ...row,
+        needsAction:
+          row.status === "Awaiting Admin Approval" ||
+          row.status === "Awaiting Super Admin",
+        isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
+        completionPercentage: row.progress || 0,
+        allAssignees: row.isMultiAssignee ? await getIndicatorAssignees(row.id) : undefined,
+      };
+      
+      // ✅ Filter deleted documents
+      if (enriched.submissions) {
+        enriched.submissions = filterGroupedSubmissions(enriched.submissions);
+      }
+      
+      return enriched;
+    }));
 
     res.status(200).json({
       success: true,
@@ -1324,6 +1419,13 @@ export const getUnassignedIndicators = asyncHandler(
       completionPercentage: 0,
     }));
 
+    // ✅ Filter deleted documents
+    for (const row of enrichedRows) {
+      if (row.submissions) {
+        row.submissions = filterGroupedSubmissions(row.submissions);
+      }
+    }
+
     res.status(200).json({
       success: true,
       count: enrichedRows.length,
@@ -1350,22 +1452,33 @@ export const getReviewIndicators = asyncHandler(
          GROUP BY indicator_id
        ) ps ON ps.indicator_id = i.id
 
-       WHERE i.status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')
-          OR ps.pending_count > 0
+       -- ✅ ONLY show indicators that need SUPER ADMIN review
+       -- NOT indicators that need ADMIN review
+       WHERE i.status = 'Awaiting Super Admin'
+          OR (i.status = 'Awaiting Admin Approval' AND ps.pending_count > 0)
 
        ORDER BY i.updated_at DESC`
     );
 
-    const enrichedRows = await Promise.all(rows.map(async (row) => ({
-      ...row,
-      needsAction:
-        row.pendingSubmissionCount > 0 ||
-        row.status === "Awaiting Admin Approval" ||
-        row.status === "Awaiting Super Admin",
-      isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
-      completionPercentage: row.progress || 0,
-      allAssignees: row.isMultiAssignee ? await getIndicatorAssignees(row.id) : undefined,
-    })));
+    const enrichedRows = await Promise.all(rows.map(async (row) => {
+      const enriched = {
+        ...row,
+        needsAction:
+          row.pendingSubmissionCount > 0 ||
+          row.status === "Awaiting Admin Approval" ||
+          row.status === "Awaiting Super Admin",
+        isOverdue: row.deadline ? new Date(row.deadline) < new Date() : false,
+        completionPercentage: row.progress || 0,
+        allAssignees: row.isMultiAssignee ? await getIndicatorAssignees(row.id) : undefined,
+      };
+      
+      // ✅ Filter deleted documents
+      if (enriched.submissions) {
+        enriched.submissions = filterGroupedSubmissions(enriched.submissions);
+      }
+      
+      return enriched;
+    }));
 
     res.status(200).json({
       success: true,
@@ -1476,11 +1589,21 @@ export const getSuperAdminApprovedIndicators = asyncHandler(
       ORDER BY i.updated_at DESC
     `);
 
+    // ✅ Filter deleted documents
+    for (const row of rows) {
+      if (row.isMultiAssignee) {
+        row.allAssignees = await getIndicatorAssignees(row.id);
+      }
+      if (row.submissions) {
+        row.submissions = filterGroupedSubmissions(row.submissions);
+      }
+    }
+
     res.status(200).json({ success: true, data: rows });
   }
 );
 
-/* ─── 19. ASSIGN INDICATOR (for existing unassigned indicators) ──────────── */
+/* ─── 19. ASSIGN INDICATOR ────────────────────────────────────────────────── */
 
 export const assignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
@@ -1525,7 +1648,6 @@ export const assignIndicator = asyncHandler(
         [assigneeId, type, adminId, id]
       );
 
-      // Clear any existing multi-assignee records
       await client.query(
         "DELETE FROM indicator_assignees WHERE indicator_id = $1",
         [id]
@@ -1537,6 +1659,11 @@ export const assignIndicator = asyncHandler(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
         [id]
       );
+
+      // ✅ Filter deleted documents
+      if (updated[0]?.submissions) {
+        updated[0].submissions = filterGroupedSubmissions(updated[0].submissions);
+      }
 
       const { rows: activityRows } = await pool.query(
         `SELECT sa.description AS "activityDescription"
@@ -1589,7 +1716,7 @@ export const assignIndicator = asyncHandler(
   }
 );
 
-/* ─── 20. REASSIGN INDICATOR (replace primary assignee) ──────────────────── */
+/* ─── 20. REASSIGN INDICATOR ──────────────────────────────────────────────── */
 
 export const reassignIndicator = asyncHandler(
   async (req: Request, res: Response) => {
@@ -1610,7 +1737,6 @@ export const reassignIndicator = asyncHandler(
     try {
       await client.query("BEGIN");
 
-      // Get current indicator details - FIXED: Use string for id
       const indicatorId = Array.isArray(id) ? id[0] : id;
       const indRes = await client.query(
         `SELECT i.id, i.assignee_id, i.assignee_model, i.status, i.is_multi_assignee, 
@@ -1633,13 +1759,11 @@ export const reassignIndicator = asyncHandler(
         throw new AppError("Cannot reassign an unassigned indicator. Please use assign endpoint.", 400);
       }
 
-      // Get old assignee info for email
       let oldAssigneeInfo = null;
       if (!indicator.is_multi_assignee) {
         oldAssigneeInfo = await resolveRecipients(oldAssigneeId, oldAssigneeModel);
       }
 
-      // Update primary assignee
       const type = newAssigneeModel === "Team" ? "Team" : "User";
       await client.query(
         `UPDATE indicators
@@ -1651,9 +1775,7 @@ export const reassignIndicator = asyncHandler(
         [newAssigneeId, type, adminId, indicatorId]
       );
 
-      // If multi-assignee, update the assignees table
       if (indicator.is_multi_assignee) {
-        // Remove old primary and add new primary
         await client.query(
           `DELETE FROM indicator_assignees WHERE indicator_id = $1 AND is_primary = true`,
           [indicatorId]
@@ -1667,7 +1789,6 @@ export const reassignIndicator = asyncHandler(
         );
       }
 
-      // Record the reassignment in review history
       await client.query(
         `INSERT INTO review_history
            (indicator_id, action, reason, reviewer_role, reviewed_by)
@@ -1677,7 +1798,6 @@ export const reassignIndicator = asyncHandler(
 
       await client.query("COMMIT");
 
-      // Fetch updated indicator
       const { rows: updated } = await pool.query(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
         [indicatorId]
@@ -1687,10 +1807,13 @@ export const reassignIndicator = asyncHandler(
         updated[0].allAssignees = await getIndicatorAssignees(indicatorId);
       }
 
-      // Send notifications
+      // ✅ Filter deleted documents
+      if (updated[0]?.submissions) {
+        updated[0].submissions = filterGroupedSubmissions(updated[0].submissions);
+      }
+
       const activityDescription = indicator.activityDescription || "Performance Indicator";
       
-      // Notify new assignee
       const newAssigneeInfo = await resolveRecipients(newAssigneeId, type);
       const emailPromises = newAssigneeInfo.emails.map((email) =>
         sendMail({
@@ -1712,7 +1835,6 @@ export const reassignIndicator = asyncHandler(
         )
       );
 
-      // Notify old assignee if different
       if (oldAssigneeInfo && oldAssigneeInfo.emails.length > 0) {
         oldAssigneeInfo.emails.forEach((email) => {
           emailPromises.push(
@@ -1753,7 +1875,7 @@ export const reassignIndicator = asyncHandler(
   }
 );
 
-/* ─── 21. ADD USERS TO TASK (multi-assignee) ────────────────────────────── */
+/* ─── 21. ADD USERS TO TASK ────────────────────────────────────────────────── */
 
 export const addUsersToIndicator = asyncHandler(
   async (req: Request, res: Response) => {
@@ -1765,7 +1887,6 @@ export const addUsersToIndicator = asyncHandler(
       throw new AppError("Please provide an array of user IDs to add.", 400);
     }
 
-    // Validate UUIDs
     for (const userId of userIds) {
       if (!isUUID(userId)) {
         throw new AppError(`Invalid user ID format: ${userId}`, 400);
@@ -1779,7 +1900,6 @@ export const addUsersToIndicator = asyncHandler(
 
       const indicatorId = Array.isArray(id) ? id[0] : id;
 
-      // Check if indicator exists
       const indRes = await client.query(
         "SELECT id, assignee_id, is_multi_assignee FROM indicators WHERE id = $1 FOR UPDATE",
         [indicatorId]
@@ -1791,9 +1911,7 @@ export const addUsersToIndicator = asyncHandler(
 
       const indicator = indRes.rows[0];
 
-      // If not already multi-assignee, convert it
       if (!indicator.is_multi_assignee) {
-        // If there's an existing assignee, add them as primary
         if (indicator.assignee_id) {
           await client.query(
             `INSERT INTO indicator_assignees (indicator_id, user_id, is_primary)
@@ -1803,17 +1921,14 @@ export const addUsersToIndicator = asyncHandler(
           );
         }
         
-        // Mark as multi-assignee
         await client.query(
           `UPDATE indicators SET is_multi_assignee = true WHERE id = $1`,
           [indicatorId]
         );
       }
 
-      // Add new users
       let addedCount = 0;
       for (const userId of userIds) {
-        // Skip if user is already primary assignee
         if (indicator.assignee_id === userId) {
           continue;
         }
@@ -1825,7 +1940,6 @@ export const addUsersToIndicator = asyncHandler(
           [indicatorId, userId]
         );
         
-        // FIXED: Check rowCount with null coalescing
         if ((result.rowCount ?? 0) > 0) {
           addedCount++;
         }
@@ -1835,7 +1949,6 @@ export const addUsersToIndicator = asyncHandler(
         throw new AppError("No new users were added. They may already be assigned to this indicator.", 400);
       }
 
-      // Record in review history
       await client.query(
         `INSERT INTO review_history
            (indicator_id, action, reason, reviewer_role, reviewed_by)
@@ -1845,7 +1958,6 @@ export const addUsersToIndicator = asyncHandler(
 
       await client.query("COMMIT");
 
-      // Fetch updated indicator
       const { rows: updated } = await pool.query(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
         [indicatorId]
@@ -1856,13 +1968,16 @@ export const addUsersToIndicator = asyncHandler(
         updated[0].allAssignees = allAssignees;
       }
 
-      // Get user details for notification
+      // ✅ Filter deleted documents
+      if (updated[0]?.submissions) {
+        updated[0].submissions = filterGroupedSubmissions(updated[0].submissions);
+      }
+
       const userDetails = await pool.query(
         `SELECT name, email FROM users WHERE id = ANY($1)`,
         [userIds]
       );
 
-      // Get activity description for email
       const activityRes = await pool.query(
         `SELECT sa.description AS "activityDescription"
          FROM strategic_activities sa
@@ -1871,7 +1986,6 @@ export const addUsersToIndicator = asyncHandler(
       );
       const activityDescription = activityRes.rows[0]?.activityDescription || "Performance Indicator";
 
-      // Send notifications to new users
       const emailPromises = userDetails.rows.map((user: any) =>
         sendMail({
           to: user.email,
@@ -1928,7 +2042,6 @@ export const removeUsersFromIndicator = asyncHandler(
 
       const indicatorId = Array.isArray(id) ? id[0] : id;
 
-      // Check if indicator exists
       const indRes = await client.query(
         "SELECT id, assignee_id, is_multi_assignee FROM indicators WHERE id = $1 FOR UPDATE",
         [indicatorId]
@@ -1944,7 +2057,6 @@ export const removeUsersFromIndicator = asyncHandler(
         throw new AppError("This indicator is not a multi-assignee task.", 400);
       }
 
-      // Check if trying to remove primary assignee
       let removedPrimary = false;
       for (const userId of userIds) {
         if (indicator.assignee_id === userId) {
@@ -1960,7 +2072,6 @@ export const removeUsersFromIndicator = asyncHandler(
         );
       }
 
-      // Remove users
       const result = await client.query(
         `DELETE FROM indicator_assignees
          WHERE indicator_id = $1 AND user_id = ANY($2) AND is_primary = false
@@ -1968,26 +2079,22 @@ export const removeUsersFromIndicator = asyncHandler(
         [indicatorId, userIds]
       );
 
-      // FIXED: Check rowCount with null coalescing
       if ((result.rowCount ?? 0) === 0) {
         throw new AppError("No users were removed. They may not be assigned to this indicator.", 400);
       }
 
-      // If no other assignees remain, convert back to single assignee
       const remainingAssignees = await client.query(
         `SELECT COUNT(*) FROM indicator_assignees WHERE indicator_id = $1`,
         [indicatorId]
       );
 
       if (parseInt(remainingAssignees.rows[0].count) <= 1) {
-        // Only primary remains, mark as not multi-assignee
         await client.query(
           `UPDATE indicators SET is_multi_assignee = false WHERE id = $1`,
           [indicatorId]
         );
       }
 
-      // Record in review history
       await client.query(
         `INSERT INTO review_history
            (indicator_id, action, reason, reviewer_role, reviewed_by)
@@ -1997,7 +2104,6 @@ export const removeUsersFromIndicator = asyncHandler(
 
       await client.query("COMMIT");
 
-      // Fetch updated indicator
       const { rows: updated } = await pool.query(
         `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
         [indicatorId]
@@ -2005,6 +2111,11 @@ export const removeUsersFromIndicator = asyncHandler(
 
       if (updated[0]?.isMultiAssignee) {
         updated[0].allAssignees = await getIndicatorAssignees(indicatorId);
+      }
+
+      // ✅ Filter deleted documents
+      if (updated[0]?.submissions) {
+        updated[0].submissions = filterGroupedSubmissions(updated[0].submissions);
       }
 
       res.status(200).json({
@@ -2021,21 +2132,218 @@ export const removeUsersFromIndicator = asyncHandler(
   }
 );
 
-/* ─── HELPER: GET INDICATOR ASSIGNEES ────────────────────────────────────── */
+/* ─── 23. SEND BACK TO ADMIN ────────────────────────────────────────────── */
 
-async function getIndicatorAssignees(indicatorId: string): Promise<any[]> {
-  const { rows } = await pool.query(
-    `SELECT 
-       ia.user_id AS "userId",
-       ia.is_primary AS "isPrimary",
-       u.name,
-       u.email,
-       u.pj_number AS "pjNumber"
-     FROM indicator_assignees ia
-     JOIN users u ON ia.user_id = u.id
-     WHERE ia.indicator_id = $1
-     ORDER BY ia.is_primary DESC, u.name ASC`,
-    [indicatorId]
-  );
-  return rows;
-}
+export const sendBackToAdmin = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { id } = req.params;
+    const indicatorId = extractId(id);
+    const { reason } = req.body;
+    const adminId = (req as any).user?.id;
+
+    if (!adminId) {
+      throw new AppError("User not authenticated.", 401);
+    }
+
+    const client = await pool.connect();
+    
+    try {
+      await client.query("BEGIN");
+
+      // ✅ FIX: Separate the FOR UPDATE query from the JOIN query
+      // First, get the indicator with FOR UPDATE (no JOINs)
+      const indRes = await client.query(
+        `SELECT i.id, i.status, i.assignee_id, i.assignee_model, 
+                i.is_multi_assignee, i.activity_id
+         FROM indicators i
+         WHERE i.id = $1 
+         FOR UPDATE`,
+        [indicatorId]
+      );
+
+      if (!indRes.rows[0]) {
+        throw new AppError("Indicator not found.", 404);
+      }
+
+      const indicator = indRes.rows[0];
+
+      // Get the activity description separately (no FOR UPDATE needed)
+      const activityRes = await client.query(
+        `SELECT sa.description AS "activityDescription"
+         FROM strategic_activities sa
+         WHERE sa.id = $1`,
+        [indicator.activity_id]
+      );
+      const activityDescription = activityRes.rows[0]?.activityDescription || "Performance Indicator";
+
+      // ✅ Validate that this indicator can be sent back to admin
+      const allowedStatuses = [
+        "Awaiting Admin Approval",
+        "Awaiting Super Admin",
+        "Verified",
+        "Pending"
+      ];
+
+      if (!allowedStatuses.includes(indicator.status)) {
+        throw new AppError(
+          `Cannot send indicator back to admin from status "${indicator.status}". ` +
+          `Allowed statuses: ${allowedStatuses.join(", ")}`,
+          400
+        );
+      }
+
+      // ✅ Get the latest submission for this indicator (no FOR UPDATE needed for read)
+      const subRes = await client.query(
+        `SELECT id, review_status, is_reviewed
+         FROM submissions
+         WHERE indicator_id = $1
+         ORDER BY submitted_at DESC
+         LIMIT 1`,
+        [indicatorId]
+      );
+
+      // ✅ Update the status to "Awaiting Admin Approval"
+      await client.query(
+        `UPDATE indicators
+         SET status = 'Awaiting Admin Approval',
+             updated_at = NOW()
+         WHERE id = $1`,
+        [indicatorId]
+      );
+
+      // ✅ If there's a submission, reset its review status so admin can review again
+      if (subRes.rows.length > 0) {
+        const submission = subRes.rows[0];
+        
+        // Only reset if it was already reviewed
+        if (submission.is_reviewed) {
+          await client.query(
+            `UPDATE submissions
+             SET review_status = 'Pending',
+                 is_reviewed = false,
+                 admin_comment = $1,
+                 reviewed_at = NULL
+             WHERE id = $2`,
+            [
+              reason ? `Sent back to admin: ${reason}` : "Sent back to admin for review",
+              submission.id
+            ]
+          );
+        }
+      }
+
+      // ✅ Add to review history
+      await client.query(
+        `INSERT INTO review_history
+           (indicator_id, action, reason, reviewer_role, reviewed_by, at)
+         VALUES ($1, 'Sent Back to Admin', $2, 'superadmin', $3, NOW())`,
+        [
+          indicatorId, 
+          reason?.trim() || "Sent back to admin queue for review", 
+          adminId
+        ]
+      );
+
+      // ✅ If multi-assignee, get all assignees for notification
+      let assigneeInfo: { emails: string[]; displayName: string } | null = null;
+      let multiAssigneeInfo: { emails: string[]; displayNames: string[] } | null = null;
+
+      if (indicator.is_multi_assignee) {
+        const assignees = await getIndicatorAssignees(indicatorId);
+        const userIds = assignees.map((a: any) => a.userId);
+        multiAssigneeInfo = await resolveMultipleRecipients(userIds);
+      } else {
+        const { emails, displayName } = await resolveRecipients(
+          indicator.assignee_id,
+          indicator.assignee_model
+        );
+        assigneeInfo = { emails, displayName };
+      }
+
+      await client.query("COMMIT");
+
+      // ✅ Fetch the updated indicator with all JOINs (no FOR UPDATE)
+      const { rows: updatedRows } = await pool.query(
+        `${INDICATOR_SELECT} ${INDICATOR_JOINS} WHERE i.id = $1`,
+        [indicatorId]
+      );
+
+      if (updatedRows[0]?.isMultiAssignee) {
+        updatedRows[0].allAssignees = await getIndicatorAssignees(indicatorId);
+      }
+
+      // ✅ Filter deleted documents
+      if (updatedRows[0]?.submissions) {
+        updatedRows[0].submissions = filterGroupedSubmissions(updatedRows[0].submissions);
+      }
+
+      // ✅ Send email notifications
+      const reasonText = reason?.trim() || "No specific reason provided";
+
+      if (indicator.is_multi_assignee && multiAssigneeInfo) {
+        const emailPromises = multiAssigneeInfo.emails.map((email, index) => {
+          const displayName = multiAssigneeInfo!.displayNames[index] || "Team Member";
+          return sendMail({
+            to: email,
+            subject: "📋 Indicator Returned to Admin Queue",
+            html: `
+              <h2>Indicator Returned to Admin for Review</h2>
+              <p>Hello ${displayName},</p>
+              <p>The following indicator has been returned to the admin queue for review:</p>
+              <ul>
+                <li><strong>Activity:</strong> ${activityDescription}</li>
+                <li><strong>Reason:</strong> ${reasonText}</li>
+                <li><strong>Status:</strong> Awaiting Admin Approval</li>
+              </ul>
+              <p>The admin will review it and notify you of the next steps.</p>
+              <hr>
+              <p style="color: #666; font-size: 12px;">
+                This is an automated notification from the Performance Management System.
+              </p>
+            `,
+          }).catch((err) =>
+            console.error(`[sendBackToAdmin] Failed to send email to ${email}:`, err)
+          );
+        });
+        await Promise.all(emailPromises);
+      } else if (assigneeInfo && assigneeInfo.emails.length > 0) {
+        const emailPromises = assigneeInfo.emails.map((email) => {
+          return sendMail({
+            to: email,
+            subject: "📋 Indicator Returned to Admin Queue",
+            html: `
+              <h2>Indicator Returned to Admin for Review</h2>
+              <p>Hello ${assigneeInfo!.displayName},</p>
+              <p>The following indicator has been returned to the admin queue for review:</p>
+              <ul>
+                <li><strong>Activity:</strong> ${activityDescription}</li>
+                <li><strong>Reason:</strong> ${reasonText}</li>
+                <li><strong>Status:</strong> Awaiting Admin Approval</li>
+              </ul>
+              <p>The admin will review it and notify you of the next steps.</p>
+              <hr>
+              <p style="color: #666; font-size: 12px;">
+                This is an automated notification from the Performance Management System.
+              </p>
+            `,
+          }).catch((err) =>
+            console.error(`[sendBackToAdmin] Failed to send email to ${email}:`, err)
+          );
+        });
+        await Promise.all(emailPromises);
+      }
+
+      res.status(200).json({
+        success: true,
+        message: "Indicator sent back to admin queue successfully.",
+        data: updatedRows[0],
+      });
+
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+);

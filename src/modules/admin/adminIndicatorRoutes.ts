@@ -10,9 +10,11 @@ import {
   approveDocument,
   deleteSubmission,
   deleteDocumentAdmin,
-  approveQuarter,          // ✅ NEW: Approve entire quarter
-  rejectQuarter,           // ✅ NEW: Reject entire quarter
-  getQuarterStatusesForIndicator, // ✅ NEW: Get quarter statuses
+  approveQuarter,
+  rejectQuarter,
+  getQuarterStatusesForIndicator,
+  getSentBackIndicators,      // ✅ NEW
+  getReturnedIndicators,      // ✅ NEW
 } from "../admin/adminIndicatorController";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 import { getCalendarEvents, getIndicatorCalendarEvents, getUpcomingDeadlines } from "../calendar/calendarcontroller";
@@ -27,6 +29,10 @@ router.get("/all", fetchIndicatorsForAdmin);
 router.get("/resubmitted", fetchResubmittedIndicators);
 router.get("/approved-by-admin", getAdminApprovedIndicators);
 
+// ✅ NEW: Routes for indicators sent back or returned
+router.get("/sent-back", getSentBackIndicators);        // Indicators sent back by super admin
+router.get("/returned", getReturnedIndicators);         // Indicators returned/rejected
+
 // ─── Calendar Routes ──────────────────────────────────────────────────────────
 router.get("/calendar/upcoming", getUpcomingDeadlines);
 router.get("/calendar/:id", getIndicatorCalendarEvents);
@@ -36,18 +42,18 @@ router.get("/calendar", getCalendarEvents);
 router.get("/:id", getIndicatorByIdAdmin);
 
 // ─── Quarter-Level Routes ────────────────────────────────────────────────────
-router.get("/:id/quarters", getQuarterStatusesForIndicator);     // Get all quarter statuses
-router.patch("/:id/quarters/approve", approveQuarter);           // Approve entire quarter
-router.patch("/:id/quarters/reject", rejectQuarter);             // Reject entire quarter with reason
+router.get("/:id/quarters", getQuarterStatusesForIndicator);
+router.patch("/:id/quarters/approve", approveQuarter);
+router.patch("/:id/quarters/reject", rejectQuarter);
 
 // ─── Document-Level Action Routes ───────────────────────────────────────────
-router.patch("/:id/documents/approve", approveDocument);         // Approve individual document
-router.patch("/:id/documents/reject", rejectDocument);           // Reject individual document
-router.patch("/:id/documents/delete", deleteDocumentAdmin);      // Soft-delete document with reason
+router.patch("/:id/documents/approve", approveDocument);
+router.patch("/:id/documents/reject", rejectDocument);
+router.patch("/:id/documents/delete", deleteDocumentAdmin);
 
 // ─── Submission-Level Action Routes (Legacy) ────────────────────────────────
-router.patch("/:id/submissions/approve", approveSubmission);     // Approve entire submission
-router.patch("/:id/submissions/reject", rejectSubmission);       // Reject entire submission
+router.patch("/:id/submissions/approve", approveSubmission);
+router.patch("/:id/submissions/reject", rejectSubmission);
 
 // ─── Delete submission (hard delete) ──────────────────────────────────────
 router.delete(

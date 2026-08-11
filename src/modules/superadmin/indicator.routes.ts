@@ -19,15 +19,17 @@ import {
   getIndicatorCounts,
   getSuperAdminApprovedIndicators,
   getPartialApprovalsHistory,
-  // NEW: Import the new controllers
   reassignIndicator,
   addUsersToIndicator,
   removeUsersFromIndicator,
+  sendBackToAdmin, // ✅ Add this import
 } from "./indicator.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
 const router = Router();
 
+// ─── Middleware ─────────────────────────────────────────────────────────────────
+// All routes require authentication and superadmin/admin role
 router.use(protect);
 router.use(restrictTo("superadmin", "admin"));
 
@@ -35,7 +37,7 @@ router.use(restrictTo("superadmin", "admin"));
 router.get("/dashboard-stats", getSuperAdminStats);
 router.get("/rejected-by-admin", getRejectedByAdmin);
 
-// ─── Submissions (MUST be before /:id routes) ─────────────────────────────────
+// ─── Submissions Queue (MUST be before /:id routes) ──────────────────────────
 router.get("/submissions/queue", getAllSubmissions);
 router.delete("/submissions/:submissionId", deleteSubmission);
 
@@ -62,14 +64,17 @@ router.delete("/:id", deleteIndicator);
 router.patch("/:id/review", superAdminReviewProcess);
 router.patch("/:id/reopen", reopenIndicator);
 
+// ✅ Send Back to Admin (MUST be before /:id/assign and other specific routes)
+router.patch("/:id/send-back-to-admin", sendBackToAdmin);
+
 // ─── Assignment Management ────────────────────────────────────────────────────
 // Single assignee operations
-router.patch("/:id/assign", assignIndicator);        // Assign an unassigned indicator
-router.delete("/:id/unassign", unassignIndicator);   // Unassign an indicator
+router.patch("/:id/assign", assignIndicator);
+router.delete("/:id/unassign", unassignIndicator);
 
-// Multi-assignee operations (NEW)
-router.patch("/:id/reassign", reassignIndicator);    // Replace primary assignee
-router.post("/:id/add-users", addUsersToIndicator);  // Add users to task
-router.delete("/:id/remove-users", removeUsersFromIndicator); // Remove users from task
+// Multi-assignee operations
+router.patch("/:id/reassign", reassignIndicator);
+router.post("/:id/add-users", addUsersToIndicator);
+router.delete("/:id/remove-users", removeUsersFromIndicator);
 
 export const IndicatorRoutes = router;
