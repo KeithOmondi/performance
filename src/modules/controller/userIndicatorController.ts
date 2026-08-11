@@ -571,6 +571,7 @@ export const UserIndicatorController: IUserIndicatorController = {
 
         switch (existing.review_status) {
           case "Accepted": {
+            // If already accepted, we should route to addDocuments
             await client.query("ROLLBACK");
             client.release();
             req.body.quarter = quarter;
@@ -841,6 +842,7 @@ export const UserIndicatorController: IUserIndicatorController = {
 
   /**
    * ✅ ADD DOCUMENTS - Add documents to any submission
+   * ✅ FIX: ALL documents go through approval process, regardless of submission status
    */
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
@@ -902,8 +904,36 @@ export const UserIndicatorController: IUserIndicatorController = {
       const submission = existingSubmission.rows[0] as { id: string; review_status: string };
       console.log(`📁 [addDocuments] Found submission: ${submission.id} with status: ${submission.review_status}`);
 
-      const docStatus = submission.review_status === 'Accepted' ? 'Additional' : 'Pending';
-      
+      // ✅ FIX: ALL documents go through approval process, regardless of submission status
+      // Documents are always set to 'Pending' so they must be reviewed by admin
+      const docStatus = 'Pending';
+
+      // If the submission is already 'Accepted', we need to change its status back to 'Pending'
+      if (submission.review_status === 'Accepted') {
+        await client.query(
+          `UPDATE submissions
+           SET review_status = 'Pending',
+               is_reviewed = false,
+               admin_comment = COALESCE(admin_comment, 'Additional documents submitted for review.'),
+               updated_at = NOW()
+           WHERE id = $1`,
+          [submission.id],
+        );
+        
+        // Update indicator status to 'Awaiting Admin Approval'
+        if (indicator.status === "Completed") {
+          await client.query(
+            `UPDATE indicators 
+             SET status = 'Awaiting Admin Approval',
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [id],
+          );
+        }
+        
+        console.log(`📝 [addDocuments] Submission ${submission.id} moved back to 'Pending' for review of new documents.`);
+      }
+
       try {
         const uploadedDocs = await uploadDocumentsWithRetry(files, descriptions || []);
         console.log(`✅ [addDocuments] Uploaded ${uploadedDocs.length} documents`);
@@ -918,15 +948,30 @@ export const UserIndicatorController: IUserIndicatorController = {
           );
         }
         
-        if (submission.review_status === 'Accepted') {
-          console.log(`📝 [addDocuments] Added documents to accepted submission ${submission.id}`);
-        }
+        console.log(`📝 [addDocuments] Added ${files.length} document(s) with status '${docStatus}' to submission ${submission.id}`);
+        
       } catch (uploadError) {
         console.error(`❌ [addDocuments] Upload failed:`, uploadError);
         throw new AppError(
           `Failed to upload documents: ${(uploadError as Error).message}`,
           500
         );
+      }
+
+      // Check if there are any rejected documents in the submission
+      const rejectedDocs = await getRejectedDocuments(client, submission.id);
+      
+      // If there are rejected documents, update submission status to 'Correction Needed'
+      if (rejectedDocs.length > 0) {
+        await client.query(
+          `UPDATE submissions
+           SET review_status = 'Correction Needed',
+               admin_comment = COALESCE(admin_comment, 'Some documents require corrections. Please resubmit the rejected documents.'),
+               updated_at = NOW()
+           WHERE id = $1`,
+          [submission.id],
+        );
+        console.log(`📝 [addDocuments] Submission ${submission.id} has rejected documents, set to 'Correction Needed'.`);
       }
 
       await storeIdempotencyKey(client, requestId);
@@ -938,7 +983,7 @@ export const UserIndicatorController: IUserIndicatorController = {
 
       res.status(200).json({
         success: true,
-        message: `${files.length} document(s) successfully added to your submission.`,
+        message: `${files.length} document(s) successfully added to your submission. They are pending admin review.`,
         data: { 
           submissionId: submission.id, 
           documentsAdded: files.length,
@@ -998,81 +1043,77 @@ export const UserIndicatorController: IUserIndicatorController = {
     await UserIndicatorController.addDocuments(req, res, next);
   }),
 
-
   /**
- * ✅ DELETE PENDING DOCUMENT - Delete a document from a pending submission
- */
-deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const { docId } = req.params;
+   * ✅ DELETE PENDING DOCUMENT - Delete a document from a pending submission
+   */
+  deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
+    const user = getAuthUser(req);
+    const { docId } = req.params;
 
-  console.log(`🗑️ [deletePendingDocument] START — docId: ${docId} | user: ${user.id}`);
+    console.log(`🗑️ [deletePendingDocument] START — docId: ${docId} | user: ${user.id}`);
 
-  const teamIds = await getUserTeamIds(user.id);
+    const teamIds = await getUserTeamIds(user.id);
 
-  const ownershipCondition = `
-    AND (
-      (i.assignee_id = $2 AND i.assignee_model = 'User')
-      OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
-      OR EXISTS (
-        SELECT 1 FROM indicator_assignees ia
-        WHERE ia.indicator_id = i.id AND ia.user_id = $2
+    const ownershipCondition = `
+      AND (
+        (i.assignee_id = $2 AND i.assignee_model = 'User')
+        OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
+        OR EXISTS (
+          SELECT 1 FROM indicator_assignees ia
+          WHERE ia.indicator_id = i.id AND ia.user_id = $2
+        )
       )
-    )
-  `;
+    `;
 
-  // ✅ FIX: Always include teamIds in params, even if empty
-  const checkParams: unknown[] = [docId, user.id, teamIds.length > 0 ? teamIds : null];
+    const checkParams: unknown[] = [docId, user.id, teamIds.length > 0 ? teamIds : null];
 
-  const { rows } = await pool.query(
-    `SELECT d.id, d.evidence_public_id, d.file_name, d.status AS doc_status, 
-            s.review_status, s.quarter, s.year
-     FROM submission_documents d
-     JOIN submissions s ON d.submission_id = s.id
-     JOIN indicators i ON s.indicator_id = i.id
-     WHERE d.id = $1 AND d.deleted_at IS NULL ${ownershipCondition}`,
-    checkParams,
-  );
-
-  if (rows.length === 0) {
-    throw new AppError("Document not found or you don't have permission to delete it.", 404);
-  }
-
-  const doc = rows[0] as {
-    evidence_public_id: string;
-    file_name: string;
-    doc_status: string;
-    review_status: string;
-    quarter: number;
-    year: number;
-  };
-
-  // Allow deletion if document is Pending, Rejected, Resubmitted, or Additional
-  if (doc.doc_status === 'Approved') {
-    throw new AppError("Cannot delete an approved document.", 400);
-  }
-
-  await pool.query(
-    `UPDATE submission_documents 
-     SET deleted_at = NOW(), deleted_by = $1
-     WHERE id = $2`,
-    [user.id, docId],
-  );
-
-  if (doc.evidence_public_id) {
-    deleteFromCloudinary(doc.evidence_public_id).catch((err: Error) =>
-      console.error("[deletePendingDocument] Cloudinary cleanup failed:", err),
+    const { rows } = await pool.query(
+      `SELECT d.id, d.evidence_public_id, d.file_name, d.status AS doc_status, 
+              s.review_status, s.quarter, s.year
+       FROM submission_documents d
+       JOIN submissions s ON d.submission_id = s.id
+       JOIN indicators i ON s.indicator_id = i.id
+       WHERE d.id = $1 AND d.deleted_at IS NULL ${ownershipCondition}`,
+      checkParams,
     );
-  }
 
-  const quarterDisplayText = doc.quarter === 0 ? "Annual" : `Q${doc.quarter}`;
-  res.status(200).json({
-    success: true,
-    message: `Document "${doc.file_name}" has been removed from your ${quarterDisplayText} ${doc.year} submission.`,
-  });
-}),
+    if (rows.length === 0) {
+      throw new AppError("Document not found or you don't have permission to delete it.", 404);
+    }
 
+    const doc = rows[0] as {
+      evidence_public_id: string;
+      file_name: string;
+      doc_status: string;
+      review_status: string;
+      quarter: number;
+      year: number;
+    };
 
+    // Allow deletion if document is Pending, Rejected, Resubmitted, or Additional
+    if (doc.doc_status === 'Approved') {
+      throw new AppError("Cannot delete an approved document.", 400);
+    }
+
+    await pool.query(
+      `UPDATE submission_documents 
+       SET deleted_at = NOW(), deleted_by = $1
+       WHERE id = $2`,
+      [user.id, docId],
+    );
+
+    if (doc.evidence_public_id) {
+      deleteFromCloudinary(doc.evidence_public_id).catch((err: Error) =>
+        console.error("[deletePendingDocument] Cloudinary cleanup failed:", err),
+      );
+    }
+
+    const quarterDisplayText = doc.quarter === 0 ? "Annual" : `Q${doc.quarter}`;
+    res.status(200).json({
+      success: true,
+      message: `Document "${doc.file_name}" has been removed from your ${quarterDisplayText} ${doc.year} submission.`,
+    });
+  }),
 
   /**
    * ✅ GET REJECTED SUBMISSIONS - Get all indicators with rejected submissions
@@ -1669,6 +1710,7 @@ deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
 
   /**
    * ✅ UPDATE DOCUMENT STATUS - Admin/Super Admin approve or reject individual documents
+   * ✅ FIX: Properly handle documents added to accepted submissions
    */
   updateDocumentStatus: asyncHandler(async (req: Request, res: Response) => {
     const { docId } = req.params;
@@ -1721,6 +1763,9 @@ deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
         reporting_cycle: string;
       };
 
+      // Check if this is an "Additional" document or pending document
+      const isAdditionalOrPending = doc.status === 'Additional' || doc.status === 'Pending';
+
       await client.query(
         `UPDATE submission_documents
          SET status = $1,
@@ -1730,55 +1775,56 @@ deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
         [status, status === 'Rejected' ? rejectionReason.trim() : null, docId],
       );
 
+      // Check if all documents in this submission are now Approved
       const allApproved = await checkAllDocumentsApproved(client, doc.submission_id);
+      const rejectedDocs = await getRejectedDocuments(client, doc.submission_id);
 
+      // Determine submission status based on document statuses
+      let newSubmissionStatus: string;
+      
       if (allApproved) {
-        await client.query(
-          `UPDATE submissions
-           SET review_status = 'Accepted',
-               is_reviewed = true,
-               updated_at = NOW()
-           WHERE id = $1`,
-          [doc.submission_id],
-        );
-
-        await client.query(
-          `UPDATE indicators
-           SET status = 'Completed',
-               progress = 100,
-               updated_at = NOW()
-           WHERE id = $1`,
-          [doc.indicator_id],
-        );
-
-        console.log(`✅ [updateDocumentStatus] All documents approved! Submission ${doc.submission_id} is now complete.`);
+        // All documents are approved - submission is complete
+        newSubmissionStatus = 'Accepted';
+      } else if (rejectedDocs.length > 0) {
+        // There are rejected documents
+        newSubmissionStatus = 'Correction Needed';
       } else {
-        const rejectedDocs = await getRejectedDocuments(client, doc.submission_id);
-        
-        if (rejectedDocs.length > 0) {
-          await client.query(
-            `UPDATE submissions
-             SET review_status = 'Correction Needed',
-                 admin_comment = 'Some documents require corrections. Please resubmit the rejected documents.',
-                 updated_at = NOW()
-             WHERE id = $1`,
-            [doc.submission_id],
-          );
-          console.log(`📝 [updateDocumentStatus] Submission ${doc.submission_id} has rejected documents.`);
-        } else {
-          await client.query(
-            `UPDATE submissions
-             SET review_status = 'Pending',
-                 updated_at = NOW()
-             WHERE id = $1`,
-            [doc.submission_id],
-          );
-        }
+        // Some documents are still pending
+        newSubmissionStatus = 'Pending';
       }
+
+      await client.query(
+        `UPDATE submissions
+         SET review_status = $1,
+             is_reviewed = $2,
+             updated_at = NOW()
+         WHERE id = $3`,
+        [newSubmissionStatus, allApproved, doc.submission_id],
+      );
+
+      // Update indicator status
+      let newIndicatorStatus: string;
+      if (allApproved) {
+        newIndicatorStatus = 'Completed';
+      } else if (rejectedDocs.length > 0) {
+        newIndicatorStatus = 'Correction Needed';
+      } else {
+        newIndicatorStatus = 'Awaiting Admin Approval';
+      }
+
+      await client.query(
+        `UPDATE indicators
+         SET status = $1,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [newIndicatorStatus, doc.indicator_id],
+      );
 
       await client.query("COMMIT");
 
       console.log(`✅ [updateDocumentStatus] Document ${docId} updated to ${status}`);
+      console.log(`📝 [updateDocumentStatus] Submission status: ${newSubmissionStatus}`);
+      console.log(`📝 [updateDocumentStatus] Indicator status: ${newIndicatorStatus}`);
 
       const fullSubmission = await getSubmissionWithDocuments(client, doc.submission_id);
 
@@ -1791,6 +1837,8 @@ deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
           rejectionReason: status === 'Rejected' ? rejectionReason.trim() : null,
           submission: fullSubmission,
           allDocumentsApproved: allApproved,
+          submissionStatus: newSubmissionStatus,
+          indicatorStatus: newIndicatorStatus,
         },
       });
     } catch (error) {
@@ -1802,48 +1850,48 @@ deletePendingDocument: asyncHandler(async (req: Request, res: Response) => {
     }
   }),
 
-/**
- * ✅ GET REJECTED DOCUMENTS - Get all rejected documents for a submission
- */
-getRejectedDocuments: asyncHandler(async (req: Request, res: Response) => {
-  const { submissionId } = req.params as { submissionId: string };
-  const user = getAuthUser(req);
+  /**
+   * ✅ GET REJECTED DOCUMENTS - Get all rejected documents for a submission
+   */
+  getRejectedDocuments: asyncHandler(async (req: Request, res: Response) => {
+    const { submissionId } = req.params as { submissionId: string };
+    const user = getAuthUser(req);
 
-  console.log(`📝 [getRejectedDocuments] START for submission ${submissionId}`);
+    console.log(`📝 [getRejectedDocuments] START for submission ${submissionId}`);
 
-  const client = await pool.connect();
+    const client = await pool.connect();
 
-  try {
-    const subResult = await client.query(
-      `SELECT s.*, i.id as indicator_id
-       FROM submissions s
-       JOIN indicators i ON s.indicator_id = i.id
-       WHERE s.id = $1`,
-      [submissionId],
-    );
+    try {
+      const subResult = await client.query(
+        `SELECT s.*, i.id as indicator_id
+         FROM submissions s
+         JOIN indicators i ON s.indicator_id = i.id
+         WHERE s.id = $1`,
+        [submissionId],
+      );
 
-    if (subResult.rows.length === 0) {
-      throw new AppError("Submission not found.", 404);
+      if (subResult.rows.length === 0) {
+        throw new AppError("Submission not found.", 404);
+      }
+
+      const teamIds = await getUserTeamIds(user.id);
+      await assertIndicatorOwnership(client, subResult.rows[0] as Record<string, unknown>, user.id, teamIds);
+
+      const rejectedDocs = await getRejectedDocuments(client, submissionId);
+
+      console.log(`✅ [getRejectedDocuments] Found ${rejectedDocs.length} rejected documents`);
+
+      res.status(200).json({
+        success: true,
+        data: rejectedDocs,
+      });
+    } catch (error) {
+      console.error(`❌ [getRejectedDocuments] ERROR:`, error);
+      throw error;
+    } finally {
+      client.release();
     }
-
-    const teamIds = await getUserTeamIds(user.id);
-    await assertIndicatorOwnership(client, subResult.rows[0] as Record<string, unknown>, user.id, teamIds);
-
-    const rejectedDocs = await getRejectedDocuments(client, submissionId);
-
-    console.log(`✅ [getRejectedDocuments] Found ${rejectedDocs.length} rejected documents`);
-
-    res.status(200).json({
-      success: true,
-      data: rejectedDocs,
-    });
-  } catch (error) {
-    console.error(`❌ [getRejectedDocuments] ERROR:`, error);
-    throw error;
-  } finally {
-    client.release();
-  }
-}),
+  }),
 
   /**
    * ✅ SEND ALERTS - Send email notifications
