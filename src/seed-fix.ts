@@ -1,92 +1,132 @@
-// src/seed-constraints.ts
+// src/scripts/inspect-enums.ts
+
 import { pool } from "./config/db";
 
+
 async function main() {
-  console.log("🐘 Applying schema constraints...");
+  console.log("🐘 Connected to Neon. Inspecting enums and statuses...\n");
+
   const client = await pool.connect();
 
   try {
-    /* ──────────────────────────────────────────────────────────────────
-       Guard: don't add the constraint if nulls still exist — it would
-       fail mid-migration and leave you in a half-applied state.
-       ────────────────────────────────────────────────────────────────── */
-    const nullCheck = await client.query(`
-      SELECT COUNT(*)::int AS count
+    /* ────────────────────────────────────────────────────────────────
+       1. What values does the `indicator_status` enum actually have?
+       ──────────────────────────────────────────────────────────────── */
+    console.log("=== 1. indicator_status enum values ===");
+    const indStatus = await client.query(`
+      SELECT unnest(enum_range(NULL::indicator_status)) AS value
+    `);
+    indStatus.rows.forEach((r) => console.log(`  • ${r.value}`));
+
+    /* ────────────────────────────────────────────────────────────────
+       2. What values does the `review_status` enum have?
+          (this is where "Verified" actually lives)
+       ──────────────────────────────────────────────────────────────── */
+    console.log("\n=== 2. review_status enum values ===");
+    const revStatus = await client.query(`
+      SELECT unnest(enum_range(NULL::review_status)) AS value
+    `);
+    revStatus.rows.forEach((r) => console.log(`  • ${r.value}`));
+
+    /* ────────────────────────────────────────────────────────────────
+       3. What indicator_status values are actually used in the data,
+          and how many rows per value?
+       ──────────────────────────────────────────────────────────────── */
+    console.log("\n=== 3. Actual indicator.status distribution ===");
+    const indDist = await client.query(`
+      SELECT status::text AS status, COUNT(*)::int AS count
+      FROM indicators
+      WHERE deleted_at IS NULL
+      GROUP BY status
+      ORDER BY count DESC
+    `);
+    indDist.rows.forEach((r) =>
+      console.log(`  ${r.status.padEnd(32)} ${r.count}`)
+    );
+
+    /* ────────────────────────────────────────────────────────────────
+       4. What review_status values are actually used in submissions?
+       ──────────────────────────────────────────────────────────────── */
+    console.log("\n=== 4. Actual submissions.review_status distribution ===");
+    const subDist = await client.query(`
+      SELECT review_status::text AS "reviewStatus", COUNT(*)::int AS count
       FROM submissions
-      WHERE achieved_value IS NULL
+      GROUP BY review_status
+      ORDER BY count DESC
     `);
+    subDist.rows.forEach((r) =>
+      console.log(`  ${r.reviewStatus.padEnd(32)} ${r.count}`)
+    );
 
-    if (nullCheck.rows[0].count > 0) {
-      console.error(
-        `❌ ${nullCheck.rows[0].count} submissions still have NULL achieved_value.`
-      );
-      console.error("   Run seed-fix.ts first, then re-run this script.");
-      process.exitCode = 1;
-      return;
-    }
-
-    /* ──────────────────────────────────────────────────────────────────
-       Apply NOT NULL. Use IF NOT EXISTS pattern via DO block since
-       Postgres doesn't support ADD CONSTRAINT IF NOT EXISTS directly.
-       ────────────────────────────────────────────────────────────────── */
-    await client.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM pg_constraint
-          WHERE conname = 'submissions_achieved_value_not_null'
-        ) THEN
-          ALTER TABLE submissions
-            ALTER COLUMN achieved_value SET NOT NULL;
-        END IF;
-      END
-      $$;
+    /* ────────────────────────────────────────────────────────────────
+       5. Sanity check: are there any indicator rows with a status
+          that would map to "Incomplete" per the frontend grouping?
+       ──────────────────────────────────────────────────────────────── */
+    console.log("\n=== 5. Counts per semantic group (as the frontend sees them) ===");
+    const grouped = await client.query(`
+      SELECT
+        CASE
+          WHEN status = 'Completed' THEN 'Complete'
+          WHEN status IN ('Partially Approved', 'Awaiting Super Admin') THEN 'Partial'
+          ELSE 'Incomplete'
+        END AS "group",
+        COUNT(*)::int AS count
+      FROM indicators
+      WHERE deleted_at IS NULL
+      GROUP BY 1
+      ORDER BY 1
     `);
+    grouped.rows.forEach((r) =>
+      console.log(`  ${r.group.padEnd(15)} ${r.count}`)
+    );
 
-    console.log("✅ submissions.achieved_value is now NOT NULL");
-
-    /* ──────────────────────────────────────────────────────────────────
-       Same treatment for approved_amount on review_history, but ONLY
-       for actions where it must exist ('Partially Approved', 'Approved',
-       'Rejected' is excluded because rejections don't have amounts).
-       We use a CHECK constraint instead of NOT NULL so rejections can
-       still be inserted.
-       ────────────────────────────────────────────────────────────────── */
-    const nullAmounts = await client.query(`
-      SELECT COUNT(*)::int AS count
-      FROM review_history
-      WHERE approved_amount IS NULL
-        AND action IN ('Partially Approved', 'Approved')
+    /* ────────────────────────────────────────────────────────────────
+       6. Indicators that are "Incomplete" but currently excluded by
+          the report controller's hard-coded NOT IN (...).
+       ──────────────────────────────────────────────────────────────── */
+    console.log("\n=== 6. Incomplete-status rows currently excluded by report WHERE ===");
+    const excluded = await client.query(`
+      SELECT status::text AS status, COUNT(*)::int AS count
+      FROM indicators
+      WHERE deleted_at IS NULL
+        AND status NOT IN (
+          'Completed',
+          'Partially Approved',
+          'Awaiting Super Admin'
+        )
+        AND status IN (
+          'Awaiting Admin Approval',
+          'Rejected by Admin',
+          'Rejected by Super Admin',
+          'Correction Needed'
+        )
+      GROUP BY status
+      ORDER BY count DESC
     `);
-
-    if (nullAmounts.rows[0].count > 0) {
-      console.warn(
-        `⚠️  ${nullAmounts.rows[0].count} review_history rows still have NULL approved_amount — skipping CHECK constraint.`
-      );
+    if (excluded.rows.length === 0) {
+      console.log("  (none — nothing being silently excluded)");
     } else {
-      await client.query(`
-        DO $$
-        BEGIN
-          IF NOT EXISTS (
-            SELECT 1 FROM pg_constraint
-            WHERE conname = 'review_history_approved_amount_check'
-          ) THEN
-            ALTER TABLE review_history
-              ADD CONSTRAINT review_history_approved_amount_check
-              CHECK (
-                action NOT IN ('Partially Approved', 'Approved')
-                OR approved_amount IS NOT NULL
-              );
-          END IF;
-        END
-        $$;
-      `);
-      console.log("✅ review_history.approved_amount CHECK constraint applied");
+      excluded.rows.forEach((r) =>
+        console.log(`  ${r.status.padEnd(32)} ${r.count}`)
+      );
     }
 
-    console.log("\n🎉 Schema constraints applied.");
+    /* ────────────────────────────────────────────────────────────────
+       7. Double-check the enum type name on the indicators.status column
+       ──────────────────────────────────────────────────────────────── */
+    console.log("\n=== 7. indicators.status column type ===");
+    const colType = await client.query(`
+      SELECT data_type, udt_name
+      FROM information_schema.columns
+      WHERE table_name = 'indicators' AND column_name = 'status'
+    `);
+    colType.rows.forEach((r) =>
+      console.log(`  data_type=${r.data_type}  udt_name=${r.udt_name}`)
+    );
+
+    console.log("\n✅ Inspection complete.");
   } catch (err) {
-    console.error("❌ Constraint script failed:", err);
+    console.error("❌ Inspection failed:", err);
     process.exitCode = 1;
   } finally {
     client.release();

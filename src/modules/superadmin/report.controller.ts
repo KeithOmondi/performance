@@ -175,12 +175,39 @@ function buildWhereClause(query: Request["query"]): {
     `;
   }
 
+  /*
+   * Status filter — accepts a single value OR a comma-separated list.
+   *   ?status=Completed
+   *   ?status=Partially Approved,Awaiting Super Admin
+   *   ?status=Pending,Verified,Awaiting Admin Approval,...
+   *
+   * The explicit ::indicator_status[] cast is required because
+   * `i.status` is a Postgres enum, not text. A plain `ANY($N)` would
+   * be treated as text[] and reject the comparison.
+   */
   if (query.status && query.status !== "all") {
-    params.push(query.status as string);
+    const statuses = String(query.status)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-    where += `
-      AND i.status = $${params.length}
-    `;
+    if (statuses.length === 1) {
+      params.push(statuses[0]);
+
+      where += `
+        AND i.status = $${params.length}::indicator_status
+      `;
+    } else if (statuses.length > 1) {
+      const placeholders = statuses
+        .map((_, index) => `$${params.length + index + 1}`)
+        .join(", ");
+
+      params.push(...statuses);
+
+      where += `
+        AND i.status = ANY(ARRAY[${placeholders}]::indicator_status[])
+      `;
+    }
   }
 
   if (query.assigneeId) {
@@ -441,10 +468,10 @@ interface EvidenceLine {
 
 /**
  * Returns ALL evidence.
- * 
+ *
  * IMPORTANT:
  * There is deliberately NO evidence cap here.
- * 
+ *
  * Every evidence description is rendered.
  * Only shows descriptions, not file names.
  * Review status is NOT displayed in the report.
