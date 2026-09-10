@@ -65,10 +65,7 @@ const REPORT_SELECT = `
             'year', s.year,
             'achievedValue', s.achieved_value,
             'notes', s.notes,
-            'reviewStatus', s.review_status,
             'submittedAt', s.submitted_at,
-            'adminComment', s.admin_comment,
-            'resubmissionCount', s.resubmission_count,
 
             'documents',
             COALESCE(
@@ -289,10 +286,7 @@ interface SubmissionRow {
   year: number;
   achievedValue: number;
   notes: string;
-  reviewStatus: string;
   submittedAt: string;
-  adminComment?: string;
-  resubmissionCount?: number;
   documents: DocumentRow[];
 }
 
@@ -447,11 +441,13 @@ interface EvidenceLine {
 
 /**
  * Returns ALL evidence.
- *
+ * 
  * IMPORTANT:
  * There is deliberately NO evidence cap here.
- *
+ * 
  * Every evidence description is rendered.
+ * Only shows descriptions, not file names.
+ * Review status is NOT displayed in the report.
  */
 function getEvidenceLines(
   submissions: SubmissionRow[]
@@ -476,14 +472,6 @@ function getEvidenceLines(
   });
 
   for (const submission of sortedSubmissions) {
-    if (
-      submission.reviewStatus === "Rejected" ||
-      submission.reviewStatus ===
-        "Correction Needed"
-    ) {
-      continue;
-    }
-
     const periodLabel =
       submission.quarter === 0
         ? "Annual"
@@ -504,34 +492,29 @@ function getEvidenceLines(
         doc.status !== "Deleted"
     );
 
+    /*
+     * ✅ Only keep documents that have descriptions.
+     * Do NOT fall back to file name.
+     */
     const documentsWithDescription =
       validDocuments.filter((doc: DocumentRow) =>
         doc.description?.trim()
       );
 
     /*
-     * If descriptions exist, display descriptions.
-     *
-     * Otherwise display filenames.
-     */
-    const documentsToShow =
-      documentsWithDescription.length > 0
-        ? documentsWithDescription
-        : validDocuments;
-
-    /*
-     * Do not create an empty quarter.
+     * If no documents have descriptions and no notes, skip this quarter.
      */
     if (
       !notes &&
-      documentsToShow.length === 0
+      documentsWithDescription.length === 0
     ) {
       continue;
     }
 
+    // ✅ REMOVED: Review status from header
     lines.push({
       isBullet: false,
-      text: `─── ${periodLabel} ${submission.year} (${submission.reviewStatus}) ───`,
+      text: `─── ${periodLabel} ${submission.year} ───`,
     });
 
     if (notes) {
@@ -541,13 +524,13 @@ function getEvidenceLines(
       });
     }
 
-    for (const document of documentsToShow) {
+    /*
+     * ✅ Only show descriptions, not file names.
+     */
+    for (const document of documentsWithDescription) {
       lines.push({
         isBullet: true,
-        text:
-          document.description?.trim() ||
-          document.fileName ||
-          "Document",
+        text: document.description!.trim(),
       });
     }
 
@@ -2208,15 +2191,15 @@ export const getTrackerPdf =
               }
 
               /*
-               * Notes column.
+               * Notes column - REMOVED all admin/review metadata
                */
               let notesText =
                 activity.description ||
                 "";
 
               /*
-               * Add submission information
-               * to explanatory notes.
+               * Add submission period information
+               * to explanatory notes - WITHOUT review status
                */
               if (
                 submissions.length > 0
@@ -2245,38 +2228,17 @@ export const getTrackerPdf =
 
                 for (const sub of
                   sortedSubs) {
-                  if (
-                    sub.reviewStatus ===
-                      "Rejected" ||
-                    sub.reviewStatus ===
-                      "Correction Needed"
-                  ) {
-                    continue;
-                  }
-
                   const periodLabel =
                     sub.quarter === 0
                       ? "Annual"
                       : `Q${sub.quarter}`;
 
+                  // ✅ REMOVED: Review status from notes
                   notesText +=
-                    `\n[${periodLabel} ${sub.year} - ${sub.reviewStatus}]`;
+                    `\n[${periodLabel} ${sub.year}]`;
 
-                  if (
-                    sub.adminComment
-                  ) {
-                    notesText +=
-                      `\nAdmin: ${sub.adminComment}`;
-                  }
-
-                  if (
-                    sub.resubmissionCount &&
-                    sub.resubmissionCount >
-                      0
-                  ) {
-                    notesText +=
-                      `\nResubmission #${sub.resubmissionCount}`;
-                  }
+                  // ✅ REMOVED: Admin comments
+                  // ✅ REMOVED: Resubmission count
                 }
               } else {
                 notesText +=
