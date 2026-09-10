@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 import { UserIndicatorController } from "./userIndicatorController";
+
 import { upload, requireFiles } from "../../middleware/upload";
 
 const router = Router();

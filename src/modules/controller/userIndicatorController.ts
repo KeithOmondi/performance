@@ -39,6 +39,7 @@ interface Submission {
   review_status: string;
   resubmission_count: number;
   admin_comment?: string;
+  achieved_value: number | null;   // ✅ added — needed for safe fallback on resubmit
   quarter: number;
   year: number;
 }
@@ -341,8 +342,6 @@ async function checkAllDocumentsApproved(
   return total > 0 && total === approved;
 }
 
-// ─── Base query ───────────────────────────────────────────────────────────────
-
 const USER_INDICATOR_BASE_QUERY = `
   SELECT DISTINCT ON (i.id)
     i.*,
@@ -380,7 +379,12 @@ const USER_INDICATOR_BASE_QUERY = `
                 'isReviewed',        s.is_reviewed,
                 'documents', (
                   SELECT COALESCE(
-                    json_agg(
+                    json_agg(doc_row.doc_json ORDER BY doc_row.uploaded_at DESC),
+                    '[]'::json
+                  )
+                  FROM (
+                    /* Own uploaded documents */
+                    SELECT
                       json_build_object(
                         'id',              d.id,
                         'evidenceUrl',     d.evidence_url,
@@ -388,14 +392,32 @@ const USER_INDICATOR_BASE_QUERY = `
                         'fileName',        d.file_name,
                         'description',     d.description,
                         'status',          d.status,
-                        'rejectionReason', d.rejection_reason
-                      )
-                      ORDER BY d.uploaded_at DESC
-                    ),
-                    '[]'::json
-                  )
-                  FROM submission_documents d
-                  WHERE d.submission_id = s.id AND d.deleted_at IS NULL
+                        'rejectionReason', d.rejection_reason,
+                        'source',          'own'
+                      ) AS doc_json,
+                      d.uploaded_at
+                    FROM submission_documents d
+                    WHERE d.submission_id = s.id AND d.deleted_at IS NULL
+
+                    UNION ALL
+
+                    /* Linked spot-check library documents */
+                    SELECT
+                      json_build_object(
+                        'id',              l.id,
+                        'evidenceUrl',     l.evidence_url,
+                        'fileType',        l.file_type,
+                        'fileName',        l.file_name,
+                        'description',     l.description,
+                        'status',          'Approved',
+                        'rejectionReason', NULL,
+                        'source',          'spot-check',
+                        'linkedAt',        l.linked_at
+                      ) AS doc_json,
+                      l.linked_at AS uploaded_at
+                    FROM submission_spot_check_links l
+                    WHERE l.submission_id = s.id
+                  ) doc_row
                 )
               ) ORDER BY s.submitted_at DESC
             ) AS quarter_submissions
@@ -611,6 +633,11 @@ export const UserIndicatorController: IUserIndicatorController = {
         }
       }
 
+      // ✅ DB requires achieved_value NOT NULL. When the user submits evidence only
+      // (e.g., spot-check links) without typing a value, default to 0 — this
+      // represents "no numeric achievement claimed."
+      const safeAchievedValue = validated.achievedValue ?? 0;
+
       // Create the submission
       const { rows: inserted } = await client.query(
         `INSERT INTO submissions
@@ -618,7 +645,7 @@ export const UserIndicatorController: IUserIndicatorController = {
             review_status, submitted_by, resubmission_count, is_reviewed)
          VALUES ($1, $2, $3, $4, $5, 'Pending', $6, 0, false)
          RETURNING id`,
-        [id, quarterNum, yearNum, validated.achievedValue, validated.notes, user.id],
+        [id, quarterNum, yearNum, safeAchievedValue, validated.notes, user.id],
       );
 
       const submissionId = (inserted[0] as { id: string }).id;
@@ -673,6 +700,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       res.status(201).json({
         success: true,
         message: `Your submission for ${quarterDisplay(quarterNum, yearNum)} has been received and is pending admin review.`,
+        submissionId,                                 // ✅ hoisted for the modal
         data: {
           submissionId,
           quarter: quarterNum,
@@ -738,8 +766,10 @@ export const UserIndicatorController: IUserIndicatorController = {
       const indicator = indRes.rows[0] as IndicatorWithActivity;
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
+      // ✅ Include achieved_value so we can preserve it when the user
+      // resubmits without typing a new value.
       const previousSubmission = await client.query(
-        `SELECT id, review_status, resubmission_count, admin_comment
+        `SELECT id, review_status, resubmission_count, admin_comment, achieved_value
          FROM submissions
          WHERE indicator_id = $1 AND quarter = $2 AND year = $3
          AND review_status IN ('Rejected', 'Correction Needed')
@@ -759,6 +789,14 @@ export const UserIndicatorController: IUserIndicatorController = {
       const latestSubmission = previousSubmission.rows[0] as Submission;
       const newResubmissionCount = latestSubmission.resubmission_count + 1;
 
+      // ✅ Preserve the previous value when the user doesn't supply one;
+      // default to 0 as a final safety net (achieved_value is NOT NULL).
+      const safeAchievedValue =
+        validated.achievedValue ??
+        (latestSubmission.achieved_value != null
+          ? Number(latestSubmission.achieved_value)
+          : 0);
+
       const { rows: updated } = await client.query(
         `UPDATE submissions
          SET achieved_value            = $1,
@@ -772,7 +810,7 @@ export const UserIndicatorController: IUserIndicatorController = {
              submitted_at              = NOW()
          WHERE id = $5
          RETURNING id`,
-        [validated.achievedValue, validated.notes, user.id,
+        [safeAchievedValue, validated.notes, user.id,
          newResubmissionCount, latestSubmission.id],
       );
 
@@ -825,6 +863,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       res.status(200).json({
         success: true,
         message: `Your resubmission for ${quarterDisplay(quarterNum, yearNum)} has been sent for review.`,
+        submissionId: newSubmissionId,                // ✅ hoisted
         data: { 
           submissionId: newSubmissionId, 
           resubmissionCount: newResubmissionCount,
@@ -984,6 +1023,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       res.status(200).json({
         success: true,
         message: `${files.length} document(s) successfully added to your submission. They are pending admin review.`,
+        submissionId: submission.id,                 // ✅ hoisted
         data: { 
           submissionId: submission.id, 
           documentsAdded: files.length,
@@ -1302,69 +1342,81 @@ export const UserIndicatorController: IUserIndicatorController = {
   /**
    * ✅ STREAM FILE - Stream a file from Cloudinary
    */
-  streamFile: asyncHandler(async (req: Request, res: Response) => {
-    const user = getAuthUser(req);
-    const url = decodeURIComponent(req.query.url as string);
+streamFile: asyncHandler(async (req: Request, res: Response) => {
+  const user = getAuthUser(req);
+  const url = decodeURIComponent(req.query.url as string);
 
-    if (!url || !url.startsWith("https://res.cloudinary.com/")) {
-      throw new AppError("Invalid file URL provided.", 400);
-    }
+  if (!url || !url.startsWith("https://res.cloudinary.com/")) {
+    throw new AppError("Invalid file URL provided.", 400);
+  }
 
-    const match = url.match(/^https:\/\/res\.cloudinary\.com\/([^/]+)\//);
-    if (!match || match[1] !== process.env.CLOUDINARY_CLOUD_NAME) {
-      throw new AppError("Unable to verify file source. Access denied.", 403);
-    }
+  const match = url.match(/^https:\/\/res\.cloudinary\.com\/([^/]+)\//);
+  if (!match || match[1] !== process.env.CLOUDINARY_CLOUD_NAME) {
+    throw new AppError("Unable to verify file source. Access denied.", 403);
+  }
 
-    const hasPrivilege = PRIVILEGED_ROLES.includes(user.role as "admin" | "superadmin" | "examiner");
-    let isAuthorized = false;
+  const hasPrivilege = PRIVILEGED_ROLES.includes(user.role as "admin" | "superadmin" | "examiner");
+  let isAuthorized = false;
 
-    if (hasPrivilege) {
-      const { rows } = await pool.query(
-        `SELECT id FROM submission_documents WHERE evidence_url = $1 AND deleted_at IS NULL LIMIT 1`,
-        [url],
-      );
-      isAuthorized = rows.length > 0;
-    } else {
-      const teamIds = await getUserTeamIds(user.id);
-      const ownershipFilter = `
-        AND (
-          (i.assignee_id = $2 AND i.assignee_model = 'User')
-          OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
-          OR EXISTS (
-            SELECT 1 FROM indicator_assignees ia
-            WHERE ia.indicator_id = i.id AND ia.user_id = $2
-          )
+  if (hasPrivilege) {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM submission_documents WHERE evidence_url = $1 AND deleted_at IS NULL
+       UNION ALL
+       SELECT 1 FROM submission_spot_check_links WHERE evidence_url = $1
+       LIMIT 1`,
+      [url],
+    );
+    isAuthorized = rows.length > 0;
+  } else {
+    const teamIds = await getUserTeamIds(user.id);
+    const ownershipFilter = `
+      AND (
+        (i.assignee_id = $2 AND i.assignee_model = 'User')
+        OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
+        OR EXISTS (
+          SELECT 1 FROM indicator_assignees ia
+          WHERE ia.indicator_id = i.id AND ia.user_id = $2
         )
-      `;
-      const checkParams = teamIds.length > 0 ? [url, user.id, teamIds] : [url, user.id];
+      )
+    `;
+    const checkParams = [url, user.id, teamIds];
 
-      const { rows } = await pool.query(
-        `SELECT d.id
-         FROM submission_documents d
-         JOIN submissions s ON d.submission_id = s.id
-         JOIN indicators i ON s.indicator_id = i.id
-         WHERE d.evidence_url = $1 AND d.deleted_at IS NULL ${ownershipFilter}
-         LIMIT 1`,
-        checkParams,
-      );
-      isAuthorized = rows.length > 0;
-    }
+    const { rows } = await pool.query(
+      `SELECT d.id
+       FROM submission_documents d
+       JOIN submissions s ON d.submission_id = s.id
+       JOIN indicators i ON s.indicator_id = i.id
+       WHERE d.evidence_url = $1 AND d.deleted_at IS NULL ${ownershipFilter}
 
-    if (!isAuthorized) {
-      throw new AppError("You don't have permission to access this file.", 403);
-    }
+       UNION ALL
 
-    const response = await axios({
-      method: "GET",
-      url,
-      responseType: "stream",
-      timeout: 30000,
-      maxContentLength: 100 * 1024 * 1024,
-    });
+       SELECT l.id
+       FROM submission_spot_check_links l
+       JOIN submissions s ON s.id = l.submission_id
+       JOIN indicators i ON s.indicator_id = i.id
+       WHERE l.evidence_url = $1 ${ownershipFilter}
 
-    res.setHeader("Content-Type", response.headers["content-type"] ?? "application/octet-stream");
-    response.data.pipe(res);
-  }),
+       LIMIT 1`,
+      checkParams,
+    );
+    isAuthorized = rows.length > 0;
+  }
+
+  if (!isAuthorized) {
+    throw new AppError("You don't have permission to access this file.", 403);
+  }
+
+  const response = await axios({
+    method: "GET",
+    url,
+    responseType: "stream",
+    timeout: 30000,
+    maxContentLength: 100 * 1024 * 1024,
+  });
+
+  res.setHeader("Content-Type", response.headers["content-type"] ?? "application/octet-stream");
+  response.data.pipe(res);
+}),
 
   /**
    * ✅ UPDATE DOCUMENT DESCRIPTIONS - Bulk update document descriptions
@@ -1456,6 +1508,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       res.status(200).json({
         success: true,
         message: `${updatedDocuments.length} document(s) updated successfully.`,
+        submissionId: submission.id,                 // ✅ hoisted
         data: { 
           submissionId: submission.id, 
           updatedDocuments,
@@ -1664,6 +1717,8 @@ export const UserIndicatorController: IUserIndicatorController = {
       }
 
       if (validated.notes || validated.achievedValue !== null) {
+        // COALESCE keeps the existing value when $2 is null, so no
+        // coercion to 0 is needed here. achieved_value stays NOT NULL.
         await client.query(
           `UPDATE submissions
            SET notes = COALESCE($1, notes),
@@ -1693,6 +1748,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       res.status(200).json({
         success: true,
         message: `${docCheck.rows.length} document(s) resubmitted for review.`,
+        submissionId: submission.id,                 // ✅ hoisted
         data: { 
           submissionId: submission.id, 
           resubmittedDocuments: documentIds,
@@ -1831,6 +1887,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       res.status(200).json({
         success: true,
         message: `Document "${doc.file_name}" has been ${status.toLowerCase()}.`,
+        submissionId: doc.submission_id,             // ✅ hoisted
         data: {
           documentId: docId,
           status,

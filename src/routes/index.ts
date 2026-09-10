@@ -12,6 +12,8 @@ import dashboardRoutes from "../modules/controllers/dashboardRoutes"
 import ExaminerAssignmentRoutes from "../modules/examiner/examinerAssignment.routes"
 import ArchiveRoutes from "../modules/archive/archiveroutes"
 import notificationRoutes from "../modules/notifications/notificationroutes"
+import spotcheckRoutes from "../modules/spotcheck/spot-check-routes"
+import submissionLinksRoutes from "../modules/spotcheck/submission-links.routes"
 
 const router = Router();
 
@@ -53,6 +55,11 @@ router.use("/archive", ArchiveRoutes)
 
 //================ Notification ================
 router.use("/notifications", notificationRoutes);
+
+//================ SpotCheck ================
+router.use("/spot-check", spotcheckRoutes);
+
+router.use("/submissions", submissionLinksRoutes);
 
 
 

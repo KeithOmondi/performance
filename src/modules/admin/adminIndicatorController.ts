@@ -20,12 +20,21 @@ function getParamString(param: string | string[] | undefined): string {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Shared document subquery
+//
+//  Returns BOTH own submission documents AND linked spot-check documents.
+//  Each entry carries a `source` field ('own' | 'spot-check') so the
+//  frontend can distinguish them if needed.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DOCUMENTS_SUBQUERY = `
   (
     SELECT COALESCE(
-      json_agg(
+      json_agg(doc_row.doc_json ORDER BY doc_row.uploaded_at DESC),
+      '[]'::json
+    )
+    FROM (
+      /* Own uploaded documents */
+      SELECT
         json_build_object(
           'id',                d.id,
           'submissionId',      d.submission_id,
@@ -36,14 +45,35 @@ const DOCUMENTS_SUBQUERY = `
           'description',       d.description,
           'status',            d.status,
           'rejectionReason',   d.rejection_reason,
-          'uploadedAt',        d.uploaded_at
-        ) ORDER BY d.uploaded_at DESC
-      ),
-      '[]'::json
-    )
-    FROM submission_documents d
-    WHERE d.submission_id = s.id
-      AND d.deleted_at IS NULL
+          'uploadedAt',        d.uploaded_at,
+          'source',            'own'
+        ) AS doc_json,
+        d.uploaded_at
+      FROM submission_documents d
+      WHERE d.submission_id = s.id
+        AND d.deleted_at IS NULL
+
+      UNION ALL
+
+      /* Linked spot-check library documents */
+      SELECT
+        json_build_object(
+          'id',                l.id,
+          'submissionId',      l.submission_id,
+          'evidenceUrl',       l.evidence_url,
+          'evidencePublicId',  l.evidence_public_id,
+          'fileType',          l.file_type,
+          'fileName',          l.file_name,
+          'description',       l.description,
+          'status',            'Approved',
+          'rejectionReason',   NULL,
+          'uploadedAt',        l.linked_at,
+          'source',            'spot-check'
+        ) AS doc_json,
+        l.linked_at AS uploaded_at
+      FROM submission_spot_check_links l
+      WHERE l.submission_id = s.id
+    ) doc_row
   ) AS documents
 `;
 
@@ -251,6 +281,32 @@ async function fetchAndLockIndicator(client: any, id: string) {
   if (!indicator) throw new AppError("Indicator not found.", 404);
 
   return indicator;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Helper: Resolve assignee name/email for an indicator WITHOUT locking.
+//  Used by quarter-approve/reject to send notification emails.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function resolveIndicatorAssignee(id: string): Promise<{
+  assigneeName: string;
+  assigneeEmail: string | null;
+}> {
+  const { rows } = await pool.query(
+    `SELECT
+       COALESCE(u.name,  t.name)  AS "assigneeName",
+       COALESCE(u.email, t.email) AS "assigneeEmail"
+     FROM indicators i
+     LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
+     LEFT JOIN teams t ON i.assignee_id = t.id AND i.assignee_model = 'Team'
+     WHERE i.id = $1`,
+    [id],
+  );
+
+  return {
+    assigneeName: rows[0]?.assigneeName ?? "User",
+    assigneeEmail: rows[0]?.assigneeEmail ?? null,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -493,6 +549,8 @@ export const approveDocument = asyncHandler(
       } else if (hasPending) {
         newQuarterStatus = 'Pending';
       } else {
+        // No approved-not-all, no rejected, no pending: the remaining
+        // combinations are mixed approved+additional. Treat as partial.
         newQuarterStatus = 'Partially Approved';
       }
 
@@ -739,24 +797,29 @@ export const approveQuarter = asyncHandler(
 
       await client.query("COMMIT");
 
+      /* ── Notification email ────────────────────────────────────────
+         Resolve the assignee email from the users/teams join, since
+         the `indicators` table doesn't have an `assignee_email` column. */
       const quarterLabel = submission.quarter === 0 ? 'Annual' : `Q${submission.quarter}`;
-      const { rows: indicatorRows } = await pool.query(
-        `SELECT name, assignee_email FROM indicators WHERE id = $1`,
-        [id]
-      );
-      const indicator = indicatorRows[0];
+      const { assigneeName, assigneeEmail } = await resolveIndicatorAssignee(id);
 
-      sendMail({
-        to: indicator.assignee_email,
-        subject: `✅ ${quarterLabel} ${submission.year} Approved`,
-        html: `
-          <h2>Quarter Approved</h2>
-          <p>Hello ${indicator.assignee_name || 'User'},</p>
-          <p>The quarter <strong>${quarterLabel} ${submission.year}</strong> has been approved.</p>
-          <p>Approved by: ${adminName}</p>
-          ${adminComment ? `<p>Comment: ${adminComment}</p>` : ''}
-        `,
-      }).catch(console.error);
+      if (assigneeEmail) {
+        sendMail({
+          to: assigneeEmail,
+          subject: `✅ ${quarterLabel} ${submission.year} Approved`,
+          html: `
+            <h2>Quarter Approved</h2>
+            <p>Hello ${assigneeName},</p>
+            <p>The quarter <strong>${quarterLabel} ${submission.year}</strong> has been approved.</p>
+            <p>Approved by: ${adminName ?? 'Admin'}</p>
+            ${adminComment ? `<p>Comment: ${adminComment}</p>` : ''}
+          `,
+        }).catch((err) =>
+          console.error(`[approveQuarter] Failed to send email to ${assigneeEmail}:`, err),
+        );
+      } else {
+        console.warn(`[approveQuarter] No assignee email found for indicator ${id}`);
+      }
 
       res.status(200).json({
         success: true,
@@ -841,25 +904,29 @@ export const rejectQuarter = asyncHandler(
 
       await client.query("COMMIT");
 
+      /* ── Notification email ────────────────────────────────────────
+         Same fix as approveQuarter: resolve assignee from the join. */
       const quarterLabel = submission.quarter === 0 ? 'Annual' : `Q${submission.quarter}`;
-      const { rows: indicatorRows } = await pool.query(
-        `SELECT name, assignee_email FROM indicators WHERE id = $1`,
-        [id]
-      );
-      const indicator = indicatorRows[0];
+      const { assigneeName, assigneeEmail } = await resolveIndicatorAssignee(id);
 
-      sendMail({
-        to: indicator.assignee_email,
-        subject: `❌ ${quarterLabel} ${submission.year} Rejected`,
-        html: `
-          <h2>Quarter Rejected</h2>
-          <p>Hello ${indicator.assignee_name || 'User'},</p>
-          <p>The quarter <strong>${quarterLabel} ${submission.year}</strong> has been rejected.</p>
-          <p>Rejected by: ${adminName}</p>
-          <p><strong>Reason:</strong> ${reason.trim()}</p>
-          <p>Please review the feedback and resubmit.</p>
-        `,
-      }).catch(console.error);
+      if (assigneeEmail) {
+        sendMail({
+          to: assigneeEmail,
+          subject: `❌ ${quarterLabel} ${submission.year} Rejected`,
+          html: `
+            <h2>Quarter Rejected</h2>
+            <p>Hello ${assigneeName},</p>
+            <p>The quarter <strong>${quarterLabel} ${submission.year}</strong> has been rejected.</p>
+            <p>Rejected by: ${adminName ?? 'Admin'}</p>
+            <p><strong>Reason:</strong> ${reason.trim()}</p>
+            <p>Please review the feedback and resubmit.</p>
+          `,
+        }).catch((err) =>
+          console.error(`[rejectQuarter] Failed to send email to ${assigneeEmail}:`, err),
+        );
+      } else {
+        console.warn(`[rejectQuarter] No assignee email found for indicator ${id}`);
+      }
 
       res.status(200).json({
         success: true,
@@ -956,6 +1023,13 @@ export const getIndicatorSubmissions = asyncHandler(
 
 export const getAdminApprovedIndicators = asyncHandler(
   async (_req: Request, res: Response) => {
+    /* ── Broaden the filter ────────────────────────────────────────
+       Previously this only matched `rh.action = 'Verified'`, which is
+       emitted by the legacy overall-approve path. Documents approved
+       via the newer document-level or quarter-level flows emit
+       'Document Approved' / 'Quarter Approved' instead, so those
+       indicators were silently excluded. Now we accept all admin
+       approval actions. */
     const { rows: indicators } = await pool.query(
       `SELECT DISTINCT
          i.id,
@@ -984,8 +1058,13 @@ export const getAdminApprovedIndicators = asyncHandler(
        LEFT JOIN strategic_plans sp ON i.strategic_plan_id = sp.id
        LEFT JOIN strategic_objectives so ON i.objective_id = so.id
        LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
-       WHERE rh.action = 'Verified'
-         AND rh.reviewer_role = 'admin'
+       WHERE rh.reviewer_role = 'admin'
+         AND rh.action IN (
+           'Verified',
+           'Approved',
+           'Document Approved',
+           'Quarter Approved'
+         )
        ORDER BY i.updated_at DESC`,
     );
 
@@ -1051,10 +1130,21 @@ export const deleteSubmission = asyncHandler(
         .map((r: any) => r.evidence_public_id)
         .filter(Boolean);
 
+      /* ── Delete dependents in FK order ───────────────────────────
+         submission_spot_check_links references submissions with
+         ON DELETE RESTRICT (per the schema script), so it must be
+         cleared before deleting the submission row itself. Otherwise
+         the DELETE below can fail with a foreign key violation. */
+      await client.query(
+        `DELETE FROM submission_spot_check_links WHERE submission_id = $1`,
+        [submissionId],
+      );
+
       await client.query(
         `DELETE FROM submission_documents WHERE submission_id = $1`,
         [submissionId],
       );
+
       await client.query(`DELETE FROM submissions WHERE id = $1`, [
         submissionId,
       ]);
@@ -1315,19 +1405,25 @@ export const rejectSubmission = asyncHandler(
 
       const taskTitle = indicator.instructions || "Performance Indicator";
       const year = new Date().getFullYear();
-      sendMail({
-        to: indicator.assignee_email,
-        subject: "Submission Returned for Correction",
-        html: submissionRejectedTemplate(
-          indicator.name,
-          taskTitle,
-          indicator.reporting_cycle,
-          indicator.active_quarter,
-          year,
-          "Admin",
-          adminOverallComments,
-        ),
-      }).catch(console.error);
+      const { assigneeName, assigneeEmail } = await resolveIndicatorAssignee(id);
+
+      if (assigneeEmail) {
+        sendMail({
+          to: assigneeEmail,
+          subject: "Submission Returned for Correction",
+          html: submissionRejectedTemplate(
+            assigneeName,
+            taskTitle,
+            indicator.reporting_cycle,
+            indicator.active_quarter,
+            year,
+            "Admin",
+            adminOverallComments,
+          ),
+        }).catch((err) =>
+          console.error(`[rejectSubmission] Failed to send email to ${assigneeEmail}:`, err),
+        );
+      }
 
       res.status(200).json({
         success: true,
@@ -1348,7 +1444,7 @@ export const rejectSubmission = asyncHandler(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  15. GET Indicators Sent Back to Admin (NEW)
+//  15. GET Indicators Sent Back to Admin
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const getSentBackIndicators = asyncHandler(
@@ -1374,8 +1470,8 @@ export const getSentBackIndicators = asyncHandler(
          sp.perspective,
          jsonb_build_object('title',       so.title)       AS objective,
          jsonb_build_object('description', sa.description) AS activity,
-         rh.at                             AS "sentBackAt",  -- ✅ Added to SELECT list for ORDER BY
-         rh.reason                         AS "sentBackReason" -- ✅ Added to SELECT list
+         rh.at                             AS "sentBackAt",
+         rh.reason                         AS "sentBackReason"
        FROM indicators i
        JOIN review_history rh ON rh.indicator_id = i.id
        LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
@@ -1428,8 +1524,8 @@ export const getReturnedIndicators = asyncHandler(
          sp.perspective,
          jsonb_build_object('title',       so.title)       AS objective,
          jsonb_build_object('description', sa.description) AS activity,
-         s.review_status                   AS "submissionReviewStatus",  -- ✅ Added to SELECT list
-         s.submitted_at                    AS "lastSubmittedAt"          -- ✅ Added to SELECT list
+         s.review_status                   AS "submissionReviewStatus",
+         s.submitted_at                    AS "lastSubmittedAt"
        FROM indicators i
        JOIN submissions s ON s.indicator_id = i.id
        LEFT JOIN users u ON i.assignee_id = u.id AND i.assignee_model = 'User'
