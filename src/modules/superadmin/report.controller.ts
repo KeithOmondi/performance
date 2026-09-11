@@ -81,6 +81,7 @@ const REPORT_SELECT = `
                 )
                 FROM submission_documents sd
                 WHERE sd.submission_id = s.id
+                  AND sd.deleted_at IS NULL
                   AND sd.status != 'Deleted'
               ),
               '[]'::json
@@ -131,59 +132,46 @@ function buildWhereClause(query: Request["query"]): {
   where: string;
   params: (string | number)[];
 } {
+  /*
+   * Base filter.
+   *
+   * Only soft-deleted indicators are excluded by default.
+   *
+   * There is NO implicit status inclusion or exclusion list any more —
+   * every indicator that exists in the DB is returned unless the caller
+   * explicitly narrows the result via query parameters.
+   *
+   * Available (optional) query params:
+   *
+   *   ?perspective=FINANCIAL PERSPECTIVE
+   *   ?status=Completed
+   *   ?status=Completed,Pending,Awaiting Admin Approval
+   *   ?assigneeId=<uuid>
+   *   ?quarter=1
+   *   ?year=2026
+   *   ?hasSubmission=true
+   *   ?hasSubmission=false
+   *   ?submissionStatus=Verified,Accepted
+   */
   let where = "WHERE i.deleted_at IS NULL";
 
   const params: (string | number)[] = [];
 
-  /*
-   * Include:
-   * - Completed
-   * - Partially Approved
-   * - Awaiting Super Admin
-   * - Indicators with no submissions
-   */
-  where += `
-    AND (
-      i.status = 'Completed'
-      OR i.status = 'Partially Approved'
-      OR i.status = 'Awaiting Super Admin'
-      OR NOT EXISTS (
-        SELECT 1
-        FROM submissions s
-        WHERE s.indicator_id = i.id
-      )
-    )
-  `;
-
-  /*
-   * Exclude rejected / returned indicators.
-   */
-  where += `
-    AND i.status NOT IN (
-      'Rejected by Admin',
-      'Rejected by Super Admin',
-      'Correction Needed',
-      'Awaiting Admin Approval'
-    )
-  `;
+  /* ── Perspective filter ────────────────────────────────────────────── */
 
   if (query.perspective) {
     params.push(query.perspective as string);
-
-    where += `
-      AND sp.perspective = $${params.length}
-    `;
+    where += ` AND sp.perspective = $${params.length}`;
   }
 
+  /* ── Status filter (indicator status, not submission status) ───────── */
+
   /*
-   * Status filter — accepts a single value OR a comma-separated list.
-   *   ?status=Completed
-   *   ?status=Partially Approved,Awaiting Super Admin
-   *   ?status=Pending,Verified,Awaiting Admin Approval,...
+   * `?status=all` disables the filter, otherwise a single value
+   * or a comma-separated list is accepted.
    *
-   * The explicit ::indicator_status[] cast is required because
-   * `i.status` is a Postgres enum, not text. A plain `ANY($N)` would
-   * be treated as text[] and reject the comparison.
+   * The `::indicator_status` cast is required because `i.status`
+   * is a Postgres enum, not text.
    */
   if (query.status && query.status !== "all") {
     const statuses = String(query.status)
@@ -193,58 +181,50 @@ function buildWhereClause(query: Request["query"]): {
 
     if (statuses.length === 1) {
       params.push(statuses[0]);
-
-      where += `
-        AND i.status = $${params.length}::indicator_status
-      `;
+      where += ` AND i.status = $${params.length}::indicator_status`;
     } else if (statuses.length > 1) {
       const placeholders = statuses
         .map((_, index) => `$${params.length + index + 1}`)
         .join(", ");
 
       params.push(...statuses);
-
-      where += `
-        AND i.status = ANY(ARRAY[${placeholders}]::indicator_status[])
-      `;
+      where += ` AND i.status = ANY(ARRAY[${placeholders}]::indicator_status[])`;
     }
   }
 
+  /* ── Assignee filter ───────────────────────────────────────────────── */
+
   if (query.assigneeId) {
     params.push(query.assigneeId as string);
-
-    where += `
-      AND i.assignee_id = $${params.length}
-    `;
+    where += ` AND i.assignee_id = $${params.length}`;
   }
+
+  /* ── Active quarter filter ─────────────────────────────────────────── */
 
   if (query.quarter) {
     params.push(Number(query.quarter));
-
-    where += `
-      AND i.active_quarter = $${params.length}
-    `;
+    where += ` AND i.active_quarter = $${params.length}`;
   }
+
+  /* ── Year filter (any submission exists in that year) ──────────────── */
 
   if (query.year) {
     params.push(Number(query.year));
-
     where += `
       AND EXISTS (
-        SELECT 1
-        FROM submissions s2
+        SELECT 1 FROM submissions s2
         WHERE s2.indicator_id = i.id
           AND s2.year = $${params.length}
       )
     `;
   }
 
+  /* ── Has-submission filter ─────────────────────────────────────────── */
+
   if (query.hasSubmission === "true") {
     where += `
       AND EXISTS (
-        SELECT 1
-        FROM submissions s
-        WHERE s.indicator_id = i.id
+        SELECT 1 FROM submissions s WHERE s.indicator_id = i.id
       )
     `;
   }
@@ -252,47 +232,37 @@ function buildWhereClause(query: Request["query"]): {
   if (query.hasSubmission === "false") {
     where += `
       AND NOT EXISTS (
-        SELECT 1
-        FROM submissions s
-        WHERE s.indicator_id = i.id
+        SELECT 1 FROM submissions s WHERE s.indicator_id = i.id
       )
     `;
   }
 
+  /* ── Submission review-status filter ───────────────────────────────── */
+
   if (query.submissionStatus) {
     const statuses = (query.submissionStatus as string)
       .split(",")
-      .map((status) => status.trim())
+      .map((s) => s.trim())
       .filter(Boolean);
 
     if (statuses.length > 0) {
-      const statusPlaceholders = statuses
-        .map(
-          (_, index) =>
-            `$${params.length + index + 1}`
-        )
+      const placeholders = statuses
+        .map((_, index) => `$${params.length + index + 1}`)
         .join(", ");
 
       params.push(...statuses);
 
       where += `
         AND EXISTS (
-          SELECT 1
-          FROM submissions s
+          SELECT 1 FROM submissions s
           WHERE s.indicator_id = i.id
-            AND s.review_status =
-              ANY(
-                ARRAY[${statusPlaceholders}]::review_status[]
-              )
+            AND s.review_status = ANY(ARRAY[${placeholders}]::review_status[])
         )
       `;
     }
   }
 
-  return {
-    where,
-    params,
-  };
+  return { where, params };
 }
 
 /* ============================================================================
@@ -512,7 +482,9 @@ function getEvidenceLines(
 
     /*
      * Only active/non-deleted documents should
-     * reach this point.
+     * reach this point. The query already filters
+     * `deleted_at IS NULL` AND `status != 'Deleted'`;
+     * this second check is a defensive duplicate.
      */
     const validDocuments = documents.filter(
       (doc: DocumentRow) =>
@@ -538,7 +510,6 @@ function getEvidenceLines(
       continue;
     }
 
-    // ✅ REMOVED: Review status from header
     lines.push({
       isBullet: false,
       text: `─── ${periodLabel} ${submission.year} ───`,
@@ -617,27 +588,6 @@ const UI_COLORS = {
    PDF TABLE SETTINGS
 ============================================================================ */
 
-/*
- * A4 landscape is approximately:
- *
- * width  = 841.89
- * height = 595.28
- *
- * With 20px left/right margins:
- *
- * printable width ≈ 801.89
- *
- * Therefore the columns MUST add up to <= 801.89.
- *
- * Previous controller had:
- *
- * 140 + 50 + 150 + 110 + 280 + 90 = 820
- *
- * which was wider than the printable A4 page.
- *
- * This version totals exactly 801.
- */
-
 const COL_WIDTHS = [
   125, // Indicator
   45,  // Unit
@@ -679,11 +629,6 @@ function getPageBottom(
   );
 }
 
-/**
- * Measure a normal table cell using the actual
- * PDFKit font and width rather than estimating
- * characters.
- */
 function measureCellHeight(
   doc: InstanceType<typeof PDFDocument>,
   text: string,
@@ -714,10 +659,6 @@ function measureCellHeight(
   ) + ROW_PADDING * 2;
 }
 
-/**
- * Calculate the vertical height required by
- * one evidence line.
- */
 function measureEvidenceLineHeight(
   doc: InstanceType<typeof PDFDocument>,
   line: EvidenceLine,
@@ -789,9 +730,6 @@ function measureEvidenceLineHeight(
   );
 }
 
-/**
- * Measure all evidence lines.
- */
 function measureEvidenceHeight(
   doc: InstanceType<typeof PDFDocument>,
   lines: EvidenceLine[],
@@ -818,12 +756,6 @@ function measureEvidenceHeight(
    SPLIT LONG EVIDENCE TEXT
 ============================================================================ */
 
-/**
- * A single evidence description can itself be extremely long.
- *
- * This helper prevents one description from becoming
- * taller than an entire A4 page.
- */
 function splitEvidenceLineToHeight(
   doc: InstanceType<typeof PDFDocument>,
   line: EvidenceLine,
@@ -847,10 +779,6 @@ function splitEvidenceLineToHeight(
     };
   }
 
-  /*
-   * Quarter headers and blank lines are tiny and
-   * should never need splitting.
-   */
   if (
     line.text === "" ||
     line.text.startsWith("───")
@@ -876,10 +804,6 @@ function splitEvidenceLineToHeight(
   let high = words.length;
   let best = 0;
 
-  /*
-   * Binary search for the largest number of words
-   * that fits the available vertical space.
-   */
   while (low <= high) {
     const mid = Math.floor(
       (low + high) / 2
@@ -908,9 +832,6 @@ function splitEvidenceLineToHeight(
     }
   }
 
-  /*
-   * Nothing fits on this page.
-   */
   if (best === 0) {
     return {
       first: null,
@@ -982,9 +903,6 @@ function takeEvidenceChunk(
       continue;
     }
 
-    /*
-     * Try splitting a long line.
-     */
     const split =
       splitEvidenceLineToHeight(
         doc,
@@ -1010,9 +928,6 @@ function takeEvidenceChunk(
       continue;
     }
 
-    /*
-     * Nothing from this line fits.
-     */
     break;
   }
 
@@ -1044,9 +959,6 @@ function drawTableRow(
     options.skipTextColumns || []
   );
 
-  /*
-   * Background.
-   */
   if (options.fillColor) {
     doc.save();
 
@@ -1062,9 +974,6 @@ function drawTableRow(
     doc.restore();
   }
 
-  /*
-   * Vertical/horizontal borders.
-   */
   let cx = x;
 
   for (const width of COL_WIDTHS) {
@@ -1086,9 +995,6 @@ function drawTableRow(
     cx += width;
   }
 
-  /*
-   * Cell text.
-   */
   cx = x;
 
   cells.forEach((cell, index) => {
@@ -1136,10 +1042,6 @@ function drawTableRow(
     cx += COL_WIDTHS[index];
   });
 
-  /*
-   * On continuation rows, identify that the
-   * evidence is continuing.
-   */
   if (
     options.continuation &&
     cells[EVIDENCE_COL_INDEX] === ""
@@ -1211,9 +1113,6 @@ function drawEvidenceCell(
     rowY + ROW_PADDING;
 
   for (const line of lines) {
-    /*
-     * Quarter heading.
-     */
     if (
       line.text.startsWith("───")
     ) {
@@ -1247,17 +1146,11 @@ function drawEvidenceCell(
       continue;
     }
 
-    /*
-     * Spacer.
-     */
     if (line.text === "") {
       cy += 3;
       continue;
     }
 
-    /*
-     * Evidence document description.
-     */
     if (line.isBullet) {
       const textOptions = {
         width:
@@ -1313,9 +1206,6 @@ function drawEvidenceCell(
       continue;
     }
 
-    /*
-     * Submission notes.
-     */
     const textOptions = {
       width: innerWidth,
       align: "left" as const,
@@ -1513,9 +1403,6 @@ function drawPerspectiveHeader(
 
   doc.restore();
 
-  /*
-   * Border.
-   */
   doc.save();
 
   doc
@@ -1597,9 +1484,6 @@ function drawReportTitle(
 
   const logoSize = 54;
 
-  /*
-   * Logo.
-   */
   if (logoBuffer) {
     try {
       doc.image(
@@ -1624,9 +1508,6 @@ function drawReportTitle(
     }
   }
 
-  /*
-   * Main title.
-   */
   doc
     .font("Helvetica-Bold")
     .fontSize(14)
@@ -1643,9 +1524,6 @@ function drawReportTitle(
 
   doc.moveDown(0.3);
 
-  /*
-   * Subtitle.
-   */
   doc
     .font("Helvetica-Bold")
     .fontSize(9)
@@ -1732,9 +1610,6 @@ function drawFooters(
       doc.page.margins.bottom +
       4;
 
-    /*
-     * Footer separator.
-     */
     doc
       .save()
       .moveTo(
@@ -2008,10 +1883,6 @@ export const getTrackerPdf =
       req: Request,
       res: Response
     ) => {
-      /* ----------------------------------------------------------------------
-         GET DATA
-      ---------------------------------------------------------------------- */
-
       const {
         where,
         params,
@@ -2040,18 +1911,10 @@ export const getTrackerPdf =
           rows as IndicatorRow[]
         );
 
-      /* ----------------------------------------------------------------------
-         LOGO
-      ---------------------------------------------------------------------- */
-
       const logoBuffer =
         await fetchLogoBuffer(
           LOGO_URL
         );
-
-      /* ----------------------------------------------------------------------
-         CREATE A4 LANDSCAPE PDF
-      ---------------------------------------------------------------------- */
 
       const doc =
         new PDFDocument({
@@ -2067,15 +1930,8 @@ export const getTrackerPdf =
 
           bufferPages: true,
 
-          /*
-           * Better PDF compatibility.
-           */
           autoFirstPage: true,
         });
-
-      /* ----------------------------------------------------------------------
-         RESPONSE HEADERS
-      ---------------------------------------------------------------------- */
 
       res.setHeader(
         "Content-Type",
@@ -2091,19 +1947,11 @@ export const getTrackerPdf =
 
       doc.pipe(res);
 
-      /* ----------------------------------------------------------------------
-         PAGE VARIABLES
-      ---------------------------------------------------------------------- */
-
       const TABLE_X =
         doc.page.margins.left;
 
       let cursorY =
         doc.page.margins.top;
-
-      /* ----------------------------------------------------------------------
-         FIRST PAGE TITLE
-      ---------------------------------------------------------------------- */
 
       drawReportTitle(
         doc,
@@ -2112,9 +1960,6 @@ export const getTrackerPdf =
 
       cursorY = doc.y;
 
-      /*
-       * Table header.
-       */
       cursorY +=
         drawTableHeader(
           doc,
@@ -2122,18 +1967,9 @@ export const getTrackerPdf =
           cursorY
         );
 
-      /* ----------------------------------------------------------------------
-         PDF RENDERING
-      ---------------------------------------------------------------------- */
-
       let rowIndex = 0;
 
       for (const perspective of grouped) {
-        /*
-         * Before drawing perspective header,
-         * make sure we have enough room for it
-         * and at least one table row.
-         */
         if (
           cursorY +
             PERSPECTIVE_HEIGHT +
@@ -2153,9 +1989,6 @@ export const getTrackerPdf =
             );
         }
 
-        /*
-         * Perspective heading.
-         */
         cursorY +=
           drawPerspectiveHeader(
             doc,
@@ -2164,44 +1997,24 @@ export const getTrackerPdf =
             cursorY
           );
 
-        /*
-         * Objectives.
-         */
         for (const objective of
           perspective.objectives) {
-          /*
-           * Activities.
-           */
           for (const activity of
             objective.activities) {
-            /*
-             * We only print the objective/activity
-             * information on the first indicator
-             * belonging to the activity.
-             */
             let firstActivityIndicator =
               true;
 
-            /*
-             * Indicators.
-             */
             for (const indicator of
               activity.indicators) {
               const submissions =
                 indicator.submissions ||
                 [];
 
-              /*
-               * ALL evidence.
-               */
               let remainingEvidence =
                 getEvidenceLines(
                   submissions
                 );
 
-              /*
-               * Build normal table cells.
-               */
               let indicatorCell =
                 "";
 
@@ -2217,17 +2030,10 @@ export const getTrackerPdf =
                   false;
               }
 
-              /*
-               * Notes column - REMOVED all admin/review metadata
-               */
               let notesText =
                 activity.description ||
                 "";
 
-              /*
-               * Add submission period information
-               * to explanatory notes - WITHOUT review status
-               */
               if (
                 submissions.length > 0
               ) {
@@ -2260,12 +2066,8 @@ export const getTrackerPdf =
                       ? "Annual"
                       : `Q${sub.quarter}`;
 
-                  // ✅ REMOVED: Review status from notes
                   notesText +=
                     `\n[${periodLabel} ${sub.year}]`;
-
-                  // ✅ REMOVED: Admin comments
-                  // ✅ REMOVED: Resubmission count
                 }
               } else {
                 notesText +=
@@ -2279,17 +2081,10 @@ export const getTrackerPdf =
                   `\n${indicator.instructions}`;
               }
 
-              /*
-               * Has submission?
-               */
               const hasSubmission =
                 submissions.length >
                 0;
 
-              /*
-               * The normal cells for the
-               * first physical row.
-               */
               const firstCells = [
                 indicatorCell,
 
@@ -2307,19 +2102,12 @@ export const getTrackerPdf =
                   : "NO SUBMISSION",
               ];
 
-              /*
-               * Measure normal columns.
-               */
-              let normalRowHeight =
+              const normalRowHeight =
                 measureNormalRowHeight(
                   doc,
                   firstCells
                 );
 
-              /*
-               * Ensure there is enough room
-               * for the first row.
-               */
               if (
                 cursorY +
                   normalRowHeight >
@@ -2337,10 +2125,6 @@ export const getTrackerPdf =
                     cursorY
                   );
 
-                /*
-                 * Small continuation label
-                 * for the perspective.
-                 */
                 cursorY +=
                   drawPerspectiveHeader(
                     doc,
@@ -2350,10 +2134,6 @@ export const getTrackerPdf =
                   );
               }
 
-              /*
-               * If there is NO evidence,
-               * render a normal one-row indicator.
-               */
               if (
                 remainingEvidence.length ===
                 0
@@ -2423,20 +2203,6 @@ export const getTrackerPdf =
                 continue;
               }
 
-              /*
-               * ==============================================================
-               * EVIDENCE ROWS
-               *
-               * This is the important part.
-               *
-               * Instead of putting all evidence into
-               * one enormous row, we split it into
-               * multiple physical table rows/pages.
-               *
-               * NOTHING IS DROPPED.
-               * ==============================================================
-               */
-
               let isFirstEvidenceRow =
                 true;
 
@@ -2444,18 +2210,10 @@ export const getTrackerPdf =
                 remainingEvidence.length >
                 0
               ) {
-                /*
-                 * Available vertical space
-                 * on the current page.
-                 */
                 let availablePageHeight =
                   getPageBottom(doc) -
                   cursorY;
 
-                /*
-                 * Keep at least 25px available
-                 * for a useful row.
-                 */
                 if (
                   availablePageHeight <
                   30
@@ -2485,11 +2243,6 @@ export const getTrackerPdf =
                     cursorY;
                 }
 
-                /*
-                 * Evidence content gets the
-                 * available page height minus
-                 * table padding.
-                 */
                 const maxEvidenceHeight =
                   Math.max(
                     20,
@@ -2497,10 +2250,6 @@ export const getTrackerPdf =
                       ROW_PADDING * 2
                   );
 
-                /*
-                 * Take as many evidence lines
-                 * as physically fit.
-                 */
                 const evidenceChunk =
                   takeEvidenceChunk(
                     doc,
@@ -2511,12 +2260,6 @@ export const getTrackerPdf =
                     maxEvidenceHeight
                   );
 
-                /*
-                 * It is possible that the next
-                 * evidence line is too large to
-                 * fit because the remaining page
-                 * space is tiny.
-                 */
                 if (
                   evidenceChunk.chunk
                     .length === 0
@@ -2544,9 +2287,6 @@ export const getTrackerPdf =
                   continue;
                 }
 
-                /*
-                 * Measure evidence chunk.
-                 */
                 const evidenceHeight =
                   measureEvidenceHeight(
                     doc,
@@ -2557,13 +2297,6 @@ export const getTrackerPdf =
                   ) +
                   ROW_PADDING * 2;
 
-                /*
-                 * First row contains all
-                 * metadata.
-                 *
-                 * Continuation rows only contain
-                 * evidence.
-                 */
                 const cells =
                   isFirstEvidenceRow
                     ? [
@@ -2583,13 +2316,6 @@ export const getTrackerPdf =
                         "",
                       ];
 
-                /*
-                 * On first row, normal content
-                 * determines a minimum height.
-                 *
-                 * On continuation rows,
-                 * evidence determines it.
-                 */
                 const rowHeight =
                   isFirstEvidenceRow
                     ? Math.max(
@@ -2602,10 +2328,6 @@ export const getTrackerPdf =
                         24
                       );
 
-                /*
-                 * If the row somehow doesn't fit,
-                 * move it to the next page.
-                 */
                 if (
                   cursorY +
                     rowHeight >
@@ -2634,12 +2356,6 @@ export const getTrackerPdf =
                   continue;
                 }
 
-                /*
-                 * Alternating background.
-                 *
-                 * Continuation rows retain the
-                 * same indicator shading.
-                 */
                 const fillColor =
                   rowIndex % 2 === 0
                     ? UI_COLORS.rowAlt
@@ -2664,9 +2380,6 @@ export const getTrackerPdf =
                   }
                 );
 
-                /*
-                 * Evidence X position.
-                 */
                 const evidenceX =
                   TABLE_X +
                   COL_WIDTHS
@@ -2680,9 +2393,6 @@ export const getTrackerPdf =
                       0
                     );
 
-                /*
-                 * Draw this evidence chunk.
-                 */
                 drawEvidenceCell(
                   doc,
                   evidenceChunk.chunk,
@@ -2690,10 +2400,6 @@ export const getTrackerPdf =
                   cursorY
                 );
 
-                /*
-                 * Status only belongs on
-                 * the first physical row.
-                 */
                 if (
                   isFirstEvidenceRow
                 ) {
@@ -2723,15 +2429,9 @@ export const getTrackerPdf =
                   );
                 }
 
-                /*
-                 * Advance vertically.
-                 */
                 cursorY +=
                   rowHeight;
 
-                /*
-                 * Remove rendered evidence.
-                 */
                 remainingEvidence =
                   evidenceChunk.remaining;
 
@@ -2739,28 +2439,16 @@ export const getTrackerPdf =
                   false;
               }
 
-              /*
-               * The complete indicator has
-               * now been rendered.
-               */
               rowIndex++;
             }
           }
         }
       }
 
-      /* ----------------------------------------------------------------------
-         FOOTERS / PAGE NUMBERS
-      ---------------------------------------------------------------------- */
-
       drawFooters(
         doc,
         TABLE_X
       );
-
-      /* ----------------------------------------------------------------------
-         FINISH PDF
-      ---------------------------------------------------------------------- */
 
       doc.end();
     }
