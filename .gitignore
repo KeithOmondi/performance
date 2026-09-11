@@ -20,3 +20,6 @@ src/strategicPlanSeeder.ts
 
 # Ignore seedCourts scripts
 src/seedUsers.ts
+
+
+src/seed-fix.ts
