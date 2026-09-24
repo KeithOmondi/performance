@@ -1,215 +1,190 @@
-// scripts/delete-q3-submission.ts
+// src/check_duplicates.ts
+import { pool } from "./config/db";
 
-import { pool } from "../src/config/db";
+const GHOST_INDICATOR_ID  = "e7ad1bb0-ac1e-4d84-a33a-79dbd89d0e32";
+const GHOST_ACTIVITY_ID   = "01ceeee3-410c-4036-8c28-560d9261067d";
+const GHOST_OBJECTIVE_ID  = "42bfafbe-96de-45a6-8064-ad51c36df03c";
+const KEEP_INDICATOR_ID   = "5c236e0a-a694-46cb-bc6e-92e57108ddb6";
 
-async function deleteQ3Submission() {
+async function main() {
   console.log("\n╔════════════════════════════════════════════════════════════════╗");
-  console.log("║              DELETE Q3 2026 SUBMISSION                         ║");
+  console.log("║           KILL GHOST INDICATOR / ACTIVITY / OBJECTIVE          ║");
   console.log("╚════════════════════════════════════════════════════════════════╝\n");
 
-  const submissionId = "cd8229cc-c200-4d9c-8680-728033929458"; // Q3 2026 submission
+  const commit = process.argv.includes("--commit");
+  console.log(commit ? "🔴 MODE: COMMIT (deletions will run)\n" : "🔒 MODE: DRY RUN (nothing will be deleted)\n");
 
-  // ─── 1. Verify the submission exists ──────────────────────────────────
-  console.log(`🔍 Verifying submission: ${submissionId}\n`);
+  // ─────────────────────────────────────────────────────────────────
+  // PHASE 1: Inventory — figure out exactly what's tied to the ghost
+  // ─────────────────────────────────────────────────────────────────
 
-  const checkResult = await pool.query(`
-    SELECT 
-      s.id,
-      s.quarter,
-      s.year,
-      s.review_status,
-      s.submitted_at,
-      s.notes,
-      s.admin_comment,
-      i.id as indicator_id,
-      sa.description as activity_description,
-      u.name as assignee_name,
-      COUNT(sd.id) as document_count
-    FROM submissions s
-    JOIN indicators i ON s.indicator_id = i.id
-    JOIN strategic_activities sa ON i.activity_id = sa.id
-    LEFT JOIN users u ON i.assignee_id = u.id
-    LEFT JOIN submission_documents sd ON sd.submission_id = s.id AND sd.status != 'Deleted'
-    WHERE s.id = $1
-    GROUP BY s.id, i.id, sa.description, u.name
-  `, [submissionId]);
+  console.log("─── PHASE 1: INVENTORY ───────────────────────────────────────────\n");
 
-  if (checkResult.rowCount === 0) {
-    console.log(`❌ Submission ${submissionId} not found.`);
+  // 1a. Ghost indicator
+  const ghostInd = await pool.query(
+    `SELECT id, assignee_id, reporting_cycle, status, deleted_at
+     FROM indicators WHERE id = $1`, [GHOST_INDICATOR_ID]);
+  if (ghostInd.rowCount === 0) {
+    console.log("✅ Ghost indicator already gone. Nothing to do.");
+    await pool.end();
+    return;
+  }
+  const gi = ghostInd.rows[0];
+  console.log(`[1a] Ghost indicator:      ${gi.id}`);
+  console.log(`     assignee=${gi.assignee_id ?? "NULL"}  cycle=${gi.reporting_cycle}  status=${gi.status}`);
+
+  // 1b. Submissions on the ghost indicator
+  const ghostSubs = await pool.query(
+    `SELECT id, review_status FROM submissions WHERE indicator_id = $1`,
+    [GHOST_INDICATOR_ID]);
+  console.log(`\n[1b] Submissions on ghost: ${ghostSubs.rowCount}`);
+
+  // 1c. Other indicators on the ghost activity
+  const otherInds = await pool.query(
+    `SELECT id, assignee_id, reporting_cycle, status
+     FROM indicators WHERE activity_id = $1 AND id != $2`,
+    [GHOST_ACTIVITY_ID, GHOST_INDICATOR_ID]);
+  console.log(`[1c] Other indicators on ghost activity: ${otherInds.rowCount}`);
+  for (const r of otherInds.rows) {
+    console.log(`     • ${r.id}  assignee=${r.assignee_id ?? "NULL"}  cycle=${r.reporting_cycle}  status=${r.status}`);
+  }
+
+  // 1d. Other activities on the ghost objective
+  const otherActs = await pool.query(
+    `SELECT id, description FROM strategic_activities
+     WHERE objective_id = $1 AND id != $2`,
+    [GHOST_OBJECTIVE_ID, GHOST_ACTIVITY_ID]);
+  console.log(`\n[1d] Other activities on ghost objective: ${otherActs.rowCount}`);
+  for (const r of otherActs.rows) {
+    console.log(`     • ${r.id} — ${r.description.slice(0, 70)}`);
+  }
+
+  // 1e. Anything else referencing the ghost objective
+  const otherRefs: Array<{ table: string; count: number }> = [];
+  const refTables = [
+    { table: "examiner_folder_assignments", col: "objective_id" },
+    { table: "indicator_archives",          col: "objective_id" },
+  ];
+  for (const { table, col } of refTables) {
+    try {
+      const r = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM ${table} WHERE ${col} = $1`,
+        [GHOST_OBJECTIVE_ID]);
+      if (r.rows[0].n > 0) otherRefs.push({ table, count: r.rows[0].n });
+      console.log(`[1e] ${table}.${col} references: ${r.rows[0].n}`);
+    } catch {
+      console.log(`[1e] ${table}: (table/column missing, skipping)`);
+    }
+  }
+
+  // 1f. Documents under ghost submissions (should be zero)
+  let ghostDocCount = 0;
+  if (ghostSubs.rowCount && ghostSubs.rowCount > 0) {
+    const r = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM submission_documents
+       WHERE submission_id IN (SELECT id FROM submissions WHERE indicator_id = $1)`,
+      [GHOST_INDICATOR_ID]);
+    ghostDocCount = r.rows[0].n;
+  }
+  console.log(`[1f] Documents tied to ghost submissions: ${ghostDocCount}`);
+
+  // 1g. Confirm keep indicator is safe
+  const keep = await pool.query(
+    `SELECT id, status FROM indicators WHERE id = $1`, [KEEP_INDICATOR_ID]);
+  console.log(`\n[1g] KEEP indicator: ${KEEP_INDICATOR_ID} → ${keep.rows[0]?.status ?? "❌ NOT FOUND"}`);
+
+  // ─────────────────────────────────────────────────────────────────
+  // PHASE 2: Decision — what's safe to delete?
+  // ─────────────────────────────────────────────────────────────────
+
+  console.log("\n─── PHASE 2: PLAN ────────────────────────────────────────────────\n");
+
+  const safeToDeleteActivity = otherInds.rowCount === 0;
+  const safeToDeleteObjective =
+    otherActs.rowCount === 0 && otherRefs.length === 0;
+
+  console.log(`  Delete ghost indicator  (${GHOST_INDICATOR_ID})       → ✅ always`);
+  console.log(`  Delete ghost activity   (${GHOST_ACTIVITY_ID})        → ${safeToDeleteActivity ? "✅ no other indicators reference it" : "❌ blocked — other indicators reference it"}`);
+  console.log(`  Delete ghost objective  (${GHOST_OBJECTIVE_ID})       → ${safeToDeleteObjective ? "✅ no other references" : "❌ blocked — other rows reference it"}`);
+
+  if (ghostSubs.rowCount && ghostSubs.rowCount > 0) {
+    console.log(`\n  ⚠️  Ghost has ${ghostSubs.rowCount} submission(s) — will delete them first (cascade).`);
+  }
+  if (ghostDocCount > 0) {
+    console.log(`  ⚠️  Ghost has ${ghostDocCount} document(s) — will delete them first.`);
+  }
+
+  console.log("\n═══════════════════════════════════════════════════════════════════");
+
+  if (!commit) {
+    console.log("\n🔒 DRY RUN COMPLETE — no changes made.");
+    console.log("   Re-run with --commit to execute.\n");
     await pool.end();
     return;
   }
 
-  const sub = checkResult.rows[0];
-  console.log(`✅ Found submission to delete:\n`);
-  console.log(`   📋 Submission Details:`);
-  console.log(`      ID: ${sub.id}`);
-  console.log(`      Quarter: Q${sub.quarter} ${sub.year}`);
-  console.log(`      Review Status: ${sub.review_status}`);
-  console.log(`      Submitted: ${new Date(sub.submitted_at).toLocaleString()}`);
-  console.log(`      Activity: ${sub.activity_description}`);
-  console.log(`      Assignee: ${sub.assignee_name || 'N/A'}`);
-  console.log(`      Documents: ${sub.document_count || 0} attached`);
-  if (sub.notes) {
-    console.log(`      Notes: ${sub.notes}`);
-  }
-  if (sub.admin_comment) {
-    console.log(`      Admin Comment: ${sub.admin_comment}`);
-  }
-  console.log();
+  // ─────────────────────────────────────────────────────────────────
+  // PHASE 3: Commit — transactional deletion
+  // ─────────────────────────────────────────────────────────────────
 
-  // ─── 2. Get documents that will be deleted ────────────────────────────
-  const docsResult = await pool.query(`
-    SELECT 
-      id,
-      file_name,
-      description,
-      evidence_url,
-      status
-    FROM submission_documents
-    WHERE submission_id = $1
-      AND status != 'Deleted'
-  `, [submissionId]);
-
-  const docCount = docsResult.rowCount ?? 0;
-  if (docCount > 0) {
-    console.log(`   📎 Documents to be deleted (${docCount}):`);
-    for (const doc of docsResult.rows) {
-      console.log(`      • ${doc.file_name}`);
-      if (doc.description) {
-        console.log(`        Description: ${doc.description}`);
-      }
-      console.log(`        Status: ${doc.status}`);
-    }
-    console.log();
-  }
-
-  // ─── 3. Show what will remain after deletion ──────────────────────────
-  console.log("═".repeat(80));
-  console.log("\n📋 AFTER DELETION - REMAINING SUBMISSIONS:\n");
-
-  const remainingResult = await pool.query(`
-    SELECT 
-      s.id,
-      s.quarter,
-      s.year,
-      s.review_status,
-      s.submitted_at,
-      COUNT(sd.id) as document_count
-    FROM submissions s
-    LEFT JOIN submission_documents sd ON sd.submission_id = s.id AND sd.status != 'Deleted'
-    WHERE s.indicator_id = $1
-      AND s.id != $2
-    GROUP BY s.id
-    ORDER BY s.year DESC, s.quarter DESC
-  `, [sub.indicator_id, submissionId]);
-
-  if (remainingResult.rowCount && remainingResult.rowCount > 0) {
-    for (const rem of remainingResult.rows) {
-      const periodLabel = rem.quarter === 0 ? 'Annual' : `Q${rem.quarter}`;
-      console.log(`   ✅ ${periodLabel} ${rem.year} - ${rem.review_status}`);
-      console.log(`      ID: ${rem.id}`);
-      console.log(`      Submitted: ${new Date(rem.submitted_at).toLocaleDateString()}`);
-      console.log(`      Documents: ${rem.document_count || 0}`);
-      console.log();
-    }
-  } else {
-    console.log("   ⚠️ No remaining submissions for this indicator.");
-    console.log("   The indicator will have NO submissions after deletion.");
-    console.log();
-  }
-
-  // ─── 4. Confirm and delete ─────────────────────────────────────────────
-  console.log("═".repeat(80));
-  console.log("\n⚠️  WARNING: You are about to permanently delete:");
-  console.log(`   • 1 submission (Q${sub.quarter} ${sub.year})`);
-  console.log(`   • ${docCount} document(s)`);
-  console.log("\n   This action CANNOT be undone!\n");
-  console.log("   Press ENTER to proceed with deletion, or Ctrl+C to cancel...");
-
-  // Wait for user input
-  await new Promise(resolve => process.stdin.once('data', resolve));
-
-  console.log("\n🚀 Proceeding with deletion...\n");
-
-  // ─── 5. Begin transaction and delete ──────────────────────────────────
-  await pool.query('BEGIN');
-
+  console.log("\n🔴 PHASE 3: EXECUTING DELETIONS\n");
+  await pool.query("BEGIN");
   try {
-    // Delete documents first (due to foreign key constraints)
-    const deleteDocs = await pool.query(`
-      DELETE FROM submission_documents
-      WHERE submission_id = $1
-    `, [submissionId]);
-
-    console.log(`✅ Deleted ${deleteDocs.rowCount} document(s)`);
-
-    // Delete the submission
-    const deleteSub = await pool.query(`
-      DELETE FROM submissions
-      WHERE id = $1
-    `, [submissionId]);
-
-    console.log(`✅ Deleted submission: ${submissionId}`);
-
-    // Commit transaction
-    await pool.query('COMMIT');
-
-    console.log("\n✅ Deletion completed successfully!\n");
-
-    // ─── 6. Show final state ─────────────────────────────────────────────
-    console.log("═".repeat(80));
-    console.log("\n📋 FINAL STATE - REMAINING SUBMISSIONS:\n");
-
-    const finalResult = await pool.query(`
-      SELECT 
-        s.id,
-        s.quarter,
-        s.year,
-        s.review_status,
-        s.submitted_at,
-        COUNT(sd.id) as document_count
-      FROM submissions s
-      LEFT JOIN submission_documents sd ON sd.submission_id = s.id AND sd.status != 'Deleted'
-      WHERE s.indicator_id = $1
-      GROUP BY s.id
-      ORDER BY s.year DESC, s.quarter DESC
-    `, [sub.indicator_id]);
-
-    if (finalResult.rowCount && finalResult.rowCount > 0) {
-      for (const rem of finalResult.rows) {
-        const periodLabel = rem.quarter === 0 ? 'Annual' : `Q${rem.quarter}`;
-        console.log(`   ✅ ${periodLabel} ${rem.year} - ${rem.review_status}`);
-        console.log(`      ID: ${rem.id}`);
-        console.log(`      Submitted: ${new Date(rem.submitted_at).toLocaleDateString()}`);
-        console.log(`      Documents: ${rem.document_count || 0}`);
-        console.log();
-      }
-    } else {
-      console.log("   ⚠️ No remaining submissions for this indicator.");
+    // 3a. Delete submission_documents tied to ghost submissions
+    if (ghostSubs.rowCount && ghostSubs.rowCount > 0) {
+      const del = await pool.query(
+        `DELETE FROM submission_documents
+         WHERE submission_id IN (SELECT id FROM submissions WHERE indicator_id = $1)`,
+        [GHOST_INDICATOR_ID]);
+      console.log(`  ✅ Deleted ${del.rowCount} submission_documents`);
     }
 
-    console.log("═".repeat(80));
-    console.log("\n📊 SUMMARY:");
-    console.log(`   • Indicator: ${sub.activity_description}`);
-    console.log(`   • Deleted: Q${sub.quarter} ${sub.year} submission`);
-    console.log(`   • Remaining: ${finalResult.rowCount || 0} submission(s)`);
+    // 3b. Delete submissions
+    const delSubs = await pool.query(
+      `DELETE FROM submissions WHERE indicator_id = $1`, [GHOST_INDICATOR_ID]);
+    console.log(`  ✅ Deleted ${delSubs.rowCount} submissions`);
 
-  } catch (error) {
-    await pool.query('ROLLBACK');
-    console.error("❌ Deletion failed:", error);
-    throw error;
+    // 3c. Delete indicator_assignees (join table)
+    try {
+      const delAss = await pool.query(
+        `DELETE FROM indicator_assignees WHERE indicator_id = $1`, [GHOST_INDICATOR_ID]);
+      console.log(`  ✅ Deleted ${delAss.rowCount} indicator_assignees`);
+    } catch {
+      console.log(`  ℹ️  indicator_assignees: table/column missing, skipped`);
+    }
+
+    // 3d. Delete the ghost indicator
+    const delInd = await pool.query(
+      `DELETE FROM indicators WHERE id = $1`, [GHOST_INDICATOR_ID]);
+    console.log(`  ✅ Deleted ${delInd.rowCount} indicator`);
+
+    // 3e. Delete the activity if safe
+    if (safeToDeleteActivity) {
+      const delAct = await pool.query(
+        `DELETE FROM strategic_activities WHERE id = $1`, [GHOST_ACTIVITY_ID]);
+      console.log(`  ✅ Deleted ${delAct.rowCount} strategic_activity`);
+    } else {
+      console.log(`  ⏭️  Skipped activity deletion (still referenced)`);
+    }
+
+    // 3f. Delete the objective if safe
+    if (safeToDeleteObjective) {
+      const delObj = await pool.query(
+        `DELETE FROM strategic_objectives WHERE id = $1`, [GHOST_OBJECTIVE_ID]);
+      console.log(`  ✅ Deleted ${delObj.rowCount} strategic_objective`);
+    } else {
+      console.log(`  ⏭️  Skipped objective deletion (still referenced)`);
+    }
+
+    await pool.query("COMMIT");
+    console.log("\n🎉 COMMIT SUCCESSFUL — ghost fully removed.\n");
+  } catch (err) {
+    await pool.query("ROLLBACK");
+    console.error("\n❌ ROLLBACK — nothing was deleted.");
+    console.error(err);
   }
-
-  console.log("\n╔════════════════════════════════════════════════════════════════╗");
-  console.log("║                    DELETION COMPLETE                           ║");
-  console.log("╚════════════════════════════════════════════════════════════════╝\n");
 
   await pool.end();
 }
 
-// ─── RUN ──────────────────────────────────────────────────────────────────────
-deleteQ3Submission().catch((err) => {
-  console.error("Script failed:", err);
-  process.exit(1);
-});
+main().catch((err) => { console.error("Script failed:", err); process.exit(1); });
