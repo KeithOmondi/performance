@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
+import { overdueSql } from "../../utils/overdue";
 import { sendMail } from "../../utils/sendMail";
 import {
   superAdminApprovedTemplate,
@@ -39,6 +40,7 @@ const INDICATOR_SELECT = `
     i.created_at             AS "createdAt",
     i.updated_at             AS "updatedAt",
     i.is_multi_assignee      AS "isMultiAssignee",
+    ${overdueSql("i")}       AS "isOverdue",
 
     sp.perspective,
 
@@ -427,6 +429,59 @@ export const getAllIndicators = asyncHandler(
       }
       if (row.submissions) {
         row.submissions = filterGroupedSubmissions(row.submissions);
+      }
+    }
+
+    // ✅ Opt-in: attach review history + submissions (flat arrays) so list pages
+    // like Final Approvals can tell which indicators are verified/certified.
+    if (req.query.include === "history" && rows.length > 0) {
+      const ids = rows.map((r: any) => r.id);
+      const [{ rows: history }, { rows: subs }] = await Promise.all([
+        pool.query(
+          `SELECT
+             rh.indicator_id  AS "indicatorId",
+             rh.action,
+             rh.reviewer_role AS "reviewerRole",
+             rh.at,
+             u.name           AS "reviewedByName"
+           FROM review_history rh
+           LEFT JOIN users u ON rh.reviewed_by = u.id
+           WHERE rh.indicator_id = ANY($1::uuid[])
+           ORDER BY rh.at DESC`,
+          [ids],
+        ),
+        pool.query(
+          `SELECT
+             s.id,
+             s.indicator_id   AS "indicatorId",
+             s.quarter,
+             s.year,
+             s.review_status  AS "reviewStatus",
+             s.is_reviewed    AS "isReviewed",
+             s.achieved_value AS "achievedValue",
+             s.admin_comment  AS "adminComment",
+             s.submitted_at   AS "submittedAt"
+           FROM submissions s
+           WHERE s.indicator_id = ANY($1::uuid[])
+           ORDER BY s.submitted_at DESC`,
+          [ids],
+        ),
+      ]);
+
+      const byIndicator = <T extends { indicatorId: string }>(list: T[]) => {
+        const map = new Map<string, T[]>();
+        for (const item of list) {
+          if (!map.has(item.indicatorId)) map.set(item.indicatorId, []);
+          map.get(item.indicatorId)!.push(item);
+        }
+        return map;
+      };
+      const historyMap = byIndicator(history);
+      const subsMap = byIndicator(subs);
+
+      for (const row of rows) {
+        row.reviewHistory = historyMap.get(row.id) ?? [];
+        row.submissions = subsMap.get(row.id) ?? [];
       }
     }
 
@@ -1256,10 +1311,7 @@ export const getSuperAdminStats = asyncHandler(
         COUNT(*)                                                        AS total_indicators,
         COUNT(*) FILTER (WHERE assignee_id IS NOT NULL)                 AS assigned,
         COUNT(*) FILTER (WHERE assignee_id IS NULL)                     AS unassigned,
-        COUNT(*) FILTER (
-          WHERE deadline < NOW()
-            AND status NOT IN ('Completed', 'Awaiting Admin Approval', 'Awaiting Super Admin')
-        )                                                               AS overdue,
+        COUNT(*) FILTER (WHERE ${overdueSql("indicators")})             AS overdue,
         COUNT(*) FILTER (
           WHERE status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')
         )                                                               AS awaiting_review,
@@ -1567,15 +1619,7 @@ export const getIndicatorCounts = asyncHandler(
         COUNT(*) FILTER (
           WHERE status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')
         )::int AS review,
-        COUNT(*) FILTER (
-          WHERE deadline < NOW()
-            AND status NOT IN (
-              'Completed',
-              'Awaiting Admin Approval',
-              'Awaiting Super Admin'
-            )
-            AND assignee_id IS NOT NULL
-        )::int AS overdue
+        COUNT(*) FILTER (WHERE ${overdueSql("indicators")})::int AS overdue
       FROM indicators
       WHERE deleted_at IS NULL
     `;

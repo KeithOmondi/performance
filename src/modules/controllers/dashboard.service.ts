@@ -1,5 +1,6 @@
 // src/services/dashboard.service.ts
 import { pool } from "../../config/db";
+import { overdueSql } from "../../utils/overdue";
 
 export interface DashboardStats {
   totalIndicators: number;
@@ -56,9 +57,7 @@ export class DashboardService {
       const unassignedIndicators = totalIndicators - assignedIndicators;
 
       const overdueRes = await client.query(
-        `SELECT COUNT(*) FROM indicators 
-         WHERE deadline < NOW() 
-         AND status NOT IN ('Completed', 'Rejected by Admin', 'Rejected by Super Admin')`
+        `SELECT COUNT(*) FROM indicators WHERE ${overdueSql("indicators")}`
       );
       const overdueIndicators = parseInt(overdueRes.rows[0].count, 10);
 
