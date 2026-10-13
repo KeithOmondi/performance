@@ -140,7 +140,7 @@ export const runArchive = asyncHandler(
                    'fileName',     sd.file_name,
                    'uploadedAt',   sd.uploaded_at
                  )
-               ) FILTER (WHERE sd.id IS NOT NULL),
+               ) FILTER (WHERE sd.id IS NOT NULL AND sd.deleted_at IS NULL AND sd.status != 'Deleted'),
                '[]'
              ) AS documents
            FROM submissions s

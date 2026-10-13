@@ -1237,9 +1237,11 @@ export const deleteDocumentAdmin = asyncHandler(
         `UPDATE submission_documents
          SET status = 'Deleted',
              rejection_reason = $1,
+             deleted_at = NOW(),
+             deleted_by = $3,
              updated_at = NOW()
          WHERE id = $2`,
-        [reason.trim(), documentId],
+        [reason.trim(), documentId, adminId],
       );
 
       await client.query(

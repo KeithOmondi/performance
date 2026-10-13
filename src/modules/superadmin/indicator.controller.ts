@@ -487,7 +487,7 @@ export const getIndicatorById = asyncHandler(
                'rejectionReason',  sd.rejection_reason,
                'uploadedAt',       sd.uploaded_at
              )
-           ) FILTER (WHERE sd.id IS NOT NULL AND sd.status != 'Deleted'),
+           ) FILTER (WHERE sd.id IS NOT NULL AND sd.status != 'Deleted' AND sd.deleted_at IS NULL),
            '[]'::json
          ) AS "documents"
        FROM latest_submissions s
@@ -1212,10 +1212,10 @@ export const getAllSubmissions = asyncHandler(
               'rejectionReason',  sd.rejection_reason,
               'uploadedAt',       sd.uploaded_at
             )
-          ) FILTER (WHERE sd.id IS NOT NULL AND sd.status != 'Deleted'),
+          ) FILTER (WHERE sd.id IS NOT NULL AND sd.status != 'Deleted' AND sd.deleted_at IS NULL),
           '[]'
         )                            AS "documents",
-        COUNT(sd.id) FILTER (WHERE sd.status != 'Deleted') AS "documentsCount"
+        COUNT(sd.id) FILTER (WHERE sd.status != 'Deleted' AND sd.deleted_at IS NULL) AS "documentsCount"
 
       FROM submissions s
       JOIN    indicators i           ON s.indicator_id = i.id
@@ -2488,7 +2488,8 @@ export const deleteSingleDocument = asyncHandler(
          JOIN indicators i ON s.indicator_id = i.id
          WHERE sd.id = $1
            AND sd.status != 'Deleted'
-         FOR UPDATE`,
+           AND sd.deleted_at IS NULL
+         FOR UPDATE OF sd`,
         [documentId],
       );
 
@@ -2507,9 +2508,11 @@ export const deleteSingleDocument = asyncHandler(
         `UPDATE submission_documents
          SET status = 'Deleted',
              rejection_reason = $1,
+             deleted_at = NOW(),
+             deleted_by = $3,
              updated_at = NOW()
          WHERE id = $2`,
-        [`Deleted by admin (ID: ${adminId})`, documentId],
+        [`Deleted by admin (ID: ${adminId})`, documentId, adminId],
       );
 
       await client.query(

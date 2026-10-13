@@ -1371,7 +1371,7 @@ export const UserIndicatorController: IUserIndicatorController = {
 
     if (hasPrivilege) {
       const { rows } = await pool.query(
-        `SELECT 1 FROM submission_documents WHERE evidence_url = $1 AND deleted_at IS NULL
+        `SELECT 1 FROM submission_documents WHERE evidence_url = $1 AND deleted_at IS NULL AND status != 'Deleted'
          UNION ALL
          SELECT 1 FROM submission_spot_check_links WHERE evidence_url = $1
          LIMIT 1`,
@@ -1397,7 +1397,7 @@ export const UserIndicatorController: IUserIndicatorController = {
          FROM submission_documents d
          JOIN submissions s ON d.submission_id = s.id
          JOIN indicators i ON s.indicator_id = i.id
-         WHERE d.evidence_url = $1 AND d.deleted_at IS NULL ${ownershipFilter}
+         WHERE d.evidence_url = $1 AND d.deleted_at IS NULL AND d.status != 'Deleted' ${ownershipFilter}
 
          UNION ALL
 
