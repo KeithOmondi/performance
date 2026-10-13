@@ -228,6 +228,7 @@ export const getMyExaminerFolders = asyncHandler(
                 )
                 FROM submission_documents sd
                 WHERE sd.submission_id = s.id
+                  AND sd.deleted_at IS NULL
               ),
               '[]'::json
             ) AS documents

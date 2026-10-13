@@ -160,10 +160,12 @@ function validateSubmissionInput(
   
   let achievedNum: number | null = null;
   if (achievedValue !== undefined && achievedValue !== null && achievedValue !== "") {
+    // Edit 9: reject bad values instead of silently zeroing them.
     const numValue = Number(achievedValue);
-    if (!isNaN(numValue) && numValue >= 0 && numValue <= MAX_ACHIEVED_VALUE) {
-      achievedNum = numValue;
+    if (isNaN(numValue) || numValue < 0 || numValue > MAX_ACHIEVED_VALUE) {
+      throw new AppError(`Achieved value must be a number between 0 and ${MAX_ACHIEVED_VALUE}.`, 400);
     }
+    achievedNum = numValue;
   }
   
   return { notes: notesStr, achievedValue: achievedNum };
@@ -478,7 +480,7 @@ export const UserIndicatorController: IUserIndicatorController = {
     const { clause, params } = ownershipClause([], user.id, teamIds);
 
     const { rows } = await pool.query(
-      `${USER_INDICATOR_BASE_QUERY} WHERE ${clause} ORDER BY i.id, i.updated_at DESC`,
+      `${USER_INDICATOR_BASE_QUERY} WHERE i.deleted_at IS NULL AND ${clause} ORDER BY i.id, i.updated_at DESC`,
       params,
     );
 
@@ -496,7 +498,7 @@ export const UserIndicatorController: IUserIndicatorController = {
     const { clause, params } = ownershipClause([req.params.id], user.id, teamIds);
 
     const { rows } = await pool.query(
-      `${USER_INDICATOR_BASE_QUERY} WHERE i.id = $1 AND ${clause} ORDER BY i.id LIMIT 1`,
+      `${USER_INDICATOR_BASE_QUERY} WHERE i.id = $1 AND i.deleted_at IS NULL AND ${clause} ORDER BY i.id LIMIT 1`,
       params,
     );
 
@@ -509,7 +511,7 @@ export const UserIndicatorController: IUserIndicatorController = {
   /**
    * ✅ SUBMIT PROGRESS - First-time submission with document-level workflow
    */
-  submitProgress: asyncHandler(async (req: Request, res: Response) => {
+  submitProgress: asyncHandler(async (req: Request, res: Response, next: NextFunction) => {
     const { id } = req.params;
     const { quarter, year, achievedValue, notes, descriptions, idempotencyKey } = req.body;
     const files = (req.files ?? []) as Express.Multer.File[];
@@ -523,7 +525,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       filesCount: files.length,
     });
 
-    if (!quarter || !year) {
+    if (quarter === undefined || quarter === null || quarter === "" || !year) {
       throw new AppError("Both quarter and year are required for submission.", 400);
     }
 
@@ -533,18 +535,17 @@ export const UserIndicatorController: IUserIndicatorController = {
       validateFiles(files);
     }
 
-    const quarterNum = parseInt(String(quarter), 10);
+    const quarterNum = quarterToInt(quarter);
     const yearNum = parseInt(String(year), 10);
-
-    if (isNaN(quarterNum) || isNaN(yearNum)) {
-      throw new AppError("Please provide valid quarter (1-4) and year numbers.", 400);
+    if (isNaN(yearNum)) {
+      throw new AppError("Please provide a valid year.", 400);
     }
 
     const { rows: indicatorRows } = await pool.query(
       `SELECT i.*, sa.description AS "activityDescription"
        FROM indicators i
        LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
-       WHERE i.id = $1`,
+       WHERE i.id = $1 AND i.deleted_at IS NULL`,
       [id],
     );
 
@@ -555,6 +556,7 @@ export const UserIndicatorController: IUserIndicatorController = {
     const indicator = indicatorRows[0] as IndicatorWithActivity;
     const teamIds = await getUserTeamIds(user.id);
     const client = await pool.connect();
+    let released = false;
 
     try {
       await client.query("BEGIN");
@@ -596,9 +598,8 @@ export const UserIndicatorController: IUserIndicatorController = {
             // If already accepted, we should route to addDocuments
             await client.query("ROLLBACK");
             client.release();
-            req.body.quarter = quarter;
-            req.body.year = year;
-            return UserIndicatorController.addDocuments(req, res, undefined as any);
+            released = true;
+            return UserIndicatorController.addDocuments(req, res, next);
           }
           case "Pending":
             throw new AppError(
@@ -713,7 +714,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       await client.query("ROLLBACK");
       throw error;
     } finally {
-      client.release();
+      if (!released) client.release();
     }
   }),
 
@@ -733,7 +734,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       filesCount: files.length,
     });
 
-    if (!quarter || !year) {
+    if (quarter === undefined || quarter === null || quarter === "" || !year) {
       throw new AppError("Quarter and year are required for resubmission.", 400);
     }
 
@@ -760,7 +761,10 @@ export const UserIndicatorController: IUserIndicatorController = {
         return;
       }
 
-      const indRes = await client.query("SELECT * FROM indicators WHERE id = $1 FOR UPDATE", [indicatorId]);
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        [indicatorId],
+      );
       if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
       
       const indicator = indRes.rows[0] as IndicatorWithActivity;
@@ -886,11 +890,12 @@ export const UserIndicatorController: IUserIndicatorController = {
   addDocuments: asyncHandler(async (req: Request, res: Response) => {
     const user = getAuthUser(req);
     const { id } = req.params;
-    const { quarter, descriptions, idempotencyKey } = req.body;
+    const { quarter, year, descriptions, idempotencyKey } = req.body;
     const files = (req.files ?? []) as Express.Multer.File[];
 
     console.log(`📝 [addDocuments] START for indicator ${id}`, {
       quarter,
+      year,
       filesCount: files.length,
     });
 
@@ -899,6 +904,7 @@ export const UserIndicatorController: IUserIndicatorController = {
 
     const teamIds = await getUserTeamIds(user.id);
     const client = await pool.connect();
+    let released = false;
 
     try {
       await client.query("BEGIN");
@@ -914,14 +920,17 @@ export const UserIndicatorController: IUserIndicatorController = {
         return;
       }
 
-      const indRes = await client.query("SELECT * FROM indicators WHERE id = $1 FOR UPDATE", [id]);
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        [id],
+      );
       if (indRes.rows.length === 0) throw new AppError("Indicator not found.", 404);
       
       const indicator = indRes.rows[0] as IndicatorWithActivity;
       await assertIndicatorOwnership(client, indicator, user.id, teamIds);
 
       const targetQ = indicator.reporting_cycle === "Annual" ? 0 : quarterToInt(quarter ?? indicator.active_quarter);
-      const currentYear = new Date().getFullYear();
+      const currentYear = year ? parseInt(String(year), 10) : new Date().getFullYear();
 
       const existingSubmission = await client.query(
         `SELECT id, review_status 
@@ -1035,7 +1044,7 @@ export const UserIndicatorController: IUserIndicatorController = {
       await client.query("ROLLBACK");
       throw error;
     } finally {
-      client.release();
+      if (!released) client.release();
     }
   }),
 
@@ -1165,11 +1174,11 @@ export const UserIndicatorController: IUserIndicatorController = {
 
     const { rows } = await pool.query(
       `${USER_INDICATOR_BASE_QUERY}
-       WHERE ${ownership}
+       WHERE i.deleted_at IS NULL AND ${ownership}
          AND EXISTS (
            SELECT 1 FROM submissions s
            WHERE s.indicator_id = i.id 
-           AND s.review_status = 'Rejected'
+           AND s.review_status IN ('Rejected', 'Correction Needed')
            AND s.submitted_at > NOW() - INTERVAL '90 days'
          )
        ORDER BY i.id, i.updated_at DESC`,
@@ -1201,7 +1210,7 @@ export const UserIndicatorController: IUserIndicatorController = {
          ) AS quarter_key
        FROM submissions s
        WHERE s.indicator_id = ANY($1) 
-         AND s.review_status = 'Rejected'
+         AND s.review_status IN ('Rejected', 'Correction Needed')
        ORDER BY s.submitted_at DESC`,
       [indicatorIds],
     );
@@ -1342,81 +1351,101 @@ export const UserIndicatorController: IUserIndicatorController = {
   /**
    * ✅ STREAM FILE - Stream a file from Cloudinary
    */
-streamFile: asyncHandler(async (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const url = decodeURIComponent(req.query.url as string);
+  streamFile: asyncHandler(async (req: Request, res: Response) => {
+    const user = getAuthUser(req);
+    // Express already decodes query params — decoding again corrupts URLs
+    // whose file names contain encoded chars (e.g. %20), breaking the DB match.
+    const url = typeof req.query.url === "string" ? req.query.url : "";
 
-  if (!url || !url.startsWith("https://res.cloudinary.com/")) {
-    throw new AppError("Invalid file URL provided.", 400);
-  }
+    if (!url || !url.startsWith("https://res.cloudinary.com/")) {
+      throw new AppError("Invalid file URL provided.", 400);
+    }
 
-  const match = url.match(/^https:\/\/res\.cloudinary\.com\/([^/]+)\//);
-  if (!match || match[1] !== process.env.CLOUDINARY_CLOUD_NAME) {
-    throw new AppError("Unable to verify file source. Access denied.", 403);
-  }
+    const match = url.match(/^https:\/\/res\.cloudinary\.com\/([^/]+)\//);
+    if (!match || match[1] !== process.env.CLOUDINARY_CLOUD_NAME) {
+      throw new AppError("Unable to verify file source. Access denied.", 403);
+    }
 
-  const hasPrivilege = PRIVILEGED_ROLES.includes(user.role as "admin" | "superadmin" | "examiner");
-  let isAuthorized = false;
+    const hasPrivilege = PRIVILEGED_ROLES.includes(user.role as "admin" | "superadmin" | "examiner");
+    let isAuthorized = false;
 
-  if (hasPrivilege) {
-    const { rows } = await pool.query(
-      `SELECT 1 FROM submission_documents WHERE evidence_url = $1 AND deleted_at IS NULL
-       UNION ALL
-       SELECT 1 FROM submission_spot_check_links WHERE evidence_url = $1
-       LIMIT 1`,
-      [url],
-    );
-    isAuthorized = rows.length > 0;
-  } else {
-    const teamIds = await getUserTeamIds(user.id);
-    const ownershipFilter = `
-      AND (
-        (i.assignee_id = $2 AND i.assignee_model = 'User')
-        OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
-        OR EXISTS (
-          SELECT 1 FROM indicator_assignees ia
-          WHERE ia.indicator_id = i.id AND ia.user_id = $2
+    if (hasPrivilege) {
+      const { rows } = await pool.query(
+        `SELECT 1 FROM submission_documents WHERE evidence_url = $1 AND deleted_at IS NULL
+         UNION ALL
+         SELECT 1 FROM submission_spot_check_links WHERE evidence_url = $1
+         LIMIT 1`,
+        [url],
+      );
+      isAuthorized = rows.length > 0;
+    } else {
+      const teamIds = await getUserTeamIds(user.id);
+      const ownershipFilter = `
+        AND (
+          (i.assignee_id = $2 AND i.assignee_model = 'User')
+          OR (i.assignee_id = ANY($3::uuid[]) AND i.assignee_model = 'Team')
+          OR EXISTS (
+            SELECT 1 FROM indicator_assignees ia
+            WHERE ia.indicator_id = i.id AND ia.user_id = $2
+          )
         )
-      )
-    `;
-    const checkParams = [url, user.id, teamIds];
+      `;
+      const checkParams = [url, user.id, teamIds];
 
-    const { rows } = await pool.query(
-      `SELECT d.id
-       FROM submission_documents d
-       JOIN submissions s ON d.submission_id = s.id
-       JOIN indicators i ON s.indicator_id = i.id
-       WHERE d.evidence_url = $1 AND d.deleted_at IS NULL ${ownershipFilter}
+      const { rows } = await pool.query(
+        `SELECT d.id
+         FROM submission_documents d
+         JOIN submissions s ON d.submission_id = s.id
+         JOIN indicators i ON s.indicator_id = i.id
+         WHERE d.evidence_url = $1 AND d.deleted_at IS NULL ${ownershipFilter}
 
-       UNION ALL
+         UNION ALL
 
-       SELECT l.id
-       FROM submission_spot_check_links l
-       JOIN submissions s ON s.id = l.submission_id
-       JOIN indicators i ON s.indicator_id = i.id
-       WHERE l.evidence_url = $1 ${ownershipFilter}
+         SELECT l.id
+         FROM submission_spot_check_links l
+         JOIN submissions s ON s.id = l.submission_id
+         JOIN indicators i ON s.indicator_id = i.id
+         WHERE l.evidence_url = $1 ${ownershipFilter}
 
-       LIMIT 1`,
-      checkParams,
-    );
-    isAuthorized = rows.length > 0;
-  }
+         LIMIT 1`,
+        checkParams,
+      );
+      isAuthorized = rows.length > 0;
+    }
 
-  if (!isAuthorized) {
-    throw new AppError("You don't have permission to access this file.", 403);
-  }
+    if (!isAuthorized) {
+      throw new AppError("You don't have permission to access this file.", 403);
+    }
 
-  const response = await axios({
-    method: "GET",
-    url,
-    responseType: "stream",
-    timeout: 30000,
-    maxContentLength: 100 * 1024 * 1024,
-  });
+    let response;
+    try {
+      response = await axios({
+        method: "GET",
+        url,
+        responseType: "stream",
+        timeout: 30000,
+        maxContentLength: 100 * 1024 * 1024,
+      });
+    } catch (err) {
+      const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+      console.error(`❌ [streamFile] Upstream fetch failed (${status ?? "network"}) for ${url}`);
+      throw new AppError(
+        status === 401 || status === 403
+          ? "The file host refused access to this file."
+          : status === 404
+            ? "File not found on the file host."
+            : "Unable to retrieve the file. Please try again.",
+        status === 404 ? 404 : 502,
+      );
+    }
 
-  res.setHeader("Content-Type", response.headers["content-type"] ?? "application/octet-stream");
-  response.data.pipe(res);
-}),
+    res.setHeader("Content-Type", response.headers["content-type"] ?? "application/octet-stream");
+    if (response.headers["content-length"]) {
+      res.setHeader("Content-Length", response.headers["content-length"]);
+    }
+    response.data.on("error", () => res.destroy());
+    response.data.pipe(res);
+  }),
 
   /**
    * ✅ UPDATE DOCUMENT DESCRIPTIONS - Bulk update document descriptions
@@ -1546,7 +1575,7 @@ streamFile: asyncHandler(async (req: Request, res: Response) => {
       )
     `;
 
-    const checkParams: unknown[] = teamIds.length > 0 ? [docId, user.id, teamIds] : [docId, user.id];
+    const checkParams: unknown[] = [docId, user.id, teamIds];
 
     const { rows } = await pool.query(
       `SELECT d.id, d.evidence_public_id, d.file_name, d.status AS doc_status, 
@@ -1600,7 +1629,7 @@ streamFile: asyncHandler(async (req: Request, res: Response) => {
    * ✅ RESUBMIT DOCUMENTS - Resubmit only specific rejected documents
    */
   resubmitDocuments: asyncHandler(async (req: Request, res: Response) => {
-    const { submissionId } = req.params;
+    const { submissionId } = req.params as { submissionId: string };
     const { documentIds, notes, achievedValue, descriptions, idempotencyKey } = req.body;
     const files = (req.files ?? []) as Express.Multer.File[];
     const user = getAuthUser(req);
@@ -1656,31 +1685,16 @@ streamFile: asyncHandler(async (req: Request, res: Response) => {
         year: number;
       };
 
-      const indResult = await client.query(
-        "SELECT * FROM indicators WHERE id = $1",
-        [submission.indicator_id],
-      );
-      
       const teamIds = await getUserTeamIds(user.id);
-      await assertIndicatorOwnership(client, indResult.rows[0] as Record<string, unknown>, user.id, teamIds);
-
-      const docCheck = await client.query(
-        `SELECT id, file_name, status 
-         FROM submission_documents
-         WHERE submission_id = $1 AND id = ANY($2) AND status = 'Rejected' AND deleted_at IS NULL`,
-        [submission.id, documentIds],
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1",
+        [subResult.rows[0].indicator_id],
       );
+      await assertIndicatorOwnership(client, indRes.rows[0] as Record<string, unknown>, user.id, teamIds);
 
-      if (docCheck.rows.length !== documentIds.length) {
-        const foundIds = docCheck.rows.map((r: any) => r.id);
-        const notFound = documentIds.filter((id: string) => !foundIds.includes(id));
-        throw new AppError(
-          `Documents ${notFound.join(', ')} are not rejected or don't belong to this submission.`,
-          400,
-        );
-      }
+      const rejectedDocs = await getRejectedDocuments(client, submissionId);
 
-      console.log(`📝 [resubmitDocuments] Resubmitting ${docCheck.rows.length} document(s)`);
+      console.log(`📝 [resubmitDocuments] Resubmitting ${documentIds.length} document(s)`);
 
       await client.query(
         `UPDATE submission_documents
@@ -1716,20 +1730,21 @@ streamFile: asyncHandler(async (req: Request, res: Response) => {
         }
       }
 
-      if (validated.notes || validated.achievedValue !== null) {
-        // COALESCE keeps the existing value when $2 is null, so no
-        // coercion to 0 is needed here. achieved_value stays NOT NULL.
-        await client.query(
-          `UPDATE submissions
-           SET notes = COALESCE($1, notes),
-               achieved_value = COALESCE($2, achieved_value),
-               resubmission_count = resubmission_count + 1,
-               resubmitted_from_rejection = true,
-               updated_at = NOW()
-           WHERE id = $3`,
-          [validated.notes, validated.achievedValue, submission.id],
-        );
-      }
+      // Edit 7: recompute rejected documents and only flip back to Pending once none remain.
+      const stillRejected = await getRejectedDocuments(client, submission.id);
+
+      await client.query(
+        `UPDATE submissions
+         SET notes = COALESCE($1, notes),
+             achieved_value = COALESCE($2, achieved_value),
+             resubmission_count = resubmission_count + 1,
+             resubmitted_from_rejection = true,
+             review_status = CASE WHEN $4::int = 0 THEN 'Pending'::review_status ELSE review_status END,
+             is_reviewed = false,
+             updated_at = NOW()
+         WHERE id = $3`,
+        [validated.notes, validated.achievedValue, submission.id, stillRejected.length],
+      );
 
       if (submission.indicator_status !== "Completed") {
         await client.query(
@@ -1747,7 +1762,7 @@ streamFile: asyncHandler(async (req: Request, res: Response) => {
 
       res.status(200).json({
         success: true,
-        message: `${docCheck.rows.length} document(s) resubmitted for review.`,
+        message: `${documentIds.length} document(s) resubmitted for review.`,
         submissionId: submission.id,                 // ✅ hoisted
         data: { 
           submissionId: submission.id, 
@@ -1932,7 +1947,11 @@ streamFile: asyncHandler(async (req: Request, res: Response) => {
       }
 
       const teamIds = await getUserTeamIds(user.id);
-      await assertIndicatorOwnership(client, subResult.rows[0] as Record<string, unknown>, user.id, teamIds);
+      const indRes = await client.query(
+        "SELECT * FROM indicators WHERE id = $1",
+        [subResult.rows[0].indicator_id],
+      );
+      await assertIndicatorOwnership(client, indRes.rows[0] as Record<string, unknown>, user.id, teamIds);
 
       const rejectedDocs = await getRejectedDocuments(client, submissionId);
 
