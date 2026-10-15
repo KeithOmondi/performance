@@ -5,7 +5,7 @@ import { pool } from "../../config/db";
 import { UserRole } from "../../types/user.types";
 
 const USER_FIELDS = `id, name, email, role, pj_number AS "pjNumber", title, is_active AS "isActive", created_at AS "createdAt"`;
-const VALID_ROLES: UserRole[] = ["user", "admin", "superadmin", "examiner"];
+const VALID_ROLES: UserRole[] = ["user", "admin", "superadmin", "examiner", "supervisor"];
 
 // ─── List All Users ───────────────────────────────────────────────────────────
 export const listUsers = asyncHandler(async (req: Request, res: Response) => {

@@ -1,4 +1,4 @@
-export type UserRole = "user" | "admin" | "superadmin" | "examiner";
+export type UserRole = "user" | "admin" | "superadmin" | "examiner" | "supervisor";
 export type ReportingCycle = "Quarterly" | "Annual";
 export type FileType = "image" | "video" | "raw";
 export type ReviewStatus = "Pending" | "Verified" | "Accepted" | "Rejected";

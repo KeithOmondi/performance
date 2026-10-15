@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
+import { pmmuOrderSql, perspectiveRankSql } from "../../utils/pmmuOrder";
 import PDFDocument from "pdfkit";
 import axios from "axios";
 
@@ -1692,11 +1693,7 @@ export const getTrackerReport =
           ${REPORT_JOINS}
           ${where}
 
-          ORDER BY
-            sp.id ASC,
-            so.id ASC,
-            sa.id ASC,
-            i.id ASC
+          ORDER BY ${pmmuOrderSql("sp", "so", "sa", "i")}
           `,
           params
         );
@@ -1735,11 +1732,7 @@ export const getReportByPlanId =
             sp.id = $1
             AND i.deleted_at IS NULL
 
-          ORDER BY
-            sp.id ASC,
-            so.id ASC,
-            sa.id ASC,
-            i.id ASC
+          ORDER BY ${pmmuOrderSql("sp", "so", "sa", "i")}
           `,
           [planId]
         );
@@ -1862,8 +1855,7 @@ export const getReportSummary =
             sp.id,
             sp.perspective
 
-          ORDER BY
-            sp.id ASC
+          ORDER BY ${perspectiveRankSql("sp.perspective")}, sp.perspective
         `);
 
       res.status(200).json({
@@ -1897,11 +1889,7 @@ export const getTrackerPdf =
           ${REPORT_JOINS}
           ${where}
 
-          ORDER BY
-            sp.id ASC,
-            so.id ASC,
-            sa.id ASC,
-            i.id ASC
+          ORDER BY ${pmmuOrderSql("sp", "so", "sa", "i")}
           `,
           params
         );

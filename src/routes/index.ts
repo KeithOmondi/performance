@@ -10,6 +10,7 @@ import registryRoute from "../modules/registry/registryRoute";
 import teamRoutes from "../modules/team/team.routes"
 import dashboardRoutes from "../modules/controllers/dashboardRoutes"
 import ExaminerAssignmentRoutes from "../modules/examiner/examinerAssignment.routes"
+import ReferenceRoutes from "../modules/reference/reference.routes";
 import ArchiveRoutes from "../modules/archive/archiveroutes"
 import notificationRoutes from "../modules/notifications/notificationroutes"
 import spotcheckRoutes from "../modules/spotcheck/spot-check-routes"
@@ -52,6 +53,7 @@ router.use("/teams", teamRoutes);
 router.use("/dashboard", dashboardRoutes);
 router.use("/examiner", ExaminerAssignmentRoutes)
 router.use("/archive", ArchiveRoutes)
+router.use("/reference", ReferenceRoutes);
 
 //================ Notification ================
 router.use("/notifications", notificationRoutes);

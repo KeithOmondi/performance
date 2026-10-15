@@ -1,5 +1,5 @@
 // src/types/user.types.ts
-export type UserRole = "user" | "admin" | "superadmin" | "examiner";
+export type UserRole = "user" | "admin" | "superadmin" | "examiner" | "supervisor";
 
 export interface IUser {
   id: string; // UUID in Postgres

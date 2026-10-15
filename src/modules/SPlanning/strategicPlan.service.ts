@@ -80,8 +80,8 @@ const addObjective = async (planId: string, title: string) => {
   }
 
   const { rows } = await pool.query(
-    `INSERT INTO strategic_objectives (plan_id, title)
-     VALUES ($1, $2)
+    `INSERT INTO strategic_objectives (plan_id, title, sort_order)
+     VALUES ($1, $2, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM strategic_objectives WHERE plan_id = $1))
      RETURNING id, plan_id AS "planId", title, created_at AS "createdAt"`,
     [planId, title]
   );

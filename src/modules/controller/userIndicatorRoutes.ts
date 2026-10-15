@@ -13,7 +13,7 @@ router.get("/my-assignments", protect, restrictTo("user"),
 router.get("/rejects", protect, restrictTo("user"),
   UserIndicatorController.getRejectedSubmissions);
 
-router.get("/stream-file", protect, restrictTo("user", "admin", "superadmin", "examiner"),
+router.get("/stream-file", protect, restrictTo("user", "admin", "superadmin", "examiner", "supervisor"),
   UserIndicatorController.streamFile);
 
 // ── Single indicator ──────────────────────────────────────────────────────────

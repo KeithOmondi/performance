@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
+import { objectiveOrderSql } from "../../utils/pmmuOrder";
 
 /* ─── 1. PREVIEW ─────────────────────────────────────────────────────────────
    Returns a summary of what will be archived — shown to superadmin BEFORE
@@ -44,7 +45,7 @@ export const getArchivePreview = asyncHandler(
        LEFT JOIN strategic_objectives so ON i.objective_id = so.id
        LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
        WHERE i.year = $1 AND i.status != 'Completed'
-       ORDER BY sp.perspective, so.title`,
+       ORDER BY ${objectiveOrderSql("sp", "so")}`,
       [year]
     );
 

@@ -1366,7 +1366,10 @@ export const UserIndicatorController: IUserIndicatorController = {
       throw new AppError("Unable to verify file source. Access denied.", 403);
     }
 
-    const hasPrivilege = PRIVILEGED_ROLES.includes(user.role as "admin" | "superadmin" | "examiner");
+    // Supervisors have read-only access to every folder, so they preview like privileged roles
+    const hasPrivilege =
+      user.role === "supervisor" ||
+      PRIVILEGED_ROLES.includes(user.role as "admin" | "superadmin" | "examiner");
     let isAuthorized = false;
 
     if (hasPrivilege) {

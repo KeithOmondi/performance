@@ -5,6 +5,7 @@ import {
   unassignExaminerFromFolder,
   getMyExaminerFolders,
   getExaminers,
+  downloadFolder,
 } from "./examinerAssignment.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
@@ -12,36 +13,42 @@ const router = Router();
 
 router.use(protect);
 
-/* ── Superadmin routes ── */
+/* ── Examiner assignment (superadmin + supervisor, all folders) ── */
 router.get(
   "/",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "supervisor"),
   getAllExaminerAssignments
 );
 
 router.get(
   "/examiners",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "supervisor"),
   getExaminers
 );
 
 router.post(
   "/",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "supervisor"),
   assignExaminerToFolder
+);
+
+/* ── Folder contents (examiner: own folders; supervisor/superadmin: all) ── */
+router.get(
+  "/my-folders",
+  restrictTo("examiner", "supervisor", "superadmin"),
+  getMyExaminerFolders
+);
+
+router.get(
+  "/folders/:objectiveId/download",
+  restrictTo("examiner", "supervisor", "superadmin"),
+  downloadFolder
 );
 
 router.delete(
   "/:objectiveId",
-  restrictTo("superadmin"),
+  restrictTo("superadmin", "supervisor"),
   unassignExaminerFromFolder
-);
-
-/* ── Examiner route ── */
-router.get(
-  "/my-folders",
-  restrictTo("examiner", "superadmin"),
-  getMyExaminerFolders
 );
 
 export default router;
