@@ -24,6 +24,7 @@ import {
   removeUsersFromIndicator,
   sendBackToAdmin,
   deleteSingleDocument,
+  getPendingFinalApprovals,   // ✅ NEW
 } from "./indicator.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
@@ -32,7 +33,7 @@ const router = Router();
 /* ─── Debug logger: remove after diagnosing ─────────────────────────────── */
 router.use((req, _res, next) => {
   console.log(
-    `[IndicatorRoutes] ${req.method} ${req.originalUrl} | role=${(req as any).user?.role ?? "anon"}`
+    `[IndicatorRoutes] ${req.method} ${req.originalUrl} | role=${(req as any).user?.role ?? "anon"}`,
   );
   next();
 });
@@ -52,6 +53,9 @@ router.get("/rejected-by-admin", getRejectedByAdmin);
 // Submissions queue (nested fixed segments)
 router.get("/submissions/queue", getAllSubmissions);
 router.delete("/submissions/:submissionId", deleteSubmission);
+
+// ✅ NEW: Super-admin final-approval queue — one row per pending quarter
+router.get("/pending-final-approval", getPendingFinalApprovals);
 
 // Document deletion
 router.delete("/documents/:documentId", deleteSingleDocument);

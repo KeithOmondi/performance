@@ -13,11 +13,16 @@ import {
   approveQuarter,
   rejectQuarter,
   getQuarterStatusesForIndicator,
-  getSentBackIndicators,      // ✅ NEW
-  getReturnedIndicators,      // ✅ NEW
+  getSentBackIndicators,
+  getReturnedIndicators,
+  fetchPendingReviewQueue,        // ✅ NEW
 } from "../admin/adminIndicatorController";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
-import { getCalendarEvents, getIndicatorCalendarEvents, getUpcomingDeadlines } from "../calendar/calendarcontroller";
+import {
+  getCalendarEvents,
+  getIndicatorCalendarEvents,
+  getUpcomingDeadlines,
+} from "../calendar/calendarcontroller";
 
 const router = Router();
 
@@ -29,9 +34,14 @@ router.get("/all", fetchIndicatorsForAdmin);
 router.get("/resubmitted", fetchResubmittedIndicators);
 router.get("/approved-by-admin", getAdminApprovedIndicators);
 
-// ✅ NEW: Routes for indicators sent back or returned
-router.get("/sent-back", getSentBackIndicators);        // Indicators sent back by super admin
-router.get("/returned", getReturnedIndicators);         // Indicators returned/rejected
+// Indicators sent back / returned by the super admin
+router.get("/sent-back", getSentBackIndicators);
+router.get("/returned", getReturnedIndicators);
+
+// ✅ NEW: Flat pending-review queue — one row per pending submission (quarter).
+//    MUST be registered before "/:id" or Express will treat
+//    "pending-queue" as an :id parameter.
+router.get("/pending-queue", fetchPendingReviewQueue);
 
 // ─── Calendar Routes ──────────────────────────────────────────────────────────
 router.get("/calendar/upcoming", getUpcomingDeadlines);
@@ -39,6 +49,7 @@ router.get("/calendar/:id", getIndicatorCalendarEvents);
 router.get("/calendar", getCalendarEvents);
 
 // ─── Single Resource Routes ──────────────────────────────────────────────────
+// ⚠️  Keep this AFTER every literal GET above ("/pending-queue", "/calendar", …)
 router.get("/:id", getIndicatorByIdAdmin);
 
 // ─── Quarter-Level Routes ────────────────────────────────────────────────────
@@ -58,7 +69,7 @@ router.patch("/:id/submissions/reject", rejectSubmission);
 // ─── Delete submission (hard delete) ──────────────────────────────────────
 router.delete(
   "/:indicatorId/submissions/:submissionId",
-  deleteSubmission
+  deleteSubmission,
 );
 
 export default router;

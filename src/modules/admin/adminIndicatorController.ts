@@ -1552,3 +1552,61 @@ export const getReturnedIndicators = asyncHandler(
     res.status(200).json({ success: true, count: data.length, data });
   },
 );
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  FILE: adminIndicatorController.ts
+//  ADD this export (anywhere below INDICATOR_SELECT / SUBMISSIONS_SELECT).
+//
+//  The queue is driven by the SUBMISSION's review_status, never by the
+//  indicator's status. One row per pending quarter, oldest first.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const fetchPendingReviewQueue = asyncHandler(
+  async (_req: Request, res: Response) => {
+    // 1. Latest submission per indicator + quarter + year, keep only Pending.
+    //    SUBMISSIONS_SELECT already adds documents, submitter name, etc.
+    const { rows: submissions } = await pool.query(
+      `WITH latest AS (
+         SELECT DISTINCT ON (s.indicator_id, s.quarter, s.year)
+                s.id, s.review_status
+         FROM submissions s
+         JOIN indicators i
+           ON i.id = s.indicator_id AND i.deleted_at IS NULL
+         ORDER BY s.indicator_id, s.quarter, s.year, s.submitted_at DESC
+       )
+       ${SUBMISSIONS_SELECT}
+       WHERE s.id IN (SELECT id FROM latest WHERE review_status = 'Pending')
+       ORDER BY s.submitted_at ASC`,
+    );
+
+    if (submissions.length === 0) {
+      return res.status(200).json({ success: true, count: 0, data: [] });
+    }
+
+    // 2. Indicator details for those submissions
+    const indicatorIds = [...new Set(submissions.map((s: any) => s.indicatorId))];
+    const { rows: indicators } = await pool.query(
+      `${INDICATOR_SELECT} WHERE i.id = ANY($1)`,
+      [indicatorIds],
+    );
+    const byId = new Map<string, any>(indicators.map((i: any) => [i.id, i]));
+
+    // 3. One queue item per pending submission
+    const data = submissions
+      .filter((s: any) => byId.has(s.indicatorId))
+      .map((s: any) => ({ ...byId.get(s.indicatorId), submission: s }));
+
+    res.status(200).json({ success: true, count: data.length, data });
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  FILE: admin routes
+//  1. add `fetchPendingReviewQueue` to the import list
+//  2. add the route BELOW with the other collection routes.
+//     It MUST stay above  router.get("/:id", ...)  or Express will treat
+//     "pending-queue" as an id.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// router.get("/pending-queue", fetchPendingReviewQueue);

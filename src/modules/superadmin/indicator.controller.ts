@@ -2601,3 +2601,59 @@ export const deleteSingleDocument = asyncHandler(
     }
   },
 );
+
+
+/* ─── 10b. GET PENDING FINAL APPROVALS (SUPER ADMIN QUEUE) ────────────────── */
+//
+//  "Pending final approval" = the quarter's LATEST submission is
+//  Verified (admin finished) or Partially Approved (super admin already
+//  awarded part of the target), AND the indicator still has target left
+//  to award. The indicator's own `status` column is intentionally NOT
+//  used, because the admin review code flips it to 'Completed' as soon
+//  as every submitted quarter is Verified — before the super admin has
+//  awarded anything.
+//
+//  One row per pending quarter.
+
+export const getPendingFinalApprovals = asyncHandler(
+  async (_req: Request, res: Response) => {
+    const { rows } = await pool.query(`
+      WITH latest AS (
+        SELECT DISTINCT ON (s.indicator_id, s.quarter, s.year)
+               s.id, s.indicator_id, s.quarter, s.year, s.review_status,
+               s.achieved_value, s.admin_comment, s.submitted_at,
+               s.resubmission_count, s.approved_amount, s.submitted_by
+        FROM submissions s
+        ORDER BY s.indicator_id, s.quarter, s.year, s.submitted_at DESC
+      )
+      ${INDICATOR_SELECT},
+        l.id                 AS "submissionId",
+        l.quarter            AS "quarter",
+        l.year               AS "year",
+        l.review_status      AS "reviewStatus",
+        l.achieved_value     AS "achievedValue",
+        l.admin_comment      AS "adminComment",
+        l.submitted_at       AS "submittedAt",
+        l.resubmission_count AS "resubmissionCount",
+        l.approved_amount    AS "approvedAmount",
+        sb.name              AS "submittedByName",
+        GREATEST(COALESCE(i.target, 0) - COALESCE(i.current_total_achieved, 0), 0)
+                             AS "remaining",
+        (SELECT COUNT(*)::int
+           FROM submission_documents d
+          WHERE d.submission_id = l.id
+            AND d.deleted_at IS NULL
+            AND d.status <> 'Deleted')
+                             AS "documentsCount"
+      ${INDICATOR_JOINS}
+      JOIN latest l ON l.indicator_id = i.id
+      LEFT JOIN users sb ON sb.id = l.submitted_by
+      WHERE i.deleted_at IS NULL
+        AND l.review_status IN ('Verified', 'Partially Approved')
+        AND COALESCE(i.current_total_achieved, 0) < COALESCE(i.target, 0)
+      ORDER BY l.submitted_at ASC
+    `);
+
+    res.status(200).json({ success: true, count: rows.length, data: rows });
+  },
+);
