@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { PoolClient } from "pg";
 import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
@@ -10,6 +11,36 @@ import {
   taskAssignedTemplate,
   partialApprovalTemplate,
 } from "../../utils/mailTemplates";
+
+/* ─── SINGLE PLACE THAT DERIVES TOTALS ──────────────────────────────────────
+   Only this function writes progress, total and the Completed status.
+   Call it inside a transaction after any mutation that changes what counts
+   as approved progress. Do NOT call it until the reconciliation is clean.
+────────────────────────────────────────────────────────────────────────────── */
+export async function recomputeIndicator(
+  client: PoolClient,
+  indicatorId: string,
+) {
+  await client.query(
+    `UPDATE indicators i
+     SET current_total_achieved = c.total,
+         progress = CASE WHEN i.target > 0
+                    THEN LEAST(ROUND(c.total / i.target * 100), 100) ELSE 0 END,
+         status = CASE
+                    WHEN i.target > 0 AND c.total >= i.target THEN 'Completed'
+                    WHEN i.status = 'Completed'              THEN 'Pending'
+                    ELSE i.status END,
+         updated_at = NOW()
+     FROM (
+       SELECT COALESCE(SUM(approved_amount), 0) AS total
+       FROM review_history
+       WHERE indicator_id = $1 AND reviewer_role = 'superadmin'
+         AND action IN ('Approved', 'Partially Approved')
+     ) c
+     WHERE i.id = $1`,
+    [indicatorId],
+  );
+}
 
 /* ─── SHARED SELECT FRAGMENT ─────────────────────────────────────────────────
    Every query that returns an indicator to the frontend uses this fragment.
@@ -528,9 +559,11 @@ export const getIndicatorById = asyncHandler(
          s.admin_comment          AS "adminComment",
          s.resubmission_count     AS "resubmissionCount",
          s.submitted_by           AS "submittedBy",
-         COALESCE(
-           json_agg(
-             json_build_object(
+         (
+           SELECT COALESCE(json_agg(doc_row.doc_json), '[]'::json)
+           FROM (
+             -- 1. Uploaded documents
+             SELECT json_build_object(
                'id',               sd.id,
                'submissionId',     sd.submission_id,
                'evidenceUrl',      sd.evidence_url,
@@ -540,19 +573,36 @@ export const getIndicatorById = asyncHandler(
                'description',      sd.description,
                'status',           sd.status,
                'rejectionReason',  sd.rejection_reason,
-               'uploadedAt',       sd.uploaded_at
-             )
-           ) FILTER (WHERE sd.id IS NOT NULL AND sd.status != 'Deleted' AND sd.deleted_at IS NULL),
-           '[]'::json
+               'uploadedAt',       sd.uploaded_at,
+               'source',           'own'
+             ) AS doc_json
+             FROM submission_documents sd
+             WHERE sd.submission_id = s.id
+               AND sd.status != 'Deleted' 
+               AND sd.deleted_at IS NULL
+             
+             UNION ALL
+             
+             -- 2. Linked spot-check documents
+             SELECT json_build_object(
+               'id',               l.id,
+               'submissionId',     l.submission_id,
+               'evidenceUrl',      l.evidence_url,
+               'evidencePublicId', l.evidence_public_id,
+               'fileType',         l.file_type,
+               'fileName',         l.file_name,
+               'description',      l.description,
+               'status',           'Approved',
+               'rejectionReason',  NULL,
+               'uploadedAt',       l.linked_at,
+               'source',           'spot-check'
+             ) AS doc_json
+             FROM submission_spot_check_links l
+             WHERE l.submission_id = s.id
+           ) doc_row
          ) AS "documents"
        FROM latest_submissions s
-       LEFT JOIN submission_documents sd ON sd.submission_id = s.id
        WHERE s.rn = 1
-       GROUP BY
-         s.id, s.indicator_id, s.quarter, s.year, s.notes,
-         s.admin_description_edit, s.submitted_at, s.achieved_value,
-         s.is_reviewed, s.review_status, s.admin_comment, s.resubmission_count,
-         s.submitted_by
        ORDER BY s.year ASC, s.quarter ASC`,
       [id],
     );
@@ -576,14 +626,9 @@ export const getIndicatorById = asyncHandler(
       [id],
     );
 
-    // ✅ FIXED: Return submissions as a flat array (matching the frontend's expectation)
-    // instead of a grouped object keyed by "Q1_2026" etc. The frontend calls
-    // `.find()` on this collection, which only works on arrays. Each submission
-    // keeps its own `quarter` and `year` fields, so the frontend can pick the
-    // right one to review. Deleted-document filtering is preserved.
-    const submissionsArray = submissions.filter(
-      (sub: any) => Array.isArray(sub.documents) && sub.documents.length > 0,
-    );
+    // ✅ FIX: Do not filter out submissions with 0 documents. 
+    // Send everything to the frontend so it can render the timeline.
+    const submissionsArray = submissions;
 
     res.status(200).json({
       success: true,
@@ -608,7 +653,7 @@ export const updateIndicator = asyncHandler(
       await client.query("BEGIN");
 
       const check = await client.query(
-        "SELECT status, reporting_cycle FROM indicators WHERE id = $1 FOR UPDATE",
+        "SELECT status, reporting_cycle, current_total_achieved FROM indicators WHERE id = $1 FOR UPDATE",
         [id],
       );
       if (!check.rows[0]) throw new AppError("Indicator not found.", 404);
@@ -620,6 +665,9 @@ export const updateIndicator = asyncHandler(
       if (cycleChanged) {
         newActiveQuarter = 1;
       }
+
+      const targetChanged =
+        target !== undefined && Number(target) !== Number(check.rows[0].target);
 
       await client.query(
         `UPDATE indicators SET
@@ -634,7 +682,9 @@ export const updateIndicator = asyncHandler(
            status = CASE
              WHEN $7                                                THEN 'Pending'
              WHEN $3 IS NOT NULL                                    THEN 'Pending'
-             WHEN $2 IS NOT NULL                                    THEN 'Pending'
+             -- don't downgrade a Completed indicator to Pending just because the target changed;
+             -- recomputeIndicator below will decide the resulting status.
+             WHEN $2 IS NOT NULL AND status <> 'Completed'          THEN 'Pending'
              WHEN $5 IS NOT NULL AND $5 IS DISTINCT FROM reporting_cycle THEN 'Pending'
              ELSE status
            END,
@@ -651,6 +701,13 @@ export const updateIndicator = asyncHandler(
           id,
         ],
       );
+
+      // If the target changed, re-derive totals/progress/status from the
+      // source of truth (review_history). Skip the full reset path
+      // (cycleChanged) which intentionally zeroes progress.
+      if (targetChanged && !cycleChanged) {
+        await recomputeIndicator(client, id);
+      }
 
       await client.query("COMMIT");
 
@@ -753,9 +810,8 @@ export const superAdminReviewProcess = asyncHandler(
       );
     }
 
-    if (isApprove && progressOverride <= 0) {
-      throw new AppError("Approved amount must be greater than zero.", 400);
-    }
+    // We removed the `progressOverride <= 0` check here because a user 
+    // might legitimately submit 0 with evidence, and you still need to approve it.
 
     const targetYear = year || new Date().getFullYear();
     const targetQuarter =
@@ -777,33 +833,13 @@ export const superAdminReviewProcess = asyncHandler(
 
       if (!indicator) throw new AppError("Indicator not found.", 404);
 
-      if (indicator.status === "Completed") {
-        throw new AppError("This indicator has already been completed.", 400);
-      }
-
       const isAnnual = indicator.reporting_cycle === "Annual";
       const target = Number(indicator.target) || 0;
       const currentTotal = Number(indicator.current_total_achieved) || 0;
       const remaining = Math.max(0, target - currentTotal);
 
-      // Validate the approved amount against the actual remaining target
-      // (raw units, matching the frontend slider — not a percentage).
-      if (isApprove) {
-        const approvedAmount = Number(progressOverride);
-
-        if (approvedAmount > remaining) {
-          throw new AppError(
-            `Approved amount (${approvedAmount}) exceeds remaining (${remaining} ${indicator.unit || "%"}).`,
-            400,
-          );
-        }
-
-        if (isAnnual && approvedAmount !== target) {
-          throw new AppError(
-            `Annual certification requires exactly ${target} ${indicator.unit || "%"}.`,
-            400,
-          );
-        }
+      if (target > 0 && currentTotal >= target) {
+        throw new AppError("This indicator is already fully certified.", 400);
       }
 
       const subRes = await client.query(
@@ -825,8 +861,14 @@ export const superAdminReviewProcess = asyncHandler(
 
       const submission = subRes.rows[0];
 
-      if (submission.review_status === "Accepted" && !isPartialApproval) {
-        throw new AppError("This submission has already been approved.", 400);
+      // Only admin-verified submissions can be certified.
+      if (
+        !["Verified", "Partially Approved"].includes(submission.review_status)
+      ) {
+        throw new AppError(
+          `Only admin-verified submissions can be certified (this one is "${submission.review_status}").`,
+          400,
+        );
       }
 
       if (indicator.is_multi_assignee) {
@@ -841,80 +883,78 @@ export const superAdminReviewProcess = asyncHandler(
         assigneeInfo = { emails, displayName };
       }
 
+      let amount = 0;
+      let isComplete = false;
       let newTotal: number;
       let newProgress: number;
       let newStatus: string;
       let approvalMessage = "";
 
       if (isApprove) {
-        const approvedAmount = Number(progressOverride);
+        amount = isPartialApproval ? Number(progressOverride) : remaining;
 
-        if (isPartialApproval) {
-          newTotal = currentTotal + approvedAmount;
-          newProgress =
-            target > 0
-              ? Math.min(Math.round((newTotal / target) * 100), 100)
-              : 0;
+        // ✅ THE FIX: If the amount is 0 (meaning the user submitted 0% progress) 
+        // but there is a target to meet, we treat this approval as certifying 
+        // the full remaining target. This prevents indicators getting stuck 
+        // at 0% when evidence is provided.
+        if (amount === 0 && remaining > 0) {
+          amount = remaining;
+        }
 
-          if (newProgress >= 100) {
-            newStatus = "Completed";
-            approvalMessage = `Final approval completed. Total progress: 100%`;
-          } else {
-            newStatus = "Awaiting Super Admin";
-            approvalMessage = `Partially approved: +${approvedAmount} ${indicator.unit || "%"}. Current total: ${newProgress}%. Remaining: ${100 - newProgress}%`;
-          }
-
-          await client.query(
-            `UPDATE submissions
-             SET review_status = 'Partially Approved', 
-                 is_reviewed = true, 
-                 admin_comment = $1,
-                 approved_amount = $2,
-                 reviewed_at = NOW()
-             WHERE id = $3`,
-            [approvalMessage, approvedAmount, submission.id],
+        if (!(amount > 0) || amount > remaining) {
+          throw new AppError(
+            `Approved amount must be between 0 and ${remaining} ${indicator.unit || "%"}.`,
+            400,
           );
-        } else {
-          newTotal = indicator.target;
-          newProgress = 100;
-          newStatus = "Completed";
-          approvalMessage = `Fully approved: ${newProgress}% complete`;
-
-          await client.query(
-            `UPDATE submissions
-             SET review_status = 'Accepted', 
-                 is_reviewed = true, 
-                 admin_comment = $1,
-                 approved_amount = $2,
-                 reviewed_at = NOW()
-             WHERE id = $3`,
-            [reason || approvalMessage, newTotal - currentTotal, submission.id],
+        }
+        if (isAnnual && amount !== target) {
+          throw new AppError(
+            `Annual certification requires exactly ${target} ${indicator.unit || "%"}.`,
+            400,
           );
         }
 
-        await client.query(
-          `UPDATE indicators
-           SET status = $1,
-               progress = $2,
-               current_total_achieved = $3,
-               updated_at = NOW()
-           WHERE id = $4`,
-          [newStatus, newProgress, newTotal, id],
-        );
+        newTotal = currentTotal + amount;
+        isComplete = newTotal >= target;
+        newProgress =
+          target > 0 ? Math.min(Math.round((newTotal / target) * 100), 100) : 0;
+        newStatus = isComplete ? "Completed" : "Awaiting Super Admin";
+        approvalMessage = isComplete
+          ? "Fully approved: 100% complete"
+          : `Partially approved: +${amount} ${indicator.unit || "%"}. Current total: ${newProgress}%. Remaining: ${100 - newProgress}%`;
 
         await client.query(
+          `UPDATE submissions
+              SET review_status = $1, is_reviewed = true, admin_comment = $2,
+                  approved_amount = $3, reviewed_at = NOW()
+            WHERE id = $4`,
+          [
+            isComplete ? "Accepted" : "Partially Approved",
+            reason || approvalMessage,
+            amount,
+            submission.id,
+          ],
+        );
+        await client.query(
+          `UPDATE indicators SET status=$1, progress=$2, current_total_achieved=$3, updated_at=NOW()
+            WHERE id=$4`,
+          [newStatus, newProgress, newTotal, id],
+        );
+        await client.query(
           `INSERT INTO review_history
-             (indicator_id, action, reason, reviewer_role, reviewed_by, quarter, year, approved_amount, is_partial)
-           VALUES ($1, $2, $3, 'superadmin', $4, $5, $6, $7, $8)`,
+             (indicator_id, submission_id, action, reason, reviewer_role, reviewed_by,
+              quarter, year, approved_amount, is_partial)
+           VALUES ($1,$2,$3,$4,'superadmin',$5,$6,$7,$8,$9)`,
           [
             id,
-            isPartialApproval ? "Partially Approved" : "Approved",
+            submission.id,
+            isComplete ? "Approved" : "Partially Approved",
             reason || approvalMessage,
             adminId,
             targetQuarter,
             targetYear,
-            progressOverride,
-            isPartialApproval,
+            amount,
+            !isComplete,
           ],
         );
       } else {
@@ -940,10 +980,11 @@ export const superAdminReviewProcess = asyncHandler(
 
         await client.query(
           `INSERT INTO review_history
-             (indicator_id, action, reason, reviewer_role, reviewed_by, quarter, year)
-           VALUES ($1, $2, $3, 'superadmin', $4, $5, $6)`,
+             (indicator_id, submission_id, action, reason, reviewer_role, reviewed_by, quarter, year)
+           VALUES ($1, $2, $3, $4, 'superadmin', $5, $6, $7)`,
           [
             id,
+            submission.id,
             "Rejected",
             reason || "Submission rejected",
             adminId,
@@ -985,14 +1026,14 @@ export const superAdminReviewProcess = asyncHandler(
           let html: string;
 
           if (isApprove) {
-            if (isPartialApproval) {
+            if (!isComplete) {
               html = partialApprovalTemplate(
                 displayName,
                 activityDescription,
                 indicator.reporting_cycle,
                 targetQuarter,
                 periodYear,
-                progressOverride,
+                amount,
                 newProgress,
                 indicator.target,
                 indicator.unit || "%",
@@ -1022,7 +1063,7 @@ export const superAdminReviewProcess = asyncHandler(
           return sendMail({
             to: email,
             subject: isApprove
-              ? isPartialApproval
+              ? !isComplete
                 ? "📈 Progress Partially Approved"
                 : "✅ Performance Indicator Certified"
               : "❌ Performance Indicator Returned by Super Admin",
@@ -1040,14 +1081,14 @@ export const superAdminReviewProcess = asyncHandler(
           let html: string;
 
           if (isApprove) {
-            if (isPartialApproval) {
+            if (!isComplete) {
               html = partialApprovalTemplate(
                 assigneeInfo!.displayName,
                 activityDescription,
                 indicator.reporting_cycle,
                 targetQuarter,
                 periodYear,
-                progressOverride,
+                amount,
                 newProgress,
                 indicator.target,
                 indicator.unit || "%",
@@ -1077,7 +1118,7 @@ export const superAdminReviewProcess = asyncHandler(
           return sendMail({
             to: email,
             subject: isApprove
-              ? isPartialApproval
+              ? !isComplete
                 ? "📈 Progress Partially Approved"
                 : "✅ Performance Indicator Certified"
               : "❌ Performance Indicator Returned by Super Admin",
@@ -1096,8 +1137,8 @@ export const superAdminReviewProcess = asyncHandler(
         success: true,
         data: updatedRows[0],
         message: isApprove
-          ? isPartialApproval
-            ? `Partially approved: +${progressOverride}`
+          ? !isComplete
+            ? `Partially approved: +${amount}`
             : "Fully approved and completed"
           : "Submission rejected",
       });
@@ -1306,6 +1347,8 @@ export const getAllSubmissions = asyncHandler(
 
 export const getSuperAdminStats = asyncHandler(
   async (_req: Request, res: Response) => {
+    // Count "approved" based on actual certified progress, not just the
+    // status column — the status can briefly lag behind partial approvals.
     const query = `
       SELECT
         COUNT(*)                                                        AS total_indicators,
@@ -1315,7 +1358,9 @@ export const getSuperAdminStats = asyncHandler(
         COUNT(*) FILTER (
           WHERE status IN ('Awaiting Admin Approval', 'Awaiting Super Admin')
         )                                                               AS awaiting_review,
-        COUNT(*) FILTER (WHERE status = 'Completed')                    AS approved,
+        COUNT(*) FILTER (
+          WHERE target > 0 AND COALESCE(current_total_achieved, 0) >= target
+        )                                                               AS approved,
         COUNT(*) FILTER (
           WHERE status IN ('Rejected by Admin', 'Rejected by Super Admin')
         )                                                               AS rejected,
@@ -1359,6 +1404,39 @@ export const unassignIndicator = asyncHandler(
 
     if (existing[0].assignee_id === null) {
       throw new AppError("Indicator is already unassigned.", 400);
+    }
+
+    // Refuse when there is certified progress. Certified means one or more
+    // super-admin approved units that we would lose by resetting the totals.
+    const certifiedProgress =
+      Number(existing[0].current_total_achieved) > 0 &&
+      existing[0].status === "Completed";
+
+    if (certifiedProgress) {
+      throw new AppError(
+        "Cannot unassign an indicator that has certified progress. Reopen or reverse it first.",
+        400,
+      );
+    }
+
+    // Even for non-completed rows, guard against losing approved units if any
+    // approval history exists. Record a reversal so the audit trail is intact.
+    const { rows: approvedHistory } = await pool.query(
+      `SELECT COALESCE(SUM(approved_amount), 0) AS total
+         FROM review_history
+        WHERE indicator_id = $1
+          AND reviewer_role = 'superadmin'
+          AND action IN ('Approved', 'Partially Approved')`,
+      [id],
+    );
+
+    const hadApprovedUnits = Number(approvedHistory[0]?.total) > 0;
+
+    if (hadApprovedUnits) {
+      throw new AppError(
+        "Cannot unassign an indicator with approved progress. Record a reversal before unassigning.",
+        400,
+      );
     }
 
     await pool.query(
@@ -1421,8 +1499,13 @@ export const deleteSubmission = asyncHandler(
 
       const submission = subRes.rows[0];
 
-      if (submission.review_status === "Accepted") {
-        throw new AppError("Cannot delete a certified submission.", 400);
+      if (
+        ["Accepted", "Partially Approved"].includes(submission.review_status)
+      ) {
+        throw new AppError(
+          "Cannot delete a submission that has certified progress.",
+          400,
+        );
       }
 
       const docsRes = await client.query(
@@ -1672,18 +1755,17 @@ export const getSuperAdminApprovedIndicators = asyncHandler(
   async (req: Request, res: Response) => {
     const includePending = req.query.includePending === "true";
 
+    // Base the query on the actual math, not just the history table.
     let whereClause = `
-      WHERE EXISTS (
-        SELECT 1
-        FROM review_history rh
-        WHERE rh.indicator_id = i.id
-          AND rh.action = 'Approved'
-          AND rh.reviewer_role = 'superadmin'
-      )
+      WHERE COALESCE(i.target, 0) > 0
     `;
 
     if (!includePending) {
-      whereClause += ` AND i.status = 'Completed'`;
+      // Show only fully certified indicators
+      whereClause += ` AND COALESCE(i.current_total_achieved, 0) >= COALESCE(i.target, 0)`;
+    } else {
+      // If includePending is true, show anything that has *some* progress or is awaiting
+      whereClause += ` AND (COALESCE(i.current_total_achieved, 0) > 0 OR i.status = 'Awaiting Super Admin')`;
     }
 
     const selectWithDistinct = INDICATOR_SELECT.replace(
@@ -1733,7 +1815,7 @@ export const assignIndicator = asyncHandler(
       await client.query("BEGIN");
 
       const indRes = await client.query(
-        "SELECT id, status, assignee_id, is_multi_assignee FROM indicators WHERE id = $1 FOR UPDATE",
+        "SELECT id, status, assignee_id, is_multi_assignee, current_total_achieved FROM indicators WHERE id = $1 FOR UPDATE",
         [id],
       );
 
@@ -1742,18 +1824,25 @@ export const assignIndicator = asyncHandler(
       }
 
       const wasUnassigned = indRes.rows[0].assignee_id === null;
+      const hasCertifiedProgress =
+        Number(indRes.rows[0].current_total_achieved) > 0;
       const type = assigneeModel === "Team" ? "Team" : "User";
 
+      // Don't reset the status when there is certified progress; the
+      // recompute step is the single source of truth for status.
       await client.query(
         `UPDATE indicators
          SET assignee_id = $1,
              assignee_model = $2,
              assigned_by = $3,
-             status = 'Pending',
+             status = CASE
+               WHEN $5::boolean THEN status
+               ELSE 'Pending'
+             END,
              is_multi_assignee = false,
              updated_at = NOW()
          WHERE id = $4`,
-        [assigneeId, type, adminId, id],
+        [assigneeId, type, adminId, id, hasCertifiedProgress],
       );
 
       await client.query(
@@ -1854,6 +1943,7 @@ export const reassignIndicator = asyncHandler(
       const indicatorId = Array.isArray(id) ? id[0] : id;
       const indRes = await client.query(
         `SELECT i.id, i.assignee_id, i.assignee_model, i.status, i.is_multi_assignee, 
+                i.current_total_achieved,
                 sa.description AS "activityDescription"
          FROM indicators i
          LEFT JOIN strategic_activities sa ON i.activity_id = sa.id
@@ -1868,6 +1958,8 @@ export const reassignIndicator = asyncHandler(
       const indicator = indRes.rows[0];
       const oldAssigneeId = indicator.assignee_id;
       const oldAssigneeModel = indicator.assignee_model;
+      const hasCertifiedProgress =
+        Number(indicator.current_total_achieved) > 0;
 
       if (!oldAssigneeId) {
         throw new AppError(
@@ -1890,9 +1982,10 @@ export const reassignIndicator = asyncHandler(
          SET assignee_id = $1,
              assignee_model = $2,
              assigned_by = $3,
+             status = CASE WHEN $5::boolean THEN status ELSE 'Pending' END,
              updated_at = NOW()
          WHERE id = $4`,
-        [newAssigneeId, type, adminId, indicatorId],
+        [newAssigneeId, type, adminId, indicatorId, hasCertifiedProgress],
       );
 
       if (indicator.is_multi_assignee) {
@@ -2288,11 +2381,15 @@ export const sendBackToAdmin = asyncHandler(
   async (req: Request, res: Response) => {
     const { id } = req.params;
     const indicatorId = extractId(id);
-    const { reason } = req.body;
+    const { reason, submissionId } = req.body;
     const adminId = (req as any).user?.id;
 
     if (!adminId) {
       throw new AppError("User not authenticated.", 401);
+    }
+
+    if (!submissionId) {
+      throw new AppError("A submission ID is required.", 400);
     }
 
     const client = await pool.connect();
@@ -2339,14 +2436,20 @@ export const sendBackToAdmin = asyncHandler(
         );
       }
 
+      // Select exactly the submitted submission.
       const subRes = await client.query(
-        `SELECT id, review_status, is_reviewed
+        `SELECT id, quarter, year, is_reviewed
          FROM submissions
-         WHERE indicator_id = $1
-         ORDER BY submitted_at DESC
-         LIMIT 1`,
-        [indicatorId],
+         WHERE id = $1 AND indicator_id = $2
+         FOR UPDATE`,
+        [submissionId, indicatorId],
       );
+
+      if (subRes.rows.length === 0) {
+        throw new AppError("Submission not found for this indicator.", 404);
+      }
+
+      const submission = subRes.rows[0];
 
       await client.query(
         `UPDATE indicators
@@ -2356,35 +2459,34 @@ export const sendBackToAdmin = asyncHandler(
         [indicatorId],
       );
 
-      if (subRes.rows.length > 0) {
-        const submission = subRes.rows[0];
-
-        if (submission.is_reviewed) {
-          await client.query(
-            `UPDATE submissions
-             SET review_status = 'Pending',
-                 is_reviewed = false,
-                 admin_comment = $1,
-                 reviewed_at = NULL
-             WHERE id = $2`,
-            [
-              reason
-                ? `Sent back to admin: ${reason}`
-                : "Sent back to admin for review",
-              submission.id,
-            ],
-          );
-        }
+      if (submission.is_reviewed) {
+        await client.query(
+          `UPDATE submissions
+           SET review_status = 'Pending',
+               is_reviewed = false,
+               admin_comment = $1,
+               reviewed_at = NULL
+           WHERE id = $2`,
+          [
+            reason
+              ? `Sent back to admin: ${reason}`
+              : "Sent back to admin for review",
+            submission.id,
+          ],
+        );
       }
 
       await client.query(
         `INSERT INTO review_history
-           (indicator_id, action, reason, reviewer_role, reviewed_by, at)
-         VALUES ($1, 'Sent Back to Admin', $2, 'superadmin', $3, NOW())`,
+           (indicator_id, submission_id, action, reason, reviewer_role, reviewed_by, quarter, year, at)
+         VALUES ($1, $2, 'Sent Back to Admin', $3, 'superadmin', $4, $5, $6, NOW())`,
         [
           indicatorId,
+          submission.id,
           reason?.trim() || "Sent back to admin queue for review",
           adminId,
+          submission.quarter,
+          submission.year,
         ],
       );
 
@@ -2602,8 +2704,7 @@ export const deleteSingleDocument = asyncHandler(
   },
 );
 
-
-/* ─── 10b. GET PENDING FINAL APPROVALS (SUPER ADMIN QUEUE) ────────────────── */
+/* ─── 10b. GET PENDING FINAL APPROVALS (SUPER ADMIN QUEUE) ──────────────────
 //
 //  "Pending final approval" = the quarter's LATEST submission is
 //  Verified (admin finished) or Partially Approved (super admin already
@@ -2614,6 +2715,7 @@ export const deleteSingleDocument = asyncHandler(
 //  awarded anything.
 //
 //  One row per pending quarter.
+*/
 
 export const getPendingFinalApprovals = asyncHandler(
   async (_req: Request, res: Response) => {
@@ -2622,7 +2724,15 @@ export const getPendingFinalApprovals = asyncHandler(
         SELECT DISTINCT ON (s.indicator_id, s.quarter, s.year)
                s.id, s.indicator_id, s.quarter, s.year, s.review_status,
                s.achieved_value, s.admin_comment, s.submitted_at,
-               s.resubmission_count, s.approved_amount, s.submitted_by
+               s.resubmission_count, s.approved_amount, s.submitted_by,
+               (
+                 (SELECT COUNT(*)::int FROM submission_documents d
+                   WHERE d.submission_id = s.id
+                     AND d.deleted_at IS NULL AND d.status <> 'Deleted')
+                 +
+                 (SELECT COUNT(*)::int FROM submission_spot_check_links k
+                   WHERE k.submission_id = s.id)
+               ) AS evidence_count
         FROM submissions s
         ORDER BY s.indicator_id, s.quarter, s.year, s.submitted_at DESC
       )
@@ -2639,18 +2749,14 @@ export const getPendingFinalApprovals = asyncHandler(
         sb.name              AS "submittedByName",
         GREATEST(COALESCE(i.target, 0) - COALESCE(i.current_total_achieved, 0), 0)
                              AS "remaining",
-        (SELECT COUNT(*)::int
-           FROM submission_documents d
-          WHERE d.submission_id = l.id
-            AND d.deleted_at IS NULL
-            AND d.status <> 'Deleted')
-                             AS "documentsCount"
+        l.evidence_count     AS "documentsCount"
       ${INDICATOR_JOINS}
       JOIN latest l ON l.indicator_id = i.id
       LEFT JOIN users sb ON sb.id = l.submitted_by
       WHERE i.deleted_at IS NULL
         AND l.review_status IN ('Verified', 'Partially Approved')
         AND COALESCE(i.current_total_achieved, 0) < COALESCE(i.target, 0)
+        AND l.evidence_count > 0
       ORDER BY l.submitted_at ASC
     `);
 
