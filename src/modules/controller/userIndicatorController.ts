@@ -2,6 +2,7 @@ import { NextFunction, Request, RequestHandler, Response } from "express";
 import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
+import { perspectiveRankSql } from "../../utils/pmmuOrder";
 import { sendMail } from "../../utils/sendMail";
 import {
   submissionReceivedTemplate,
@@ -67,6 +68,18 @@ type DocumentStatus =
 
 function getAuthUser(req: Request): IUser {
   return (req as Request & { user: IUser }).user;
+}
+
+/** Sorts task-list rows in signed-PMMU order: perspective → objective → activity. */
+function sortByPmmu(rows: Record<string, any>[]): void {
+  const n = (v: unknown) => (v === null || v === undefined ? Number.MAX_SAFE_INTEGER : Number(v));
+  rows.sort(
+    (a, b) =>
+      n(a.perspectiveRank) - n(b.perspectiveRank) ||
+      n(a.objectiveOrder) - n(b.objectiveOrder) ||
+      n(a.activityOrder) - n(b.activityOrder) ||
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+  );
 }
 
 async function getUserTeamIds(userId: string): Promise<string[]> {
@@ -365,6 +378,12 @@ const USER_INDICATOR_BASE_QUERY = `
     u.name                                        AS "assigneeName",
     ab.name                                       AS "assignedByName",
     sp.perspective,
+    t.name                                        AS "teamName",
+
+    -- PMMU position, used to order and group the task list
+    ${perspectiveRankSql("sp.perspective")}     AS "perspectiveRank",
+    (SELECT sort_order FROM strategic_objectives WHERE id = i.objective_id) AS "objectiveOrder",
+    (SELECT "order"    FROM strategic_activities  WHERE id = i.activity_id)  AS "activityOrder",
 
     (SELECT json_build_object('title', title)
        FROM strategic_objectives WHERE id = i.objective_id) AS objective,
@@ -498,6 +517,9 @@ export const UserIndicatorController: IUserIndicatorController = {
       `${USER_INDICATOR_BASE_QUERY} WHERE i.deleted_at IS NULL AND ${clause} ORDER BY i.id, i.updated_at DESC`,
       params,
     );
+
+    // DISTINCT ON forces ORDER BY i.id in SQL, so put rows in PMMU order here
+    sortByPmmu(rows);
 
     // Evidence uploader sees every indicator — flag which ones are genuinely theirs
     if (user.canUploadForAll) {
