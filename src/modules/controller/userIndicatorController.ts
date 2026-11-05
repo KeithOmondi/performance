@@ -119,7 +119,7 @@ function ownershipClause(
   )`;
 
   // The super-admin-selected evidence uploader may act on every indicator
-  if (includeUploader) clause += ` OR ${EVIDENCE_UPLOADER_SQL(`${userIdx}`)}`;
+  if (includeUploader) clause += ` OR ${EVIDENCE_UPLOADER_SQL(`$${userIdx}`)}`;
 
   clause += ")";
   return { clause, params };
