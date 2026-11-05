@@ -5,6 +5,7 @@ import { AppError } from "../utils/AppError";
 import { env } from "../config/env";
 import { pool } from "../config/db";
 import { UserRole } from "../types/user.types";
+import { ACCESS_COOKIE } from "../utils/sendToken";
 
 interface JwtPayload {
   id: string;
@@ -21,8 +22,8 @@ export const protect: RequestHandler = asyncHandler(
     let token: string | undefined;
 
     // 1. Extract Token
-    if (req.cookies?.accessToken) {
-      token = req.cookies.accessToken;
+    if (req.cookies?.[ACCESS_COOKIE]) {
+      token = req.cookies[ACCESS_COOKIE];
     } else if (
       req.headers.authorization &&
       req.headers.authorization.startsWith("Bearer ")
@@ -45,7 +46,7 @@ export const protect: RequestHandler = asyncHandler(
 
     // 3. Check if user still exists in PostgreSQL
     const userQuery = `
-      SELECT id, name, email, role, pj_number, is_active, password_changed_at 
+      SELECT id, name, email, role, pj_number, is_active, password_changed_at, can_upload_for_all
       FROM users 
       WHERE id = $1 LIMIT 1
     `;
@@ -76,6 +77,7 @@ export const protect: RequestHandler = asyncHandler(
       email: currentUser.email,
       role: currentUser.role,
       pjNumber: currentUser.pj_number,
+      canUploadForAll: currentUser.can_upload_for_all,
     } as any;
 
     next();

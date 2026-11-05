@@ -108,7 +108,7 @@ static async requestLoginOTP(pjNumber: string): Promise<string> {
 
     // Clear OTP and return user
     const finalRes = await pool.query(
-      "UPDATE users SET login_otp = NULL, login_otp_expires = NULL WHERE id = $1 RETURNING id, name, email, role, pj_number as \"pjNumber\"",
+      "UPDATE users SET login_otp = NULL, login_otp_expires = NULL WHERE id = $1 RETURNING id, name, email, role, pj_number as \"pjNumber\", can_upload_for_all as \"canUploadForAll\"",
       [user.id]
     );
 
@@ -118,7 +118,7 @@ static async requestLoginOTP(pjNumber: string): Promise<string> {
   // ─── Get User By ID ───────────────────────────────────────────────────────
   static async getUserById(userId: string): Promise<IUser> {
     const { rows } = await pool.query(
-      "SELECT id, name, email, role, pj_number as \"pjNumber\", is_active as \"isActive\" FROM users WHERE id = $1",
+      "SELECT id, name, email, role, pj_number as \"pjNumber\", is_active as \"isActive\", can_upload_for_all as \"canUploadForAll\" FROM users WHERE id = $1",
       [userId]
     );
     if (rows.length === 0) throw new AppError("User not found.", 404);

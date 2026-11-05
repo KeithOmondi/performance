@@ -8,6 +8,8 @@ export interface IUser {
   password?: string;
   role: UserRole;
   pjNumber: string;
+  /** Super-admin-selected evidence uploader: may upload on every indicator */
+  canUploadForAll?: boolean;
   title: string;
   isActive: boolean;
   teamId?: string | null; // Foreign key

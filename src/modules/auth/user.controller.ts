@@ -4,7 +4,7 @@ import { AppError } from "../../utils/AppError";
 import { pool } from "../../config/db";
 import { UserRole } from "../../types/user.types";
 
-const USER_FIELDS = `id, name, email, role, pj_number AS "pjNumber", title, is_active AS "isActive", created_at AS "createdAt"`;
+const USER_FIELDS = `id, name, email, role, pj_number AS "pjNumber", title, is_active AS "isActive", can_upload_for_all AS "canUploadForAll", created_at AS "createdAt"`;
 const VALID_ROLES: UserRole[] = ["user", "admin", "superadmin", "examiner", "supervisor"];
 
 // ─── List All Users ───────────────────────────────────────────────────────────
@@ -69,7 +69,7 @@ export const updateUserRole = asyncHandler(async (req: Request, res: Response) =
   }
 
   const { rows } = await pool.query(
-    `UPDATE users SET role = $1, updated_at = NOW() WHERE id = $2 RETURNING ${USER_FIELDS}`,
+    `UPDATE users SET role = $1, can_upload_for_all = (can_upload_for_all AND $1 = 'user'), updated_at = NOW() WHERE id = $2 RETURNING ${USER_FIELDS}`,
     [role, id]
   );
 
@@ -96,7 +96,7 @@ export const toggleUserActive = asyncHandler(async (req: Request, res: Response)
   }
 
   const { rows } = await pool.query(
-    `UPDATE users SET is_active = $1, updated_at = NOW() WHERE id = $2 RETURNING ${USER_FIELDS}`,
+    `UPDATE users SET is_active = $1, can_upload_for_all = (can_upload_for_all AND $1), updated_at = NOW() WHERE id = $2 RETURNING ${USER_FIELDS}`,
     [isActive, id]
   );
 
@@ -150,6 +150,7 @@ export const updateUser = asyncHandler(async (req: Request, res: Response) => {
          pj_number = COALESCE($3, pj_number), 
          title = COALESCE($4, title), 
          role = COALESCE($5, role),
+         can_upload_for_all = (can_upload_for_all AND COALESCE($5, role) = 'user'),
          updated_at = NOW()
      WHERE id = $6 
      RETURNING ${USER_FIELDS}`,
@@ -181,4 +182,52 @@ export const deleteUser = asyncHandler(async (req: Request, res: Response) => {
     message: "User has been removed from the system.",
     id
   });
+});
+// ─── Evidence Uploader (SuperAdmin only) ─────────────────────────────────────
+// One standard user who may upload evidence on every indicator.
+
+export const getEvidenceUploader = asyncHandler(async (_req: Request, res: Response) => {
+  const { rows } = await pool.query(
+    `SELECT ${USER_FIELDS} FROM users WHERE can_upload_for_all LIMIT 1`
+  );
+  res.status(200).json({ success: true, user: rows[0] ?? null });
+});
+
+/** Body: { userId } to select, or { userId: null } to clear. */
+export const setEvidenceUploader = asyncHandler(async (req: Request, res: Response) => {
+  const { userId } = req.body as { userId?: string | null };
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("UPDATE users SET can_upload_for_all = false WHERE can_upload_for_all");
+
+    let user = null;
+    if (userId) {
+      const { rows } = await client.query(
+        `UPDATE users SET can_upload_for_all = true, updated_at = NOW()
+         WHERE id = $1 AND role = 'user' AND is_active = true
+         RETURNING ${USER_FIELDS}`,
+        [userId]
+      );
+      if (rows.length === 0) {
+        throw new AppError("Select an active user with the standard 'user' role.", 400);
+      }
+      user = rows[0];
+    }
+
+    await client.query("COMMIT");
+    res.status(200).json({
+      success: true,
+      message: user
+        ? `${user.name} can now upload evidence on every indicator.`
+        : "Evidence uploader cleared.",
+      user,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 });

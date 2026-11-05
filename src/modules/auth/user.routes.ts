@@ -7,6 +7,8 @@ import {
   createUser,
   updateUser,
   deleteUser, // 👈 Add the new controller here
+  getEvidenceUploader,
+  setEvidenceUploader,
 } from "./user.controller";
 import { protect, restrictTo } from "../../middleware/auth.middleware";
 
@@ -16,6 +18,10 @@ const router = Router();
 router.use(protect);
 
 // ─── Admin + SuperAdmin ───────────────────────────────────────────────────────
+
+// Evidence uploader — must precede "/:id"
+router.get("/evidence-uploader", restrictTo("superadmin"), getEvidenceUploader);
+router.put("/evidence-uploader", restrictTo("superadmin"), setEvidenceUploader);
 
 // List all users
 router.get("/", restrictTo("admin", "superadmin"), listUsers);

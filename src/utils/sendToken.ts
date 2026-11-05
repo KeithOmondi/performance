@@ -4,6 +4,14 @@ import { env } from "../config/env";
 import ms, { StringValue } from "ms";
 import { IUser, UserRole } from "../types/user.types"; 
 
+/**
+ * App-specific cookie names. Generic names ("accessToken"/"refreshToken") collide with
+ * other apps on the same host — on localhost every port shares one cookie jar — and
+ * those apps overwrite PMMU's tokens with ones signed by a different secret.
+ */
+export const ACCESS_COOKIE = "pmmu_access";
+export const REFRESH_COOKIE = "pmmu_refresh";
+
 export interface IUserPayload {
   id: string;
   role: UserRole;
@@ -34,14 +42,14 @@ export const sendToken = (res: Response, user: IUser, statusCode: number = 200) 
 
   const isProduction = env.NODE_ENV === "production";
 
-  res.cookie("accessToken", accessToken, {
+  res.cookie(ACCESS_COOKIE, accessToken, {
     httpOnly: true,
     secure: isProduction,
     sameSite: (isProduction ? "none" : "lax") as "none" | "lax",
     maxAge: ms(env.JWT_ACCESS_EXPIRES as StringValue), 
   });
 
-  res.cookie("refreshToken", refreshToken, {
+  res.cookie(REFRESH_COOKIE, refreshToken, {
     httpOnly: true,
     secure: isProduction,
     sameSite: (isProduction ? "none" : "lax") as "none" | "lax",
@@ -56,6 +64,7 @@ export const sendToken = (res: Response, user: IUser, statusCode: number = 200) 
       name: user.name,
       email: user.email,
       role: user.role,
+      canUploadForAll: !!user.canUploadForAll,
     },
   });
 };

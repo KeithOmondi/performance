@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AuthService } from "./auth.service";
-import { sendToken } from "../../utils/sendToken";
+import { sendToken, ACCESS_COOKIE, REFRESH_COOKIE } from "../../utils/sendToken";
 import { AppError } from "../../utils/AppError";
 import jwt from "jsonwebtoken";
 import { env } from "../../config/env";
@@ -68,7 +68,7 @@ export const AuthController = {
 
   // ─── Refresh Token ────────────────────────────────────────────────────────
   refreshToken: asyncHandler(async (req: Request, res: Response) => {
-    const refreshToken = req.cookies?.refreshToken;
+    const refreshToken = req.cookies?.[REFRESH_COOKIE];
     if (!refreshToken) throw new AppError("No refresh token provided.", 401);
 
     let decoded: { id: string; role: string };
@@ -104,8 +104,8 @@ export const AuthController = {
       expires: new Date(0),
     };
 
-    res.cookie("accessToken", "", cookieOptions);
-    res.cookie("refreshToken", "", cookieOptions);
+    res.cookie(ACCESS_COOKIE, "", cookieOptions);
+    res.cookie(REFRESH_COOKIE, "", cookieOptions);
 
     res.status(200).json({
       success: true,

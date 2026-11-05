@@ -97,6 +97,7 @@ function ownershipClause(
   userId: string,
   teamIds: string[],
   tableAlias = "i",
+  includeUploader = true,
 ): { clause: string; params: unknown[] } {
   const params = [...baseParams, userId];
   const userIdx = params.length;
@@ -117,9 +118,16 @@ function ownershipClause(
       AND ia.user_id = $${userIdx}
   )`;
 
+  // The super-admin-selected evidence uploader may act on every indicator
+  if (includeUploader) clause += ` OR ${EVIDENCE_UPLOADER_SQL(`${userIdx}`)}`;
+
   clause += ")";
   return { clause, params };
 }
+
+/** SQL: true when the given user id is the designated evidence uploader. */
+const EVIDENCE_UPLOADER_SQL = (userIdParam: string) =>
+  `EXISTS (SELECT 1 FROM users eu WHERE eu.id = ${userIdParam} AND eu.can_upload_for_all)`;
 
 async function assertIndicatorOwnership(
   client: PoolClient,
@@ -145,6 +153,13 @@ async function assertIndicatorOwnership(
     [id, userId],
   );
   if ((assigneeCheck.rowCount ?? 0) > 0) return;
+
+  // The super-admin-selected evidence uploader may act on every indicator
+  const uploaderCheck = await client.query(
+    `SELECT 1 WHERE ${EVIDENCE_UPLOADER_SQL("$1")}`,
+    [userId],
+  );
+  if ((uploaderCheck.rowCount ?? 0) > 0) return;
 
   throw new AppError(
     "You don't have permission to access this indicator.",
@@ -484,6 +499,17 @@ export const UserIndicatorController: IUserIndicatorController = {
       params,
     );
 
+    // Evidence uploader sees every indicator — flag which ones are genuinely theirs
+    if (user.canUploadForAll) {
+      const own = ownershipClause([], user.id, teamIds, "i", false);
+      const { rows: ownRows } = await pool.query(
+        `SELECT i.id FROM indicators i WHERE i.deleted_at IS NULL AND ${own.clause}`,
+        own.params,
+      );
+      const ownIds = new Set(ownRows.map((r: { id: string }) => r.id));
+      for (const row of rows) row.isOwn = ownIds.has(row.id);
+    }
+
     res.status(200).json({ 
       success: true, 
       message: `Found ${rows.length} indicator(s) assigned to you.`,
@@ -504,6 +530,16 @@ export const UserIndicatorController: IUserIndicatorController = {
 
     if (rows.length === 0)
       throw new AppError("Indicator not found or you don't have permission to view it.", 404);
+
+    // Evidence uploader: tell the UI whether this indicator is genuinely theirs
+    if (user.canUploadForAll) {
+      const own = ownershipClause([req.params.id], user.id, teamIds, "i", false);
+      const { rowCount } = await pool.query(
+        `SELECT 1 FROM indicators i WHERE i.id = $1 AND ${own.clause}`,
+        own.params,
+      );
+      rows[0].isOwn = (rowCount ?? 0) > 0;
+    }
 
     res.status(200).json({ success: true, data: rows[0] });
   }),
@@ -1111,6 +1147,7 @@ export const UserIndicatorController: IUserIndicatorController = {
           SELECT 1 FROM indicator_assignees ia
           WHERE ia.indicator_id = i.id AND ia.user_id = $2
         )
+        OR ${EVIDENCE_UPLOADER_SQL("$2")}
       )
     `;
 
@@ -1391,6 +1428,7 @@ export const UserIndicatorController: IUserIndicatorController = {
             SELECT 1 FROM indicator_assignees ia
             WHERE ia.indicator_id = i.id AND ia.user_id = $2
           )
+          OR ${EVIDENCE_UPLOADER_SQL("$2")}
         )
       `;
       const checkParams = [url, user.id, teamIds];
@@ -1575,6 +1613,7 @@ export const UserIndicatorController: IUserIndicatorController = {
           SELECT 1 FROM indicator_assignees ia
           WHERE ia.indicator_id = i.id AND ia.user_id = $2
         )
+        OR ${EVIDENCE_UPLOADER_SQL("$2")}
       )
     `;
 

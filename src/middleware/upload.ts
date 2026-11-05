@@ -56,7 +56,11 @@ const fileFilter = (
   file: Express.Multer.File,
   cb: FileFilterCallback
 ) => {
-  if (allowedTypes[file.mimetype]) {
+  // Accept by MIME type, or by extension: browsers on machines without Office often
+  // send .xlsx/.docx as "application/octet-stream" or with no type at all.
+  const ext = file.originalname.split(".").pop()?.toLowerCase() ?? "";
+  const extAllowed = Object.values(allowedTypes).some((exts) => exts.includes(ext));
+  if (allowedTypes[file.mimetype] || extAllowed) {
     cb(null, true);
   } else {
     // Using AppError to maintain consistency with your error handling

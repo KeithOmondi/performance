@@ -27,6 +27,15 @@ export const uploadToCloudinary = (
       // Removed async: true to ensure we get the secure_url back immediately
     };
 
+    // Office/text files are stored as "raw". Keep the original file name (and so the
+    // extension) in the public id, otherwise they download as extension-less blobs.
+    const isRawDoc = !isVideo && !isImage && file.mimetype !== "application/pdf";
+    if (isRawDoc) {
+      options.use_filename = true;
+      options.unique_filename = true;
+      options.filename_override = file.originalname;
+    }
+
     if (isVideo) {
       options.eager = [{ streaming_profile: "hd", quality: "auto" }];
       options.eager_async = true; // This is fine; it transcodes in BG but gives us the URL now
