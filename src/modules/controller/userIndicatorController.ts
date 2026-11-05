@@ -3,6 +3,7 @@ import { pool } from "../../config/db";
 import { asyncHandler } from "../../utils/asyncHandler";
 import { AppError } from "../../utils/AppError";
 import { perspectiveRankSql } from "../../utils/pmmuOrder";
+import { allowedTypes as UPLOAD_ALLOWED_TYPES } from "../../middleware/upload";
 import { sendMail } from "../../utils/sendMail";
 import {
   submissionReceivedTemplate,
@@ -24,13 +25,6 @@ const PRIVILEGED_ROLES = ["admin", "superadmin", "examiner"] as const;
 const MAX_ACHIEVED_VALUE = 999999999.99;
 const MAX_NOTES_LENGTH = 5000;
 const MAX_DESCRIPTION_LENGTH = 500;
-const ALLOWED_FILE_TYPES = [
-  "image/jpeg",
-  "image/png",
-  "image/gif",
-  "application/pdf",
-  "video/mp4",
-];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -201,9 +195,13 @@ function validateSubmissionInput(
 
 function validateFiles(files: Express.Multer.File[]): void {
   for (const file of files) {
-    if (!ALLOWED_FILE_TYPES.includes(file.mimetype))
+    // Same whitelist as the upload middleware; accept by MIME type or extension
+    // (Windows often sends Office files as application/octet-stream).
+    const ext = file.originalname.split(".").pop()?.toLowerCase() ?? "";
+    const extAllowed = Object.values(UPLOAD_ALLOWED_TYPES).some((exts) => exts.includes(ext));
+    if (!UPLOAD_ALLOWED_TYPES[file.mimetype] && !extAllowed)
       throw new AppError(
-        `File "${file.originalname}" is not supported. Allowed types: ${ALLOWED_FILE_TYPES.join(", ")}`,
+        `File "${file.originalname}" is not supported. Upload PDF, Word, Excel, PowerPoint, CSV, image or video files.`,
         400,
       );
     if (file.size > MAX_FILE_SIZE)
@@ -1014,8 +1012,10 @@ export const UserIndicatorController: IUserIndicatorController = {
       // Documents are always set to 'Pending' so they must be reviewed by admin
       const docStatus = 'Pending';
 
-      // If the submission is already 'Accepted', we need to change its status back to 'Pending'
-      if (submission.review_status === 'Accepted') {
+      // Locked submissions (certified, verified, or partially approved) are reopened:
+      // new evidence sends them back to 'Pending' so the admin reviews it.
+      const REOPENABLE = ['Accepted', 'Verified', 'Partially Approved'];
+      if (REOPENABLE.includes(submission.review_status)) {
         await client.query(
           `UPDATE submissions
            SET review_status = 'Pending',
@@ -1027,7 +1027,7 @@ export const UserIndicatorController: IUserIndicatorController = {
         );
         
         // Update indicator status to 'Awaiting Admin Approval'
-        if (indicator.status === "Completed") {
+        if (["Completed", "Awaiting Super Admin", "Partially Approved"].includes(indicator.status as string)) {
           await client.query(
             `UPDATE indicators 
              SET status = 'Awaiting Admin Approval',

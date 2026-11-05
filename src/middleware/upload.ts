@@ -8,7 +8,7 @@ import { AppError } from "../utils/AppError";
  */
 const storage = multer.memoryStorage();
 
-const allowedTypes: Record<string, string[]> = {
+export const allowedTypes: Record<string, string[]> = {
   // --- Images ---
   "image/jpeg": ["jpg", "jpeg"],
   "image/png": ["png"],
