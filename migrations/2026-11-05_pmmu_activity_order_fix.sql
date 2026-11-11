@@ -12,6 +12,9 @@
 
 BEGIN;
 
+-- Connection poolers can reuse a session that still holds an earlier copy
+DROP TABLE IF EXISTS pg_temp.pmmu_activity_order;
+
 CREATE TEMP TABLE pmmu_activity_order (persp TEXT, obj TEXT, act TEXT, n INT) ON COMMIT DROP;
 INSERT INTO pmmu_activity_order VALUES
   -- A1 Improve proximity to courts

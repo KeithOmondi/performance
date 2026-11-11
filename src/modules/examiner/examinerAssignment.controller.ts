@@ -86,26 +86,49 @@ const loadFolderContents = async (folders: FolderRow[], completedOnly: boolean) 
            s.notes,
            s.review_status  AS "reviewStatus",
            s.submitted_at   AS "submittedAt",
+           -- Uploaded documents AND attached spot-check reports: both are evidence
            COALESCE(
              (
-               SELECT json_agg(
-                 json_build_object(
-                   'id',               sd.id,
-                   'submissionId',     sd.submission_id,
-                   'evidenceUrl',      sd.evidence_url,
-                   'evidencePublicId', sd.evidence_public_id,
-                   'fileType',         sd.file_type,
-                   'fileName',         sd.file_name,
-                   'description',      sd.description,
-                   'status',           sd.status,
-                   'rejectionReason',  sd.rejection_reason,
-                   'uploadedAt',       sd.uploaded_at
-                 ) ORDER BY sd.uploaded_at ASC
-               )
-               FROM submission_documents sd
-               WHERE sd.submission_id = s.id
-                 AND sd.deleted_at IS NULL
-                 AND sd.status != 'Deleted'
+               SELECT json_agg(ev.doc ORDER BY ev.uploaded_at ASC)
+               FROM (
+                 SELECT sd.uploaded_at,
+                        json_build_object(
+                          'id',               sd.id,
+                          'submissionId',     sd.submission_id,
+                          'evidenceUrl',      sd.evidence_url,
+                          'evidencePublicId', sd.evidence_public_id,
+                          'fileType',         sd.file_type,
+                          'fileName',         sd.file_name,
+                          'description',      sd.description,
+                          'status',           sd.status,
+                          'rejectionReason',  sd.rejection_reason,
+                          'uploadedAt',       sd.uploaded_at,
+                          'source',           'upload'
+                        ) AS doc
+                 FROM submission_documents sd
+                 WHERE sd.submission_id = s.id
+                   AND sd.deleted_at IS NULL
+                   AND sd.status != 'Deleted'
+
+                 UNION ALL
+
+                 SELECT l.linked_at,
+                        json_build_object(
+                          'id',               l.id,
+                          'submissionId',     l.submission_id,
+                          'evidenceUrl',      l.evidence_url,
+                          'evidencePublicId', l.evidence_public_id,
+                          'fileType',         l.file_type,
+                          'fileName',         l.file_name,
+                          'description',      l.description,
+                          'status',           'Spot Check Report',
+                          'rejectionReason',  NULL,
+                          'uploadedAt',       l.linked_at,
+                          'source',           'spotcheck'
+                        )
+                 FROM submission_spot_check_links l
+                 WHERE l.submission_id = s.id
+               ) ev
              ),
              '[]'::json
            ) AS documents
