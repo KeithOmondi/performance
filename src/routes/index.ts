@@ -11,6 +11,7 @@ import teamRoutes from "../modules/team/team.routes"
 import dashboardRoutes from "../modules/controllers/dashboardRoutes"
 import ExaminerAssignmentRoutes from "../modules/examiner/examinerAssignment.routes"
 import ReferenceRoutes from "../modules/reference/reference.routes";
+import GradingRoutes from "../modules/grading/grading.routes";
 import ArchiveRoutes from "../modules/archive/archiveroutes"
 import notificationRoutes from "../modules/notifications/notificationroutes"
 import spotcheckRoutes from "../modules/spotcheck/spot-check-routes"
@@ -54,6 +55,7 @@ router.use("/dashboard", dashboardRoutes);
 router.use("/examiner", ExaminerAssignmentRoutes)
 router.use("/archive", ArchiveRoutes)
 router.use("/reference", ReferenceRoutes);
+router.use("/grading", GradingRoutes);
 
 //================ Notification ================
 router.use("/notifications", notificationRoutes);
